@@ -230,11 +230,27 @@ extract_gridmet_wind <- function(cal_vect, cal_start, cal_end,
 
     if (is.null(gm)) next
 
-    vs_r <- gm$vs
-    th_r <- gm$th
+    # climateR variable names vary by version — match flexibly by pattern
+    nm <- names(gm)
+    message(sprintf("GRIDMET year %d: returned variables: %s", yr, paste(nm, collapse = ", ")))
 
-    # Mask to actual boundary polygon (climateR returns bounding-box crop)
-    cal_v  <- vect(cal_sf)
+    vs_idx <- grep("^vs$|wind.?speed|speed", nm, ignore.case = TRUE)[1]
+    th_idx <- grep("^th$|wind.?dir|direction|bearing", nm, ignore.case = TRUE)[1]
+
+    if (is.na(vs_idx))
+      stop("Cannot identify wind speed layer in GRIDMET response. ",
+           "Available names: ", paste(nm, collapse = ", "))
+    if (is.na(th_idx))
+      stop("Cannot identify wind direction layer in GRIDMET response. ",
+           "Available names: ", paste(nm, collapse = ", "))
+
+    vs_r <- gm[[vs_idx]]
+    th_r <- gm[[th_idx]]
+
+    # Mask to actual boundary polygon (climateR returns bounding-box crop).
+    # Reproject the boundary to exactly match the raster CRS to avoid
+    # minor WGS84 string mismatches between terra and climateR.
+    cal_v  <- project(vect(cal_sf), crs(vs_r))
     vs_r   <- mask(vs_r, cal_v)
     th_r   <- mask(th_r, cal_v)
 

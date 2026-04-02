@@ -73,6 +73,7 @@ ui <- page_navbar(
       "perimeters (e.g. WA Cascades + Coast Range). The .dbf, .shx, and .prj ",
       "files must be in the same directory as the .shp."),
     textInput("shp_path", label = NULL,
+              value       = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/S_USA.ECOSYS_ECOMAPPROVINCES_2025/ECOSYS_CoastalRange.shp",
               placeholder = "/path/to/calibration_region.shp"),
     actionButton("load_shp", "Load Shapefile", class = "btn-sm btn-secondary w-100"),
     uiOutput("shp_status"),
@@ -87,6 +88,7 @@ ui <- page_navbar(
       "different CRS and extent than the calibration boundary — the app will ",
       "reproject everything to match this grid."),
     textInput("tif_path", label = NULL,
+              value       = "/Users/jlamping/Desktop/LANDIS/NOCA/CoolDry/Rep1/input_maps/NOCA_ClimateRegions_09122025.tif",
               placeholder = "/path/to/template.tif"),
     actionButton("load_tif", "Load Raster", class = "btn-sm btn-secondary w-100"),
     uiOutput("tif_status"),
@@ -99,10 +101,14 @@ ui <- page_navbar(
       tags$a("Download from Zenodo", href = "https://doi.org/10.5281/zenodo.1065400",
              target = "_blank"),
       " — ffmc.nc, dmc.nc, dc.nc, fwi.nc"),
-    textInput("era_fwi_path",  "fwi.nc",  placeholder = "/path/to/fwi.nc"),
-    textInput("era_ffmc_path", "ffmc.nc", placeholder = "/path/to/ffmc.nc"),
-    textInput("era_dmc_path",  "dmc.nc",  placeholder = "/path/to/dmc.nc"),
-    textInput("era_dc_path",   "dc.nc",   placeholder = "/path/to/dc.nc"),
+    textInput("era_fwi_path",  "fwi.nc",
+              value = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/Climate/ERA-Interim/data/fwi.nc"),
+    textInput("era_ffmc_path", "ffmc.nc",
+              value = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/Climate/ERA-Interim/data/ffmc.nc"),
+    textInput("era_dmc_path",  "dmc.nc",
+              value = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/Climate/ERA-Interim/data/dmc.nc"),
+    textInput("era_dc_path",   "dc.nc",
+              value = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/Climate/ERA-Interim/data/dc.nc"),
     actionButton("load_era_fwi", "Load FWI Files", class = "btn-sm btn-secondary w-100"),
     uiOutput("era_fwi_status"),
 
@@ -152,7 +158,7 @@ ui <- page_navbar(
                  href = "https://www.fs.usda.gov/rds/archive/Catalog/RDS-2013-0009.6",
                  target = "_blank")),
         textInput("fpa_gdb_path", label = NULL,
-                  placeholder = "/path/to/FPA_FOD_20221014.gdb"),
+                  value = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Code/calibration/scf_calibration/data_raw/Short2022/Data/FPA_FOD_20221014.gdb"),
 
         hr(),
         h6("Model Settings"),
@@ -252,25 +258,55 @@ ui <- page_navbar(
 
         hr(),
         h6("Cleaning Thresholds"),
-        numericInput("max_gap_spread_prob", "Max Gap Days (Spread Prob)",
-                     value = 1, min = 1, max = 5),
-        numericInput("max_gap_daily_area",  "Max Gap Days (Daily Area)",
-                     value = 3, min = 1, max = 7),
-        numericInput("neg_growth_tol", "Neg Growth Tolerance (ha)",
+        p(class = "text-muted small",
+          "These filters control which perimeter pairs are used for each model."),
+        numericInput("max_gap_spread_prob", "Max Gap Days — Spread Probability",
+                     value = 3, min = 1, max = 14),
+        p(class = "text-muted small",
+          "Only pairs where consecutive perimeters are \u2264 N days apart feed the ",
+          "cell-to-cell spread probability model. Shorter gaps = cleaner signal ",
+          "but fewer pairs. Raise this if too few pairs are found."),
+        numericInput("max_gap_daily_area", "Max Gap Days — Daily Spread Area",
+                     value = 7, min = 1, max = 30),
+        p(class = "text-muted small",
+          "Maximum day gap allowed when estimating max daily spread area. ",
+          "Growth is divided by gap length to get ha/day, so wider gaps are ",
+          "tolerable here than for spread probability."),
+        numericInput("neg_growth_tol", "Negative Growth Tolerance (ha)",
                      value = 1.0, min = 0, step = 0.5),
+        p(class = "text-muted small",
+          "Pairs where the later perimeter is more than N ha ",
+          "smaller than the earlier are dropped. Small negative values (\u2264 1 ha) ",
+          "are GeoMAC remapping noise; large negatives indicate a data problem."),
+
+        hr(),
+        h6("Spread Rasterization"),
+        numericInput("spread_res_m", "Cell Size (m)",
+                     value = 90, min = 30, max = 2000, step = 10),
+        p(class = "text-muted small",
+          "Resolution used to rasterize GeoMAC perimeters across the calibration ",
+          "boundary. Defaults to the LANDIS template cell size. Finer resolution ",
+          "captures more fire detail but increases processing time."),
 
         hr(),
         h6("Sampling Control"),
-        numericInput("failure_sample_ratio", "Failure Sample Ratio",
+        numericInput("failure_sample_ratio", "Failure : Success Cell Ratio",
                      value = 3, min = 1, max = 10),
-        numericInput("max_samples_per_pair", "Max Samples Per Pair",
+        p(class = "text-muted small",
+          "For every cell that newly burned (success), sample N cells that were ",
+          "adjacent but did not burn (failure). Higher values give a more balanced ",
+          "logistic regression but increase memory use."),
+        numericInput("max_samples_per_pair", "Max Cells Per Pair",
                      value = 25000, min = 1000, step = 1000),
+        p(class = "text-muted small",
+          "Cap on total raster cells per perimeter pair. Prevents very large fires ",
+          "from dominating the fit."),
 
         hr(),
         h6("Fine Fuels (optional)"),
         p(class = "text-muted small",
-          "Fine fuels raster (0-1 scale) on LANDIS grid. Leave blank to use ",
-          "placeholder (fuels = 1.0 everywhere)."),
+          "Fine fuels raster (0–1 scale) on LANDIS grid. Leave blank to use ",
+          "a placeholder value of 1.0 everywhere."),
         textInput("fine_fuels_path", label = NULL,
                   placeholder = "/path/to/fine_fuels.tif"),
 
@@ -485,6 +521,10 @@ server <- function(input, output, session) {
         # Binary mask: 1 = active cell, NA = inactive
         msk <- r; msk[!is.na(msk)] <- 1
         rv$template_mask <- msk
+
+        # Pre-fill spread rasterization cell size from template resolution
+        updateNumericInput(session, "spread_res_m",
+                           value = round(mean(res(r))))
 
         # Reproject calibration boundary to match if already loaded
         if (!is.null(rv$cal_vect)) {
@@ -809,7 +849,7 @@ server <- function(input, output, session) {
   # ---------------------------------------------------------------------------
 
   observeEvent(input$run_spread_fit, {
-    req(rv$cal_vect_proj, rv$template_r, rv$template_mask,
+    req(rv$cal_vect_proj, rv$template_r,
         rv$era_fwi_daily, rv$wind_daily)
     req(nchar(trimws(input$geomac_gdb_path)) > 0)
 
@@ -855,12 +895,29 @@ server <- function(input, output, session) {
       setProgress(0.5, detail = "Fitting max daily area model...")
       rv$max_area_coef <- fit_max_daily_area(climate_joined$pairs)$coef
 
+      # Build a spread rasterization grid from the calibration boundary at the
+      # user-specified cell size (defaults to LANDIS template resolution).
+      setProgress(0.55, detail = "Building spread rasterization grid...")
+      spread_res_m <- max(as.numeric(input$spread_res_m), 10)  # floor at 10m
+      spread_template <- rast(
+        ext(rv$cal_vect_proj),
+        resolution = spread_res_m,
+        crs        = rv$working_crs
+      )
+      spread_mask <- rasterize(rv$cal_vect_proj, spread_template,
+                               field = 1, background = NA)
+      spread_mask[!is.na(spread_mask)] <- 1
+      message(sprintf(
+        "Spread raster grid: %d x %d cells at %.0f m resolution over calibration boundary.",
+        nrow(spread_template), ncol(spread_template), spread_res_m
+      ))
+
       setProgress(0.6, detail = "Fitting spread probability (rasterizing perimeters)...")
       rv$spread_prob_coef <- fit_spread_probability(
         pairs2        = climate_joined$spread_pairs,
         geomac_v      = geomac_result,
-        template_r    = rv$template_r,
-        park_mask     = rv$template_mask,
+        template_r    = spread_template,
+        park_mask     = spread_mask,
         failure_ratio = input$failure_sample_ratio,
         max_samples   = input$max_samples_per_pair,
         progress_fn   = function(i, n) setProgress(

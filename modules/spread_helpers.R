@@ -74,6 +74,8 @@ load_geomac_perimeters <- function(gdb_path, cal_vect, template_r,
   intersects_cal <- relate(gm_v, cal_vect, "intersects")
   gm_cal <- gm_v[intersects_cal, ]
 
+  message(sprintf("  -> %d perimeters intersect calibration boundary.", nrow(gm_cal)))
+
   if (nrow(gm_cal) == 0) {
     stop(paste0(
       "No GeoMAC perimeters intersect the calibration boundary.\n",
@@ -83,18 +85,58 @@ load_geomac_perimeters <- function(gdb_path, cal_vect, template_r,
   }
 
   # ---- Pull fire IDs from intersecting perimeters -------------------------
+  # Goal: retrieve ALL perimeters for each fire that touches the boundary
+  # (not just the boundary-intersecting subset) so pair-building gets the
+  # full progression. Fall back to gm_cal if the ID column is absent or
+  # all-NA for the intersecting set.
+  all_fires <- gm_cal   # safe default
+
   if (!is.na(id_col)) {
     fire_ids <- unique(gm_cal[[id_col]])
-    all_fires <- gm_v[gm_v[[id_col]] %in% fire_ids, ]
-  } else {
-    all_fires <- gm_cal
+    fire_ids <- fire_ids[!is.na(fire_ids) & nchar(as.character(fire_ids)) > 0]
+
+    if (length(fire_ids) > 0) {
+      candidate <- gm_v[as.character(gm_v[[id_col]]) %in% as.character(fire_ids), ]
+      if (nrow(candidate) > 0) all_fires <- candidate
+    }
   }
 
+  message(sprintf("  -> %d total perimeters for %d unique fires passed to date filter.",
+                  nrow(all_fires),
+                  if (!is.na(id_col) && nrow(all_fires) > 0)
+                    length(unique(all_fires[[id_col]]))
+                  else nrow(all_fires)))
+
   # ---- Parse attributes + date filter -------------------------------------
+  # Show a sample of raw date values to aid diagnosis if parsing fails
+  raw_dates <- as.data.frame(all_fires)[[dt_col]]
+  message(sprintf("GeoMAC date column '%s' — sample raw values: %s",
+                  dt_col,
+                  paste(head(unique(as.character(raw_dates)), 5), collapse = " | ")))
+
+  parse_geomac_date <- function(x) {
+    # Already a Date or POSIXct
+    if (inherits(x, "Date"))                  return(as.Date(x))
+    if (inherits(x, c("POSIXct", "POSIXlt"))) return(as.Date(x))
+    # Character / factor: try common formats in order
+    x <- as.character(x)
+    x[x %in% c("", "NA", "NaN", "NULL")] <- NA_character_
+    d <- suppressWarnings(as.Date(x, "%Y-%m-%d"))
+    if (!all(is.na(d))) return(d)
+    d <- suppressWarnings(as.Date(as.POSIXct(x, tz = "UTC")))
+    if (!all(is.na(d))) return(d)
+    d <- suppressWarnings(as.Date(x, "%m/%d/%Y"))
+    if (!all(is.na(d))) return(d)
+    d <- suppressWarnings(as.Date(x, "%Y/%m/%d"))
+    if (!all(is.na(d))) return(d)
+    d <- suppressWarnings(as.Date(x, "%d-%b-%Y"))
+    if (!all(is.na(d))) return(d)
+    d  # return last attempt (all NA) so error fires below
+  }
+
   full_df <- as.data.frame(all_fires) %>%
     mutate(
-      perimeter_dt   = suppressWarnings(as.POSIXct(.data[[dt_col]], tz = "UTC")),
-      perimeter_date = as.Date(perimeter_dt),
+      perimeter_date = parse_geomac_date(.data[[dt_col]]),
       FIRE_YEAR      = if (!is.na(year_col)) as.integer(.data[[year_col]])
                        else year(perimeter_date),
       INCIDENT       = if (!is.na(name_col)) as.character(.data[[name_col]])
@@ -108,8 +150,16 @@ load_geomac_perimeters <- function(gdb_path, cal_vect, template_r,
            perimeter_date >= cal_start,
            perimeter_date <= cal_end)
 
-  if (nrow(full_df) == 0)
-    stop("No GeoMAC perimeters fall within the calibration date range.")
+  if (nrow(full_df) == 0) {
+    n_parsed <- sum(!is.na(parse_geomac_date(raw_dates)))
+    stop(sprintf(
+      "No GeoMAC perimeters fall within the calibration date range (%s to %s).\n",
+      cal_start, cal_end),
+      sprintf("  %d of %d perimeters had parseable dates.\n", n_parsed, length(raw_dates)),
+      sprintf("  Sample raw values: %s",
+              paste(head(unique(as.character(raw_dates)), 5), collapse = " | "))
+    )
+  }
 
   # ---- Area ---------------------------------------------------------------
   if (all(is.na(full_df$GIS_ACRES))) {
@@ -255,6 +305,7 @@ fit_spread_probability <- function(pairs2, geomac_v, template_r, park_mask,
   if (nrow(eligible) == 0)
     stop("No eligible perimeter pairs for spread probability fit.")
 
+
   samples_list <- vector("list", nrow(eligible))
 
   for (i in seq_len(nrow(eligible))) {
@@ -267,12 +318,26 @@ fit_spread_probability <- function(pairs2, geomac_v, template_r, park_mask,
 
     r_t  <- rasterize_perim(geomac_v, row$row_id,      template_r, park_mask)
     r_t1 <- rasterize_perim(geomac_v, row$row_id_next, template_r, park_mask)
-    if (is.null(r_t) || is.null(r_t1)) next
+
+    if (is.null(r_t) || is.null(r_t1)) {
+      message(sprintf("  Pair %d: skipped — rasterize_perim returned NULL (row_id %s / %s)",
+                      i, row$row_id, row$row_id_next))
+      next
+    }
+
+    n_burned_t  <- sum(values(r_t)  == 1, na.rm = TRUE)
+    n_burned_t1 <- sum(values(r_t1) == 1, na.rm = TRUE)
+    message(sprintf("  Pair %d (fire %s, %s): r_t cells=%d  r_t1 cells=%d",
+                    i, row$FIRE_ID, row$date, n_burned_t, n_burned_t1))
 
     dil        <- focal(r_t, w = ROOK_W, fun = "max", na.policy = "omit", fillvalue = 0)
     cand       <- (dil == 1) & (r_t == 0)
     succ_cells <- which(values(cand & (r_t1 == 1)) == 1)
     fail_cells <- which(values(cand & (r_t1 == 0)) == 1)
+
+    message(sprintf("    cand=%d  succ=%d  fail=%d",
+                    sum(values(cand) == 1, na.rm = TRUE),
+                    length(succ_cells), length(fail_cells)))
 
     n_succ <- length(succ_cells)
     if (n_succ == 0) next
