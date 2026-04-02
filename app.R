@@ -36,7 +36,8 @@
 if (!require("pacman", quietly = TRUE)) install.packages("pacman")
 pacman::p_load(
   shiny, bslib, terra, dplyr, lubridate, readr, tidyr,
-  ggplot2, glue, DT, tmap, purrr, stringr, broom, sf, scales
+  ggplot2, glue, DT, tmap, purrr, stringr, broom, sf, scales,
+  climateR
 )
 
 source("modules/era_helpers.R")
@@ -107,19 +108,17 @@ ui <- page_navbar(
 
     hr(),
 
-    # -- ERA5 wind files
-    h6("4. ERA5 Wind Files (u10 / v10)"),
+    # -- GRIDMET wind (remote fetch, no local files needed)
+    h6("4. GRIDMET Wind (Remote)"),
     p(class = "text-muted small",
-      tags$a("Download from Copernicus CDS",
-             href = "https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels",
+      "Daily 10m wind speed and direction fetched remotely from ",
+      tags$a("GRIDMET", href = "https://www.climatologylab.org/gridmet.html",
              target = "_blank"),
-      " — Variables: 10m_u_component_of_wind, 10m_v_component_of_wind. ",
-      "Daily at 12:00 UTC, 1980-2018, NetCDF."),
-    textInput("era_u10_path", "u10.nc (or combined file)",
-              placeholder = "/path/to/u10.nc"),
-    textInput("era_v10_path", "v10.nc (blank if combined)",
-              placeholder = "/path/to/v10.nc"),
-    actionButton("load_era_wind", "Load Wind Files", class = "btn-sm btn-secondary w-100"),
+      " via OPeNDAP. CONUS only, ~4 km, 1979–present. No download required — ",
+      "load the calibration boundary and set the calibration period first."),
+    actionButton("fetch_gridmet_wind", "Fetch GRIDMET Wind",
+                 class = "btn-sm btn-secondary w-100",
+                 icon  = icon("cloud-arrow-down")),
     uiOutput("era_wind_status"),
 
     hr(),
@@ -402,7 +401,7 @@ server <- function(input, output, session) {
     era_ffmc_daily = NULL,
     era_dmc_daily  = NULL,
     era_dc_daily   = NULL,
-    era_wind_daily = NULL,
+    wind_daily     = NULL,
 
     # Ignition outputs
     ign_df          = NULL,
@@ -555,31 +554,38 @@ server <- function(input, output, session) {
   })
 
   # ---------------------------------------------------------------------------
-  # 4) Load ERA5 wind — uses calibration boundary for spatial extraction
+  # 4) Fetch GRIDMET wind — remote OPeNDAP, no local files required
   # ---------------------------------------------------------------------------
 
-  observeEvent(input$load_era_wind, {
+  observeEvent(input$fetch_gridmet_wind, {
     req(rv$cal_vect)
-    req(nchar(trimws(input$era_u10_path)) > 0)
 
-    withProgress(message = "Extracting ERA5 wind time series...", {
+    output$era_wind_status <- renderUI(
+      tags$span(class = "text-warning small",
+                icon("spinner", class = "fa-spin"),
+                " Fetching GRIDMET wind data (this may take a minute)...")
+    )
+
+    withProgress(message = "Fetching GRIDMET wind...", value = 0, {
       tryCatch({
         cal_start <- as.Date(sprintf("%d-01-01", input$cal_years[1]))
         cal_end   <- as.Date(sprintf("%d-12-31", input$cal_years[2]))
 
-        wind_ts <- extract_era5_wind(
-          u10_path  = input$era_u10_path,
-          v10_path  = if (nchar(trimws(input$era_v10_path)) > 0) input$era_v10_path else NULL,
-          park_vect = rv$cal_vect,
-          cal_start = cal_start,
-          cal_end   = cal_end
+        wind_ts <- extract_gridmet_wind(
+          cal_vect    = rv$cal_vect,
+          cal_start   = cal_start,
+          cal_end     = cal_end,
+          progress_fn = function(i, n, yr) {
+            setProgress(i / n,
+                        detail = sprintf("Year %d (%d of %d)...", yr, i, n))
+          }
         )
-        rv$era_wind_daily <- wind_ts
+        rv$wind_daily <- wind_ts
 
         output$era_wind_status <- renderUI(
           tags$span(class = "text-success small",
                     icon("check"),
-                    sprintf(" %d daily wind records | mean %.1f km/h",
+                    sprintf(" %d daily GRIDMET wind records | mean %.1f km/h",
                             nrow(wind_ts),
                             mean(wind_ts$WindSpeed_kmh, na.rm = TRUE)))
         )
@@ -804,7 +810,7 @@ server <- function(input, output, session) {
 
   observeEvent(input$run_spread_fit, {
     req(rv$cal_vect_proj, rv$template_r, rv$template_mask,
-        rv$era_fwi_daily, rv$era_wind_daily)
+        rv$era_fwi_daily, rv$wind_daily)
     req(nchar(trimws(input$geomac_gdb_path)) > 0)
 
     output$spread_fit_status <- renderUI(
@@ -839,7 +845,7 @@ server <- function(input, output, session) {
       climate_joined <- bind_climate_to_pairs(
         geomac_v   = geomac_result,
         fwi_daily  = rv$era_fwi_daily,
-        wind_daily = rv$era_wind_daily,
+        wind_daily = rv$wind_daily,
         max_gap_sp = input$max_gap_spread_prob,
         max_gap_da = input$max_gap_daily_area,
         neg_tol_ha = input$neg_growth_tol

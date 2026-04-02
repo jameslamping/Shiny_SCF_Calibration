@@ -18,6 +18,7 @@ suppressPackageStartupMessages({
   library(lubridate)
   library(tidyr)
   library(ggplot2)
+  library(climateR)
 })
 
 # -----------------------------------------------------------------------------
@@ -168,6 +169,100 @@ extract_era5_wind <- function(u10_path, v10_path = NULL, park_vect,
     WindSpeed_kmh = wind_speed_kmh,
     WindDir_deg   = wind_dir_deg
   )
+}
+
+
+# -----------------------------------------------------------------------------
+# extract_gridmet_wind
+#
+# Fetches daily wind speed and direction from GRIDMET via OPeNDAP (no local
+# files required). Data are fetched year-by-year to support progress reporting
+# and graceful partial failure.
+#
+# GRIDMET variables used:
+#   vs  -- daily mean 10m wind speed (m/s)  -> converted to km/h
+#   th  -- daily mean 10m wind direction (degrees clockwise from north)
+#
+# Coverage: contiguous US (CONUS) only, 1979-present, ~4 km resolution.
+# Source:   https://www.climatologylab.org/gridmet.html
+#
+# Arguments:
+#   cal_vect    SpatVector of calibration boundary (any CRS; reprojected internally)
+#   cal_start   start Date
+#   cal_end     end Date
+#   progress_fn optional function(i, n_total, year) for progress callbacks
+#
+# Returns data.frame(date, WindSpeed_kmh, WindDir_deg)
+# -----------------------------------------------------------------------------
+
+extract_gridmet_wind <- function(cal_vect, cal_start, cal_end,
+                                  progress_fn = NULL) {
+
+  if (!requireNamespace("climateR", quietly = TRUE))
+    stop("climateR package required. Install with: install.packages('climateR')")
+
+  # GRIDMET uses WGS84 geographic coordinates
+  cal_wgs84 <- project(cal_vect, "EPSG:4326")
+  cal_sf    <- sf::st_as_sf(cal_wgs84)
+
+  years   <- seq(year(cal_start), year(cal_end))
+  results <- vector("list", length(years))
+
+  for (i in seq_along(years)) {
+    yr <- years[i]
+    if (!is.null(progress_fn)) progress_fn(i, length(years), yr)
+
+    yr_start <- max(cal_start, as.Date(sprintf("%d-01-01", yr)))
+    yr_end   <- min(cal_end,   as.Date(sprintf("%d-12-31", yr)))
+
+    gm <- tryCatch(
+      climateR::getGridMET(
+        AOI       = cal_sf,
+        varname   = c("vs", "th"),
+        startDate = as.character(yr_start),
+        endDate   = as.character(yr_end)
+      ),
+      error = function(e) {
+        warning(sprintf("GRIDMET fetch failed for %d: %s", yr, conditionMessage(e)))
+        NULL
+      }
+    )
+
+    if (is.null(gm)) next
+
+    vs_r <- gm$vs
+    th_r <- gm$th
+
+    # Mask to actual boundary polygon (climateR returns bounding-box crop)
+    cal_v  <- vect(cal_sf)
+    vs_r   <- mask(vs_r, cal_v)
+    th_r   <- mask(th_r, cal_v)
+
+    dates <- tryCatch(as.Date(time(vs_r)),
+                      error = function(e) seq(yr_start, yr_end, by = "day"))
+
+    vs_mean <- as.numeric(global(vs_r, "mean", na.rm = TRUE)[, 1])
+    th_mean <- as.numeric(global(th_r, "mean", na.rm = TRUE)[, 1])
+
+    results[[i]] <- tibble(
+      date          = dates,
+      WindSpeed_kmh = vs_mean * 3.6,   # m/s -> km/h
+      WindDir_deg   = th_mean
+    )
+  }
+
+  out <- bind_rows(results)
+
+  if (nrow(out) == 0)
+    stop(paste0(
+      "No GRIDMET wind data returned for the specified region and date range.\n",
+      "  Check that the calibration boundary is within the contiguous US (CONUS)\n",
+      "  and that the GRIDMET THREDDS server is reachable."
+    ))
+
+  out %>%
+    filter(date >= cal_start, date <= cal_end) %>%
+    arrange(date)
 }
 
 
