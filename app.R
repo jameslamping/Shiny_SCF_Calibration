@@ -37,7 +37,7 @@ if (!require("pacman", quietly = TRUE)) install.packages("pacman")
 pacman::p_load(
   shiny, bslib, terra, dplyr, lubridate, readr, tidyr,
   ggplot2, glue, DT, tmap, purrr, stringr, broom, sf, scales,
-  climateR
+  climateR, elevatr
 )
 
 source("modules/era_helpers.R")
@@ -303,12 +303,34 @@ ui <- page_navbar(
           "from dominating the fit."),
 
         hr(),
-        h6("Fine Fuels (optional)"),
-        p(class = "text-muted small",
-          "Fine fuels raster (0–1 scale) on LANDIS grid. Leave blank to use ",
-          "a placeholder value of 1.0 everywhere."),
-        textInput("fine_fuels_path", label = NULL,
-                  placeholder = "/path/to/fine_fuels.tif"),
+        h6("Fine Fuels"),
+        radioButtons("fine_fuels_source", label = NULL,
+          choices = c(
+            "None — placeholder (1.0 everywhere)"  = "none",
+            "Fetch LANDFIRE FBFM40 (remote)"       = "landfire",
+            "Local file (0-1 scaled GeoTIFF)"      = "local"
+          ),
+          selected = "none"
+        ),
+        conditionalPanel(
+          "input.fine_fuels_source == 'landfire'",
+          p(class = "text-muted small",
+            "Pulls LANDFIRE FBFM40 (Scott & Burgan 40 fuel models) for the ",
+            "calibration boundary via ", tags$a("FedData", target = "_blank",
+            href = "https://cran.r-project.org/package=FedData"),
+            ". Reclassified to a 0-1 fine fuel load index using 1-hr + 10-hr ",
+            "dead fuel loading values from Scott & Burgan (2005). Covers CONUS. ",
+            "First run downloads and caches locally; subsequent runs are fast.")
+        ),
+        conditionalPanel(
+          "input.fine_fuels_source == 'local'",
+          textInput("fine_fuels_path", label = NULL,
+                    placeholder = "/path/to/fine_fuels.tif"),
+          p(class = "text-muted small",
+            "Any GeoTIFF scaled 0-1 (e.g. pre-downloaded LANDFIRE 1-hr fuel, ",
+            "FCCS surface fuel load, or custom map). Will be reprojected and ",
+            "resampled to the spread grid automatically.")
+        ),
 
         hr(),
         actionButton("run_spread_fit", "Run Spread Fitting",
@@ -338,9 +360,85 @@ ui <- page_navbar(
                            class = "btn-sm btn-outline-primary")
           ),
 
+          nav_panel("Maps",
+            br(),
+            fluidRow(
+              column(6,
+                h5("Fine Fuels Index (FBFM40-derived)"),
+                p(class = "text-muted small",
+                  "1-hr + 10-hr dead fuel load normalized 0\u20131.",
+                  "Used as B2 predictor in the spread probability equation."),
+                uiOutput("fine_fuels_map_ui")
+              ),
+              column(6,
+                h5("GeoMAC Calibration Fires"),
+                p(class = "text-muted small",
+                  "Historic fire perimeters loaded within the calibration",
+                  "boundary and date range. Colored by fire year."),
+                uiOutput("geomac_fires_map_ui")
+              )
+            )
+          ),
+
           nav_panel("Diagnostics",
-            plotOutput("spread_diag_plot",   height = "300px"),
-            plotOutput("max_area_diag_plot", height = "300px")
+            br(),
+            fluidRow(
+              column(6,
+                h6("Spread Probability vs FWI"),
+                plotOutput("spread_prob_fwi_plot",  height = "280px")
+              ),
+              column(6,
+                h6("Spread Probability vs Wind Speed"),
+                plotOutput("spread_prob_wind_plot", height = "280px")
+              )
+            ),
+            fluidRow(
+              column(6,
+                h6("ROC Curve — Spread Probability Model"),
+                plotOutput("spread_roc_plot",        height = "280px")
+              ),
+              column(6,
+                h6("Max Daily Spread Area: Observed vs Predicted"),
+                plotOutput("max_area_scatter_plot",  height = "280px")
+              )
+            )
+          ),
+
+          nav_panel("Terrain",
+            br(),
+            p(class = "text-muted small",
+              "SRTM/3DEP elevation fetched via elevatr at zoom level 8 (~600 m). ",
+              "Slope and aspect drive effective wind speed at each fire centroid ",
+              "via the upslope wind component plus a Rothermel slope equivalent."),
+            fluidRow(
+              column(4,
+                h6("Effective vs Raw Wind Speed"),
+                p(class = "text-muted small",
+                  "Each point is one perimeter pair. Colour = slope at centroid."),
+                plotOutput("wind_comparison_plot", height = "260px")
+              ),
+              column(4,
+                h6("Slope Distribution at Fire Centroids"),
+                plotOutput("slope_hist_plot",      height = "260px")
+              ),
+              column(4,
+                h6("Wind-to-Upslope Alignment"),
+                p(class = "text-muted small",
+                  "0\u00b0 = wind blowing straight upslope; \u00b1180\u00b0 = downslope."),
+                plotOutput("wind_align_plot",      height = "260px")
+              )
+            ),
+            br(),
+            fluidRow(
+              column(6,
+                h6("Slope (degrees)"),
+                tmapOutput("slope_map", height = "360px")
+              ),
+              column(6,
+                h6("Aspect (degrees from N)"),
+                tmapOutput("aspect_map", height = "360px")
+              )
+            )
           ),
 
           nav_panel("Perimeter Pairs",
@@ -449,11 +547,20 @@ server <- function(input, output, session) {
     startup_df      = NULL,
 
     # Spread outputs
-    pairs_clean      = NULL,
-    spread_prob_coef = NULL,
-    max_area_coef    = NULL,
-    candidate_grid   = NULL,
-    scores_df        = NULL
+    pairs_clean         = NULL,
+    spread_prob_coef    = NULL,
+    spread_prob_model   = NULL,
+    spread_prob_samples = NULL,
+    max_area_coef       = NULL,
+    spread_da_model     = NULL,
+    spread_da_data      = NULL,
+    fine_fuels_r        = NULL,
+    geomac_result       = NULL,
+    dem_r               = NULL,
+    slope_r             = NULL,
+    aspect_r            = NULL,
+    candidate_grid      = NULL,
+    scores_df           = NULL
   )
 
   # ---------------------------------------------------------------------------
@@ -880,12 +987,39 @@ server <- function(input, output, session) {
         }
       )
       req(geomac_result)
+      rv$geomac_result <- geomac_result
 
-      setProgress(0.2, detail = "Building perimeter pairs...")
+      # ---- Terrain (DEM -> slope + aspect) ------------------------------------
+      setProgress(0.18, detail = "Fetching terrain (DEM)...")
+      terrain_result <- tryCatch(
+        fetch_terrain(
+          cal_vect    = rv$cal_vect_proj,
+          working_crs = rv$working_crs,
+          z           = 8,
+          progress_fn = function(msg) setProgress(0.18, detail = msg)
+        ),
+        error = function(e) {
+          warning("Terrain fetch failed, using raw wind speed: ", conditionMessage(e))
+          NULL
+        }
+      )
+
+      if (!is.null(terrain_result)) {
+        rv$dem_r    <- terrain_result$dem
+        rv$slope_r  <- terrain_result$slope
+        rv$aspect_r <- terrain_result$aspect
+        message("Terrain loaded successfully.")
+      } else {
+        rv$dem_r <- rv$slope_r <- rv$aspect_r <- NULL
+      }
+
+      setProgress(0.2, detail = "Building perimeter pairs with effective wind...")
       climate_joined <- bind_climate_to_pairs(
         geomac_v   = geomac_result,
         fwi_daily  = rv$era_fwi_daily,
         wind_daily = rv$wind_daily,
+        slope_r    = rv$slope_r,
+        aspect_r   = rv$aspect_r,
         max_gap_sp = input$max_gap_spread_prob,
         max_gap_da = input$max_gap_daily_area,
         neg_tol_ha = input$neg_growth_tol
@@ -893,7 +1027,10 @@ server <- function(input, output, session) {
       rv$pairs_clean <- climate_joined$pairs
 
       setProgress(0.5, detail = "Fitting max daily area model...")
-      rv$max_area_coef <- fit_max_daily_area(climate_joined$pairs)$coef
+      da_fit             <- fit_max_daily_area(climate_joined$pairs)
+      rv$max_area_coef   <- da_fit$coef
+      rv$spread_da_model <- da_fit$model
+      rv$spread_da_data  <- da_fit$data
 
       # Build a spread rasterization grid from the calibration boundary at the
       # user-specified cell size (defaults to LANDIS template resolution).
@@ -912,17 +1049,57 @@ server <- function(input, output, session) {
         nrow(spread_template), ncol(spread_template), spread_res_m
       ))
 
+      # ---- Fine fuels raster --------------------------------------------------
+      setProgress(0.58, detail = "Preparing fine fuels...")
+      fine_fuels_r <- tryCatch({
+        if (input$fine_fuels_source == "landfire") {
+          fetch_landfire_fine_fuels(
+            cal_vect        = rv$cal_vect_proj,
+            working_crs     = rv$working_crs,
+            spread_template = spread_template,
+            progress_fn     = function(msg) setProgress(0.58, detail = msg)
+          )
+        } else if (input$fine_fuels_source == "local" &&
+                   nchar(trimws(input$fine_fuels_path)) > 0) {
+          load_local_fine_fuels(
+            path            = input$fine_fuels_path,
+            working_crs     = rv$working_crs,
+            spread_template = spread_template
+          )
+        } else {
+          NULL   # placeholder — fit_spread_probability uses 1.0 everywhere
+        }
+      }, error = function(e) {
+        warning("Fine fuels load failed, falling back to placeholder: ",
+                conditionMessage(e))
+        NULL
+      })
+
+      rv$fine_fuels_r <- fine_fuels_r
+
+      if (!is.null(fine_fuels_r)) {
+        message(sprintf("Fine fuels loaded: range [%.3f, %.3f]",
+                        min(values(fine_fuels_r), na.rm = TRUE),
+                        max(values(fine_fuels_r), na.rm = TRUE)))
+      } else {
+        message("Fine fuels: using placeholder (1.0 everywhere).")
+      }
+
       setProgress(0.6, detail = "Fitting spread probability (rasterizing perimeters)...")
-      rv$spread_prob_coef <- fit_spread_probability(
+      sp_fit <- fit_spread_probability(
         pairs2        = climate_joined$spread_pairs,
         geomac_v      = geomac_result,
         template_r    = spread_template,
         park_mask     = spread_mask,
+        fine_fuels_r  = fine_fuels_r,
         failure_ratio = input$failure_sample_ratio,
         max_samples   = input$max_samples_per_pair,
         progress_fn   = function(i, n) setProgress(
           0.6 + 0.35 * (i / n), detail = sprintf("Pair %d of %d...", i, n))
-      )$coef
+      )
+      rv$spread_prob_coef    <- sp_fit$coef
+      rv$spread_prob_model   <- sp_fit$model
+      rv$spread_prob_samples <- sp_fit$samples
 
       setProgress(1.0)
       output$spread_fit_status <- renderUI(
@@ -949,21 +1126,291 @@ server <- function(input, output, session) {
                 rownames = FALSE, class = "table-sm table-striped")
   })
 
-  output$spread_diag_plot <- renderPlot({
-    req(rv$spread_prob_coef, rv$pairs_clean)
-    plot_spread_prob_diagnostics(rv$pairs_clean, rv$spread_prob_coef)
+  # ---------------------------------------------------------------------------
+  # Maps tab outputs
+  # ---------------------------------------------------------------------------
+
+  output$fine_fuels_map_ui <- renderUI({
+    if (!is.null(rv$fine_fuels_r)) {
+      tmapOutput("fine_fuels_map", height = "420px")
+    } else {
+      div(class = "text-muted p-3 border rounded mt-2",
+          icon("circle-info"), " ",
+          "Fine fuels map not available — spread was fitted with a placeholder ",
+          "(1.0 everywhere). Select LANDFIRE or local file and re-run spread fitting.")
+    }
   })
 
-  output$max_area_diag_plot <- renderPlot({
-    req(rv$max_area_coef, rv$pairs_clean)
-    plot_max_area_diagnostics(rv$pairs_clean, rv$max_area_coef)
+  output$fine_fuels_map <- renderTmap({
+    req(rv$fine_fuels_r, rv$cal_vect_proj)
+    ff  <- rv$fine_fuels_r
+
+    # leafem addStarsImage hard limit is 4 MB (4,194,304 bytes).
+    # RGBA = 4 bytes/pixel -> max ~1,000,000 pixels safely.
+    # Aggregate to stay well under that ceiling.
+    max_cells <- 800000L
+    n_cells   <- nrow(ff) * ncol(ff)
+    if (n_cells > max_cells) {
+      fact <- ceiling(sqrt(n_cells / max_cells))
+      ff   <- aggregate(ff, fact = fact, fun = "mean", na.rm = TRUE)
+    }
+
+    bnd <- project(rv$cal_vect_proj, crs(ff))
+    tm_shape(ff) +
+      tm_raster(
+        col        = names(ff)[1],
+        col.scale  = tm_scale_continuous(
+          values   = "brewer.yl_gn",
+          value.na = NA,
+          limits   = c(0, 1)
+        ),
+        col.legend = tm_legend(title = "Fine Fuel Load\n(0\u20131)"),
+        col_alpha  = 0.85
+      ) +
+      tm_shape(bnd) +
+      tm_borders(col = "gray30", lwd = 1.5)
+  })
+
+  output$geomac_fires_map_ui <- renderUI({
+    if (!is.null(rv$geomac_result)) {
+      tmapOutput("geomac_fires_map", height = "420px")
+    } else {
+      div(class = "text-muted p-3 border rounded mt-2",
+          icon("circle-info"), " ",
+          "GeoMAC fires will appear here after spread fitting is run.")
+    }
+  })
+
+  output$geomac_fires_map <- renderTmap({
+    req(rv$geomac_result, rv$cal_vect_proj)
+    fires <- project(rv$geomac_result, "EPSG:4326")
+    bnd   <- project(rv$cal_vect_proj, "EPSG:4326")
+    yr_col <- grep("FIRE_YEAR|fire_year|year",
+                   names(fires), ignore.case = TRUE, value = TRUE)[1]
+    fill_col <- if (!is.na(yr_col)) yr_col else names(fires)[1]
+    tm_shape(bnd) +
+      tm_borders(col = "gray30", lwd = 2) +
+      tm_shape(fires) +
+      tm_polygons(
+        col        = fill_col,
+        col.scale  = tm_scale_ordinal(values = "brewer.set1"),
+        col_alpha  = 0.55,
+        col.legend = tm_legend(title = "Fire Year")
+      )
+  })
+
+  # ---------------------------------------------------------------------------
+  # Terrain tab outputs
+  # ---------------------------------------------------------------------------
+
+  output$wind_comparison_plot <- renderPlot({
+    req(rv$pairs_clean)
+    dat <- rv$pairs_clean %>%
+      filter(is.finite(WindSpeed_kmh), is.finite(EffectiveWind))
+    if (nrow(dat) == 0) return(NULL)
+    has_slope <- "Slope_deg" %in% names(dat) && any(is.finite(dat$Slope_deg))
+    p <- ggplot(dat, aes(WindSpeed_kmh, EffectiveWind))
+    if (has_slope) {
+      p <- p + geom_point(aes(colour = Slope_deg), size = 2.5, alpha = 0.8) +
+        scale_colour_gradientn(
+          colours = c("#a8d5a2","#f5a623","#c0392b"),
+          name    = "Slope\n(deg)")
+    } else {
+      p <- p + geom_point(colour = "#c0392b", size = 2.5, alpha = 0.8)
+    }
+    p + geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+      labs(title   = "Effective vs Raw Wind Speed",
+           subtitle = if (has_slope) "Terrain-adjusted" else "No terrain (placeholder)",
+           x = "Raw Wind Speed (km/h)",
+           y = "Effective Wind Speed (km/h)") +
+      theme_bw(base_size = 11)
+  })
+
+  output$slope_hist_plot <- renderPlot({
+    req(rv$pairs_clean)
+    dat <- rv$pairs_clean %>% filter(is.finite(Slope_deg))
+    if (nrow(dat) == 0)
+      return(ggplot() + labs(title = "No slope data (terrain not fetched)") + theme_bw())
+    ggplot(dat, aes(Slope_deg)) +
+      geom_histogram(fill = "#c0392b", colour = "white", bins = 20, alpha = 0.8) +
+      labs(title   = "Slope at Fire Centroids",
+           x = "Slope (degrees)", y = "Number of pairs") +
+      theme_bw(base_size = 11)
+  })
+
+  output$wind_align_plot <- renderPlot({
+    req(rv$pairs_clean)
+    dat <- rv$pairs_clean %>%
+      filter(is.finite(WindDir_deg), is.finite(Aspect_deg))
+    if (nrow(dat) == 0)
+      return(ggplot() + labs(title = "No aspect data (terrain not fetched)") + theme_bw())
+    dat <- dat %>% mutate(
+      upslope   = (Aspect_deg + 180) %% 360,
+      align_deg = ((WindDir_deg - upslope + 180) %% 360) - 180
+    )
+    ggplot(dat, aes(align_deg)) +
+      geom_histogram(fill = "#2c5f2e", colour = "white", bins = 24, alpha = 0.85) +
+      geom_vline(xintercept = 0, linetype = "dashed", colour = "grey30") +
+      scale_x_continuous(breaks = seq(-180, 180, 60),
+                         limits = c(-180, 180)) +
+      labs(title   = "Wind-to-Upslope Alignment",
+           x = "Angle from upslope direction (degrees)",
+           y = "Number of pairs") +
+      theme_bw(base_size = 11)
+  })
+
+  output$slope_map <- renderTmap({
+    req(rv$slope_r, rv$cal_vect_proj)
+    sl <- rv$slope_r
+    n_cells <- nrow(sl) * ncol(sl)
+    if (n_cells > 800000L) {
+      fact <- ceiling(sqrt(n_cells / 800000L))
+      sl   <- aggregate(sl, fact = fact, fun = "mean", na.rm = TRUE)
+    }
+    bnd <- project(rv$cal_vect_proj, crs(sl))
+    tm_shape(sl) +
+      tm_raster(
+        col        = names(sl)[1],
+        col.scale  = tm_scale_continuous(
+          values   = "brewer.yl_or_rd", value.na = NA),
+        col.legend = tm_legend(title = "Slope (deg)"),
+        col_alpha  = 0.85
+      ) +
+      tm_shape(bnd) + tm_borders(col = "gray30", lwd = 1.2)
+  })
+
+  output$aspect_map <- renderTmap({
+    req(rv$aspect_r, rv$cal_vect_proj)
+    asp <- rv$aspect_r
+    n_cells <- nrow(asp) * ncol(asp)
+    if (n_cells > 800000L) {
+      fact <- ceiling(sqrt(n_cells / 800000L))
+      asp  <- aggregate(asp, fact = fact, fun = "mean", na.rm = TRUE)
+    }
+    bnd <- project(rv$cal_vect_proj, crs(asp))
+    tm_shape(asp) +
+      tm_raster(
+        col        = names(asp)[1],
+        col.scale  = tm_scale_continuous(
+          values   = "brewer.rd_yl_bu", value.na = NA,
+          limits   = c(0, 360)),
+        col.legend = tm_legend(title = "Aspect (deg\nfrom N)"),
+        col_alpha  = 0.85
+      ) +
+      tm_shape(bnd) + tm_borders(col = "gray30", lwd = 1.2)
+  })
+
+  # ---------------------------------------------------------------------------
+  # Diagnostics tab outputs
+  # ---------------------------------------------------------------------------
+
+  output$spread_prob_fwi_plot <- renderPlot({
+    req(rv$spread_prob_model, rv$spread_prob_samples)
+    samp    <- rv$spread_prob_samples
+    m       <- rv$spread_prob_model
+    fwi_seq <- seq(0, max(samp$FWI, na.rm = TRUE) * 1.05, length.out = 200)
+    nd <- data.frame(
+      FWI           = fwi_seq,
+      WindSpeed_kmh = mean(samp$WindSpeed_kmh, na.rm = TRUE),
+      FineFuels     = mean(samp$FineFuels,     na.rm = TRUE)
+    )
+    pr  <- predict(m, nd, type = "response", se.fit = TRUE)
+    nd$fit   <- pr$fit
+    nd$lower <- pmax(0, pr$fit - 1.96 * pr$se.fit)
+    nd$upper <- pmin(1, pr$fit + 1.96 * pr$se.fit)
+    ggplot(nd, aes(FWI, fit)) +
+      geom_ribbon(aes(ymin = lower, ymax = upper),
+                  alpha = 0.2, fill = "#c0392b") +
+      geom_line(color = "#c0392b", linewidth = 1) +
+      geom_rug(data = samp, aes(x = FWI, y = NULL),
+               sides = "b", alpha = 0.04) +
+      scale_y_continuous(limits = c(0, 1),
+                         labels = scales::percent_format(accuracy = 1)) +
+      labs(x = "FWI", y = "P(spread to neighbor cell)",
+           subtitle = sprintf("At mean wind %.1f km/h, mean fine fuels %.2f",
+                              mean(samp$WindSpeed_kmh, na.rm = TRUE),
+                              mean(samp$FineFuels,     na.rm = TRUE))) +
+      theme_bw(base_size = 11)
+  })
+
+  output$spread_prob_wind_plot <- renderPlot({
+    req(rv$spread_prob_model, rv$spread_prob_samples)
+    samp     <- rv$spread_prob_samples
+    m        <- rv$spread_prob_model
+    wind_seq <- seq(0, max(samp$WindSpeed_kmh, na.rm = TRUE) * 1.05, length.out = 200)
+    nd <- data.frame(
+      FWI           = mean(samp$FWI,       na.rm = TRUE),
+      WindSpeed_kmh = wind_seq,
+      FineFuels     = mean(samp$FineFuels, na.rm = TRUE)
+    )
+    pr  <- predict(m, nd, type = "response", se.fit = TRUE)
+    nd$fit   <- pr$fit
+    nd$lower <- pmax(0, pr$fit - 1.96 * pr$se.fit)
+    nd$upper <- pmin(1, pr$fit + 1.96 * pr$se.fit)
+    ggplot(nd, aes(WindSpeed_kmh, fit)) +
+      geom_ribbon(aes(ymin = lower, ymax = upper),
+                  alpha = 0.2, fill = "#2c5f2e") +
+      geom_line(color = "#2c5f2e", linewidth = 1) +
+      geom_rug(data = samp, aes(x = WindSpeed_kmh, y = NULL),
+               sides = "b", alpha = 0.04) +
+      scale_y_continuous(limits = c(0, 1),
+                         labels = scales::percent_format(accuracy = 1)) +
+      labs(x = "Wind Speed (km/h)", y = "P(spread to neighbor cell)",
+           subtitle = sprintf("At mean FWI %.1f, mean fine fuels %.2f",
+                              mean(samp$FWI,       na.rm = TRUE),
+                              mean(samp$FineFuels, na.rm = TRUE))) +
+      theme_bw(base_size = 11)
+  })
+
+  output$spread_roc_plot <- renderPlot({
+    req(rv$spread_prob_model, rv$spread_prob_samples)
+    samp  <- rv$spread_prob_samples
+    pred  <- predict(rv$spread_prob_model, samp, type = "response")
+    ord   <- order(pred, decreasing = TRUE)
+    y     <- samp$y[ord]
+    n_pos <- sum(y == 1);  n_neg <- sum(y == 0)
+    tpr   <- cumsum(y == 1) / n_pos
+    fpr   <- cumsum(y == 0) / n_neg
+    auc   <- sum(diff(c(0, fpr)) * (c(0, tpr[-length(tpr)]) + tpr) / 2)
+    roc_df <- data.frame(fpr = c(0, fpr, 1), tpr = c(0, tpr, 1))
+    ggplot(roc_df, aes(fpr, tpr)) +
+      geom_abline(slope = 1, intercept = 0,
+                  linetype = "dashed", color = "gray60") +
+      geom_line(color = "#c0392b", linewidth = 1) +
+      annotate("text", x = 0.65, y = 0.12,
+               label = sprintf("AUC = %.3f", auc), size = 4) +
+      scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+      scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+      labs(x = "False Positive Rate", y = "True Positive Rate") +
+      theme_bw(base_size = 11)
+  })
+
+  output$max_area_scatter_plot <- renderPlot({
+    req(rv$spread_da_model, rv$spread_da_data)
+    dat <- rv$spread_da_data
+    dat$pred_ha <- expm1(predict(rv$spread_da_model, dat))
+    ggplot(dat, aes(daily_area_ha, pred_ha, color = FWI)) +
+      geom_abline(slope = 1, intercept = 0,
+                  linetype = "dashed", color = "gray60") +
+      geom_point(alpha = 0.7, size = 2.5) +
+      scale_color_gradient(low = "#ffffb2", high = "#d7191c", name = "FWI") +
+      scale_x_log10(labels = scales::comma) +
+      scale_y_log10(labels = scales::comma) +
+      labs(x = "Observed (ha/day)", y = "Predicted (ha/day)",
+           subtitle = "Log scale \u2014 dashed = perfect fit") +
+      theme_bw(base_size = 11)
   })
 
   output$pairs_table <- renderDT({
     req(rv$pairs_clean)
+    cols <- intersect(
+      c("FIRE_ID", "date", "gap_days", "daily_area_ha", "FWI",
+        "WindSpeed_kmh", "WindDir_deg", "Slope_deg", "Aspect_deg",
+        "EffectiveWind", "use_for_spread_prob", "use_for_daily_area"),
+      names(rv$pairs_clean)
+    )
     rv$pairs_clean %>%
-      select(FIRE_ID, date, gap_days, daily_area_ha, FWI, WindSpeed_kmh,
-             use_for_spread_prob, use_for_daily_area) %>%
+      select(all_of(cols)) %>%
       mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
       datatable(options = list(pageLength = 15, scrollX = TRUE),
                 rownames = FALSE, class = "table-sm table-striped")

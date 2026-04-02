@@ -10,12 +10,189 @@
 
 if (!require("pacman", quietly = TRUE)) install.packages("pacman")
 pacman::p_load(terra, dplyr, readr, ggplot2, tidyr, purrr, stringr,
-               lubridate, glue, broom, scales)
+               lubridate, glue, broom, scales, httr, elevatr)
 
 ROOK_W <- matrix(c(0,1,0, 1,1,1, 0,1,0), nrow = 3, byrow = TRUE)
 
 # Reuse utilities from ignition_helpers (sourced before this file in app.R)
 # pick_first_col(), parse_any_date() are defined there.
+
+
+# =============================================================================
+# Fine fuels helpers
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# FBFM40 -> fine fuel load lookup table
+#
+# Fine fuel load = 1-hr + 10-hr dead fuel (tons/acre) for each Scott & Burgan
+# 40 fuel model, sourced from Scott & Burgan (2005).  LANDFIRE stores FBFM40
+# as integer codes; this table maps those codes to physical fuel loads which
+# are then normalized 0-1 for use in the SCF spread probability equation.
+# -----------------------------------------------------------------------------
+
+FBFM40_FINE_FUELS <- c(
+  # Non-burnable
+  "91" = 0.00, "92" = 0.00, "93" = 0.05,
+  "98" = 0.00, "99" = 0.00,
+  # Grass (GR)
+  "101" = 0.10, "102" = 0.10, "103" = 0.50,
+  "104" = 2.25, "105" = 3.45, "106" = 3.60,
+  "107" = 5.50, "108" = 4.50, "109" = 9.00,
+  # Grass-Shrub (GS)
+  "121" = 0.35, "122" = 1.55, "123" = 1.80, "124" = 6.40,
+  # Shrub (SH)
+  "141" = 0.45, "142" = 1.35, "143" = 0.50, "144" = 1.80,
+  "145" = 3.60, "146" = 2.90, "147" = 6.20, "149" = 8.35,
+  # Timber-Understory (TU)
+  "161" = 0.80, "162" = 1.60, "163" = 1.50,
+  "164" = 0.70, "165" = 3.00,
+  # Timber Litter (TL)
+  "181" = 1.00, "182" = 1.40, "183" = 0.80, "184" = 0.80,
+  "185" = 1.40, "186" = 2.40, "187" = 1.40,
+  "188" = 3.50, "189" = 4.50,
+  # Slash-Blowdown (SB)
+  "201" = 1.55, "202" = 4.50, "203" = 5.50, "204" = 3.50
+)
+
+
+# -----------------------------------------------------------------------------
+# fetch_landfire_fine_fuels
+#
+# Pulls LANDFIRE FBFM40 for the calibration boundary via FedData, reclassifies
+# integer fuel model codes to a 0-1 fine fuel load index using FBFM40_FINE_FUELS,
+# reprojects and resamples to the spread rasterization grid.
+#
+# Arguments:
+#   cal_vect       SpatVector of calibration boundary (any CRS)
+#   working_crs    CRS string for output
+#   spread_template SpatRaster defining the output grid (extent + resolution)
+#   progress_fn    optional function(msg) for status messages
+#
+# Returns a SpatRaster on spread_template grid, values 0-1 (NA = non-burnable)
+# -----------------------------------------------------------------------------
+
+fetch_landfire_fine_fuels <- function(cal_vect, working_crs, spread_template,
+                                       progress_fn = NULL) {
+
+  # ---- Bounding box in WGS84 -----------------------------------------------
+  cal_wgs84 <- project(cal_vect, "EPSG:4326")
+  bb        <- as.vector(ext(cal_wgs84))   # xmin, xmax, ymin, ymax
+
+  # ---- Request pixel dimensions (cap at 4096; LANDFIRE native = 30 m) -------
+  deg_per_30m <- 30 / 111320          # ~0.000270 degrees per 30 m
+  nx <- min(as.integer(ceiling((bb["xmax"] - bb["xmin"]) / deg_per_30m)), 4096L)
+  ny <- min(as.integer(ceiling((bb["ymax"] - bb["ymin"]) / deg_per_30m)), 4096L)
+  message(sprintf("Requesting LANDFIRE FBFM40: %d x %d pixels over bbox [%.4f %.4f %.4f %.4f]",
+                  nx, ny, bb["xmin"], bb["ymin"], bb["xmax"], bb["ymax"]))
+
+  # ---- LANDFIRE LF2024 FBFM40 CONUS ImageServer ----------------------------
+  # Hosted at lfps.usgs.gov; native CRS EPSG:5070, pixel type S16, range 91-204.
+  # rasterFunction "None" returns raw integer fuel model codes.
+  base_url <- paste0(
+    "https://lfps.usgs.gov/arcgis/rest/services/",
+    "Landfire_LF2024/LF2024_FBFM40_CONUS/ImageServer/exportImage"
+  )
+
+  if (!is.null(progress_fn)) progress_fn("Downloading LANDFIRE FBFM40 from USGS server...")
+
+  tmp_tif <- tempfile(fileext = ".tif")
+
+  resp <- tryCatch(
+    httr::GET(
+      base_url,
+      query = list(
+        bbox          = sprintf("%.6f,%.6f,%.6f,%.6f",
+                                bb["xmin"], bb["ymin"], bb["xmax"], bb["ymax"]),
+        bboxSR        = "4326",
+        imageSR       = "4326",
+        size          = sprintf("%d,%d", nx, ny),
+        format        = "tiff",
+        pixelType     = "S16",
+        renderingRule = '{"rasterFunction":"None"}',
+        f             = "image"
+      ),
+      httr::write_disk(tmp_tif, overwrite = TRUE),
+      httr::timeout(300)
+    ),
+    error = function(e)
+      stop("LANDFIRE HTTP request failed: ", conditionMessage(e))
+  )
+
+  if (httr::http_error(resp))
+    stop("LANDFIRE REST API returned HTTP ", httr::status_code(resp),
+         ". Check internet connection or try again later.")
+
+  # ---- Read and validate ----------------------------------------------------
+  fbfm_r <- tryCatch(
+    rast(tmp_tif),
+    error = function(e)
+      stop("Could not read LANDFIRE response as raster: ", conditionMessage(e))
+  )
+
+  raw_vals  <- values(fbfm_r, mat = FALSE)
+  val_range <- range(raw_vals, na.rm = TRUE)
+  message(sprintf("LANDFIRE raw pixel range: [%.0f, %.0f]  (expected 91-204)",
+                  val_range[1], val_range[2]))
+
+  # ---- Reclassify integer codes -> fine fuel load (tons/acre), normalise ----
+  if (!is.null(progress_fn)) progress_fn("Reclassifying FBFM40 to fine fuel index...")
+
+  code_strs <- as.character(as.integer(round(raw_vals)))
+  loads     <- as.numeric(FBFM40_FINE_FUELS[code_strs])   # NA for unknown codes
+
+  max_load <- max(FBFM40_FINE_FUELS)                       # GR9 = 9.0 t/ac
+  loads    <- loads / max_load
+  loads[loads < 0 | !is.finite(loads)] <- NA
+
+  values(fbfm_r) <- loads
+
+  matched_frac <- mean(!is.na(loads))
+  message(sprintf("FBFM40 reclassification: %.1f%% of pixels matched a known fuel code",
+                  matched_frac * 100))
+  if (matched_frac < 0.1)
+    warning("Fewer than 10% of pixels matched known FBFM40 codes. ",
+            "The downloaded raster may not contain raw fuel model integers. ",
+            "Fine fuels will fall back to placeholder (1.0) for most cells.")
+
+  # ---- Reproject + resample to spread grid ---------------------------------
+  if (!is.null(progress_fn)) progress_fn("Reprojecting and resampling fine fuels...")
+  fbfm_proj <- project(fbfm_r, working_crs, method = "bilinear")
+  resample(fbfm_proj, spread_template, method = "bilinear")
+}
+
+
+# -----------------------------------------------------------------------------
+# load_local_fine_fuels
+#
+# Loads a user-provided raster, validates it is 0-1 scaled, reprojects and
+# resamples to the spread grid.
+# -----------------------------------------------------------------------------
+
+load_local_fine_fuels <- function(path, working_crs, spread_template) {
+
+  if (!file.exists(path))
+    stop("Fine fuels raster not found: ", path)
+
+  r <- rast(path)
+
+  rng <- range(values(r, mat = FALSE), na.rm = TRUE)
+  if (rng[2] > 10)
+    warning(sprintf(
+      "Fine fuels raster max value is %.1f — expected 0-1 scale. ",
+      rng[2]),
+      "Values will be normalized to 0-1.")
+
+  # Normalize if not already 0-1
+  v <- values(r, mat = FALSE)
+  mx <- max(v, na.rm = TRUE)
+  if (is.finite(mx) && mx > 1) v <- v / mx
+  v[!is.finite(v)] <- NA
+  values(r) <- v
+
+  r_proj <- project(r, working_crs, method = "bilinear")
+  resample(r_proj, spread_template, method = "bilinear")
+}
 
 
 # -----------------------------------------------------------------------------
@@ -189,10 +366,105 @@ load_geomac_perimeters <- function(gdb_path, cal_vect, template_r,
 
 
 # -----------------------------------------------------------------------------
+# fetch_terrain
+#
+# Downloads a DEM for the calibration boundary via elevatr (SRTM/3DEP tiles),
+# then computes slope (degrees) and aspect (degrees clockwise from N) with
+# terra::terrain().
+#
+# Arguments:
+#   cal_vect    SpatVector in working CRS defining the calibration area
+#   working_crs CRS string (taken from template_r)
+#   z           elevatr zoom level (default 8 ≈ 600 m; 9 ≈ 300 m)
+#   progress_fn optional function(msg) for status messages
+#
+# Returns list(dem, slope, aspect) — all SpatRasters in working_crs
+# -----------------------------------------------------------------------------
+
+fetch_terrain <- function(cal_vect, working_crs, z = 8, progress_fn = NULL) {
+
+  if (!requireNamespace("elevatr", quietly = TRUE))
+    stop("elevatr package required. Install with: install.packages('elevatr')")
+
+  if (!is.null(progress_fn)) progress_fn("Fetching DEM via elevatr (SRTM/3DEP)...")
+
+  cal_sf <- sf::st_as_sf(project(cal_vect, "EPSG:4326"))
+
+  dem_raster <- tryCatch(
+    elevatr::get_elev_raster(cal_sf, z = z, clip = "bbox", neg_to_na = FALSE),
+    error = function(e) stop("elevatr DEM fetch failed: ", conditionMessage(e))
+  )
+
+  dem_r    <- rast(dem_raster)
+  dem_proj <- project(dem_r, working_crs, method = "bilinear")
+
+  if (!is.null(progress_fn)) progress_fn("Computing slope and aspect...")
+
+  slope_r  <- terrain(dem_proj, v = "slope",  unit = "degrees")
+  aspect_r <- terrain(dem_proj, v = "aspect", unit = "degrees")
+
+  message(sprintf(
+    "Terrain: DEM range [%.0f, %.0f] m  |  slope [%.1f, %.1f] deg  |  %d x %d cells",
+    minmax(dem_proj)[1], minmax(dem_proj)[2],
+    minmax(slope_r)[1],  minmax(slope_r)[2],
+    nrow(dem_proj), ncol(dem_proj)
+  ))
+
+  list(dem = dem_proj, slope = slope_r, aspect = aspect_r)
+}
+
+
+# -----------------------------------------------------------------------------
+# compute_effective_wind
+#
+# Converts raw wind speed + direction + terrain (slope/aspect) into an
+# "effective wind speed" in the upslope direction — the wind component that
+# matters most for fire spread in SCF.
+#
+# Physics:
+#   1. Upslope direction = (aspect + 180) %% 360
+#      (terra aspect = direction of steepest descent, clockwise from N)
+#   2. Wind upslope component = wind_speed × cos(wind_dir − upslope_dir)
+#      Positive when wind blows uphill, negative when blowing downhill.
+#   3. Slope wind equivalent (Rothermel-inspired):
+#      slope_pct = tan(slope_deg × π/180) × 100
+#      slope_wind_kmh = slope_pct × 0.3  (approximate mid-range fuel conversion)
+#   4. effective_wind = max(0, wind_upslope + slope_wind_kmh)
+#
+# All inputs are vectors of equal length. Returns vector of same length.
+# -----------------------------------------------------------------------------
+
+compute_effective_wind <- function(wind_speed, wind_dir, slope_deg, aspect_deg) {
+
+  # Replace NAs with neutral values so vector stays full-length
+  slope_deg  <- ifelse(is.finite(slope_deg),  slope_deg,  0)
+  aspect_deg <- ifelse(is.finite(aspect_deg), aspect_deg, wind_dir)  # neutral: wind is along-slope
+
+  upslope_dir <- (aspect_deg + 180) %% 360
+
+  # Signed angle between wind direction and upslope direction (-180 to 180)
+  delta_deg <- ((wind_dir - upslope_dir + 180) %% 360) - 180
+  delta_rad <- delta_deg * pi / 180
+
+  # Wind component in the upslope direction
+  wind_upslope <- wind_speed * cos(delta_rad)
+
+  # Slope-equivalent wind speed (Rothermel-inspired, approximate)
+  slope_pct      <- tan(slope_deg * pi / 180) * 100
+  slope_wind_kmh <- pmax(0, slope_pct * 0.3)
+
+  # Combine: only count positive (assisting) wind; always include slope contribution
+  pmax(0, wind_upslope + slope_wind_kmh)
+}
+
+
+# -----------------------------------------------------------------------------
 # bind_climate_to_pairs
 # -----------------------------------------------------------------------------
 
 bind_climate_to_pairs <- function(geomac_v, fwi_daily, wind_daily,
+                                   slope_r    = NULL,
+                                   aspect_r   = NULL,
                                    max_gap_sp = 1, max_gap_da = 3,
                                    neg_tol_ha = 1.0) {
 
@@ -231,6 +503,19 @@ bind_climate_to_pairs <- function(geomac_v, fwi_daily, wind_daily,
       use_for_daily_area  = !drop_neg & gap_days <= max_gap_da & delta_ha > 0
     )
 
+  # Extract centroid coordinates for each pair's t perimeter (for terrain lookup)
+  gm_row_ids  <- as.integer(geomac_v$row_id)
+  pair_idx    <- match(pairs$row_id, gm_row_ids)
+  valid_idx   <- !is.na(pair_idx)
+
+  ctr_v       <- centroids(geomac_v[pair_idx[valid_idx], ])
+  ctr_xy      <- geom(ctr_v)[, c("x", "y"), drop = FALSE]
+
+  pairs$centroid_x <- NA_real_
+  pairs$centroid_y <- NA_real_
+  pairs$centroid_x[valid_idx] <- ctr_xy[, "x"]
+  pairs$centroid_y[valid_idx] <- ctr_xy[, "y"]
+
   # Join climate
   climate <- fwi_daily %>%
     rename(FWI = value) %>%
@@ -241,9 +526,47 @@ bind_climate_to_pairs <- function(geomac_v, fwi_daily, wind_daily,
     mutate(
       FWI           = suppressWarnings(as.numeric(FWI)),
       WindSpeed_kmh = suppressWarnings(as.numeric(WindSpeed_kmh)),
-      WindDir_deg   = suppressWarnings(as.numeric(WindDir_deg)),
-      EffectiveWind = WindSpeed_kmh  # placeholder: swap for topographic formula later
+      WindDir_deg   = suppressWarnings(as.numeric(WindDir_deg))
     )
+
+  # Compute effective wind: topographic formula if terrain available, else raw speed
+  if (!is.null(slope_r) && !is.null(aspect_r)) {
+    message("Computing effective wind using slope/aspect at fire centroids...")
+    valid_pts <- !is.na(pairs$centroid_x) & !is.na(pairs$centroid_y) &
+                 is.finite(pairs$WindSpeed_kmh) & is.finite(pairs$WindDir_deg)
+
+    slope_vals  <- rep(NA_real_, nrow(pairs))
+    aspect_vals <- rep(NA_real_, nrow(pairs))
+
+    if (any(valid_pts)) {
+      pts_v <- vect(
+        data.frame(x = pairs$centroid_x[valid_pts], y = pairs$centroid_y[valid_pts]),
+        geom = c("x", "y"), crs = crs(slope_r)
+      )
+      slope_vals[valid_pts]  <- as.numeric(terra::extract(slope_r,  pts_v)[, 2])
+      aspect_vals[valid_pts] <- as.numeric(terra::extract(aspect_r, pts_v)[, 2])
+    }
+
+    pairs$Slope_deg   <- slope_vals
+    pairs$Aspect_deg  <- aspect_vals
+    pairs$EffectiveWind <- compute_effective_wind(
+      wind_speed = pairs$WindSpeed_kmh,
+      wind_dir   = pairs$WindDir_deg,
+      slope_deg  = slope_vals,
+      aspect_deg = aspect_vals
+    )
+    message(sprintf(
+      "Effective wind: mean=%.1f km/h  raw wind mean=%.1f km/h  slope contribution mean=%.1f km/h",
+      mean(pairs$EffectiveWind, na.rm = TRUE),
+      mean(pairs$WindSpeed_kmh, na.rm = TRUE),
+      mean(pairs$EffectiveWind - pmax(0, pairs$WindSpeed_kmh), na.rm = TRUE)
+    ))
+  } else {
+    message("No terrain rasters provided — using raw wind speed as EffectiveWind (placeholder).")
+    pairs$Slope_deg    <- NA_real_
+    pairs$Aspect_deg   <- NA_real_
+    pairs$EffectiveWind <- pairs$WindSpeed_kmh
+  }
 
   spread_pairs <- pairs %>% filter(use_for_spread_prob)
 
@@ -296,6 +619,7 @@ fit_max_daily_area <- function(pairs) {
 # -----------------------------------------------------------------------------
 
 fit_spread_probability <- function(pairs2, geomac_v, template_r, park_mask,
+                                    fine_fuels_r  = NULL,
                                     failure_ratio = 3, max_samples = 25000,
                                     progress_fn = NULL) {
 
@@ -354,13 +678,25 @@ fit_spread_probability <- function(pairs2, geomac_v, template_r, park_mask,
     n_f <- length(fail_keep)
     if (n_succ + n_f == 0) next
 
+    # Extract fine fuel values at sample cell locations (or use 1.0 placeholder)
+    if (!is.null(fine_fuels_r)) {
+      all_cells    <- c(succ_cells, fail_keep)
+      ff_vals      <- as.numeric(values(fine_fuels_r)[all_cells])
+      # Replace NA fine fuel values with the raster-wide mean (safe fallback)
+      ff_mean      <- mean(ff_vals, na.rm = TRUE)
+      if (!is.finite(ff_mean)) ff_mean <- 1.0
+      ff_vals[!is.finite(ff_vals)] <- ff_mean
+    } else {
+      ff_vals <- rep(1.0, n_succ + n_f)
+    }
+
     samples_list[[i]] <- tibble(
       FIRE_ID       = rep(row$FIRE_ID, n_succ + n_f),
       date          = rep(row$date,    n_succ + n_f),
       y             = c(rep(1L, n_succ), rep(0L, n_f)),
       FWI           = rep(fwi,  n_succ + n_f),
       WindSpeed_kmh = rep(wspd, n_succ + n_f),
-      FineFuels     = rep(1.0,  n_succ + n_f)
+      FineFuels     = ff_vals
     )
   }
 
@@ -372,13 +708,15 @@ fit_spread_probability <- function(pairs2, geomac_v, template_r, park_mask,
            data   = all_samples,
            family = binomial(link = "logit"))
 
+  fine_fuels_label <- if (is.null(fine_fuels_r)) "B2_FineFuels (placeholder)" else "B2_FineFuels"
+
   coef_df <- broom::tidy(m) %>%
     rename(std_error = std.error, p_value = p.value) %>%
     mutate(
       term = case_when(
         term == "(Intercept)"   ~ "B0_Intercept",
         term == "FWI"           ~ "B1_FWI",
-        term == "FineFuels"     ~ "B2_FineFuels (placeholder)",
+        term == "FineFuels"     ~ fine_fuels_label,
         term == "WindSpeed_kmh" ~ "B3_EffectiveWind",
         TRUE ~ term
       ),
