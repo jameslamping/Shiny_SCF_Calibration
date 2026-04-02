@@ -1,0 +1,38 @@
+# =============================================================================
+# R / Shiny project .gitignore
+# =============================================================================
+
+# R session artifacts
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# R package build outputs
+*.tar.gz
+*.zip
+
+# renv / packrat lockfiles (uncomment if using renv)
+# renv/library/
+# renv/.cache/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Large data inputs — too big for git; document in README
+*.nc
+*.gdb
+*.gdb/
+*.tif
+*.tiff
+*.geotiff
+
+# Temporary / scratch output files
+*.tmp
+Rplots.pdf
+
+# Shiny app logs
+*.log
+rsconnect/
