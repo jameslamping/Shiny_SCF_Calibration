@@ -12,9 +12,15 @@
 *.tar.gz
 *.zip
 
-# renv / packrat lockfiles (uncomment if using renv)
-# renv/library/
-# renv/.cache/
+# renv — commit the lockfile and activate script; ignore the library cache
+# (collaborators run `renv::restore()` to rebuild the library locally)
+renv/library/
+renv/local/
+renv/cellar/
+renv/lock/
+renv/python/
+renv/sandbox/
+renv/staging/
 
 # macOS
 .DS_Store
@@ -36,3 +42,6 @@ Rplots.pdf
 # Shiny app logs
 *.log
 rsconnect/
+
+# user paths
+paths.rtf
