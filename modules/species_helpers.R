@@ -16,6 +16,12 @@
 
 pacman::p_load(dplyr, tibble, readr, stringr, purrr)
 
+# rFIA is available on CRAN; install if missing
+if (!requireNamespace("rFIA", quietly = TRUE)) {
+  message("Installing rFIA from CRAN...")
+  install.packages("rFIA")
+}
+
 # -----------------------------------------------------------------------------
 # LANDIS species code → FIA SPCD lookup table
 # Covers full PascalCase binomials (NECN style) and 8-char abbreviations.

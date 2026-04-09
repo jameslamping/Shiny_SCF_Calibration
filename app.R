@@ -367,19 +367,42 @@ ui <- page_navbar(
           "thickness in cm) and ", tags$b("AgeDBH"), " (age at half-maximum ",
           "bark thickness) via the SCF Eq. 10 Michaelis-Menten form."),
 
-        checkboxGroupInput("fia_states", "FIA States to Query",
-          choices  = c("WA", "OR", "ID", "MT", "CA", "NV", "AZ", "CO", "WY",
-                       "UT", "NM", "AK"),
+        h6("FIA States to Query"),
+        p(class = "text-muted small",
+          "Select one or more states. rFIA downloads the FIA TREE table for each ",
+          "selected state from the USFS FIADB. Downloads are cached in a temp ",
+          "folder for the session; use the local directory option below to persist ",
+          "them between sessions. Each state is roughly 50\u2013500 MB."),
+        selectizeInput("fia_states", label = NULL,
+          choices  = c(
+            # West
+            "AK" = "AK", "AZ" = "AZ", "CA" = "CA", "CO" = "CO",
+            "HI" = "HI", "ID" = "ID", "MT" = "MT", "NM" = "NM",
+            "NV" = "NV", "OR" = "OR", "UT" = "UT", "WA" = "WA", "WY" = "WY",
+            # Midwest
+            "IA" = "IA", "IL" = "IL", "IN" = "IN", "KS" = "KS",
+            "MI" = "MI", "MN" = "MN", "MO" = "MO", "ND" = "ND",
+            "NE" = "NE", "OH" = "OH", "SD" = "SD", "WI" = "WI",
+            # South
+            "AL" = "AL", "AR" = "AR", "FL" = "FL", "GA" = "GA",
+            "KY" = "KY", "LA" = "LA", "MS" = "MS", "NC" = "NC",
+            "OK" = "OK", "SC" = "SC", "TN" = "TN", "TX" = "TX",
+            "VA" = "VA", "WV" = "WV",
+            # Northeast
+            "CT" = "CT", "DE" = "DE", "MA" = "MA", "MD" = "MD",
+            "ME" = "ME", "NH" = "NH", "NJ" = "NJ", "NY" = "NY",
+            "PA" = "PA", "RI" = "RI", "VT" = "VT"
+          ),
           selected = c("OR", "WA", "ID", "MT"),
-          inline   = TRUE
+          multiple = TRUE,
+          options  = list(plugins = list("remove_button"), maxItems = 50)
         ),
 
         h6("Local FIA Directory (optional)"),
         p(class = "text-muted small",
-          "If you have already downloaded FIA state CSV files (via rFIA or ",
-          "the FIADB download tool), specify the folder here to avoid ",
-          "re-downloading. Leave blank to download fresh into a temp folder. ",
-          "Note: FIA downloads can be several hundred MB per state."),
+          "If you have previously run rFIA::getFIA() and saved the output, point ",
+          "to that directory here to skip re-downloading. Leave blank to let rFIA ",
+          "download fresh into a session temp folder."),
         textInput("fia_local_dir", label = NULL,
                   placeholder = "/path/to/fia_csvs/",
                   value       = ""),
