@@ -1942,14 +1942,53 @@ server <- function(input, output, session) {
   # ---------------------------------------------------------------------------
   observeEvent(input$load_lookup_csv, {
     req(nchar(trimws(input$lookup_csv_path)) > 0)
+    warn_msgs <- character(0)
     tryCatch({
-      lkup <- load_species_lookup(input$lookup_csv_path)
+      lkup <- withCallingHandlers(
+        load_species_lookup(input$lookup_csv_path),
+        warning = function(w) {
+          warn_msgs <<- c(warn_msgs, conditionMessage(w))
+          invokeRestart("muffleWarning")
+        }
+      )
       rv$spp_lookup <- lkup
-      output$lookup_load_status <- renderUI(
+
+      # Build status UI: success banner + optional SPCD mismatch alert
+      status_ui <- tagList(
         tags$span(class = "text-success small", icon("check"),
-                  sprintf(" Loaded lookup: %d species, %d with FIA SPCDs.",
+                  sprintf(" Loaded: %d species, %d with FIA SPCDs.",
                           nrow(lkup), sum(!is.na(lkup$FIA_SPCD))))
       )
+
+      if (length(warn_msgs) > 0) {
+        # Parse mismatch lines out of the warning message
+        mismatch_lines <- warn_msgs[1] %>%
+          strsplit("\n") %>% `[[`(1) %>%
+          grep("•", ., value = TRUE, fixed = TRUE) %>%
+          trimws()
+
+        status_ui <- tagList(
+          status_ui,
+          br(),
+          tags$div(
+            class = "alert alert-warning p-2 mt-2",
+            style = "font-size:0.82rem;",
+            tags$b(icon("triangle-exclamation"),
+                   " Possible SPCD mismatches — verify before fetching FIA data:"),
+            tags$ul(style = "margin-bottom:0; padding-left:1.2em;",
+                    lapply(mismatch_lines, tags$li)),
+            tags$small(
+              "Check against: ",
+              tags$a("FIA REF_SPECIES.csv",
+                     href = "https://apps.fs.usda.gov/fia/datamart/CSV/REF_SPECIES.csv",
+                     target = "_blank")
+            )
+          )
+        )
+      }
+
+      output$lookup_load_status <- renderUI(status_ui)
+
     }, error = function(e) {
       output$lookup_load_status <- renderUI(
         tags$span(class = "text-danger small", icon("xmark"), " ", conditionMessage(e))
