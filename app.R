@@ -317,95 +317,101 @@ ui <- page_navbar(
       card(
         card_header("Species Table Inputs"),
 
-        h6("Species Source"),
-        radioButtons("spp_source", label = NULL,
-          choices = c(
-            "Load from NECN species CSV"  = "necn",
-            "Enter species codes manually" = "manual"
-          ),
-          selected = "necn"
-        ),
+        # ---- Step 1: Lookup CSV -------------------------------------------
+        h6("Step 1 — LANDIS \u2192 FIA Species Lookup CSV"),
+        p(class = "text-muted small",
+          "A CSV with three columns: ",
+          tags$code("SpeciesName"), " (LANDIS species code), ",
+          tags$code("FIA_SPCD"), " (integer FIA species code), and ",
+          tags$code("SCIENTIFIC_NAME"), ". All species in this file will be ",
+          "included in the table. Load it once; it persists for the session."),
+        textInput("lookup_csv_path", label = NULL,
+                  placeholder = "/path/to/LANDIS_FIA_species_lookup.csv",
+                  value = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/FIA/LANDIS_FIA_species_lookup.csv"),
+        actionButton("load_lookup_csv", "Load Lookup CSV",
+                     class = "btn-sm btn-secondary w-100",
+                     icon  = icon("table")),
+        uiOutput("lookup_load_status"),
 
+        hr(),
+
+        # ---- Step 2: Optional NECN filter or manual add -------------------
+        h6("Step 2 — Filter or Add Species (optional)"),
+        radioButtons("spp_filter_mode", label = NULL,
+          choices = c(
+            "Use all species in lookup CSV"     = "all",
+            "Filter to a NECN species CSV"      = "necn",
+            "Enter species codes manually"      = "manual"
+          ),
+          selected = "all"
+        ),
         conditionalPanel(
-          "input.spp_source == 'necn'",
+          "input.spp_filter_mode == 'necn'",
           p(class = "text-muted small",
-            "Point to the NECN species parameter CSV. The ",
-            tags$code("SpeciesCode"), " column will be imported as the species list."),
+            "Filters the lookup to only the species codes found in the ",
+            tags$code("SpeciesCode"), " column of your NECN parameter CSV. ",
+            "Useful when the lookup has more species than a specific project."),
           textInput("necn_csv_path", label = NULL,
                     placeholder = "/path/to/NECN_sp.csv",
-                    value = "/Users/jlamping/Desktop/LANDIS/OLYM/WarmWet/Rep2/extensions/NECN_sp_02032026.csv"),
-          actionButton("load_necn_species", "Load Species from NECN CSV",
-                       class = "btn-sm btn-secondary w-100",
-                       icon  = icon("folder-open"))
+                    value = "/Users/jlamping/Desktop/LANDIS/OLYM/WarmWet/Rep2/extensions/NECN_sp_02032026.csv")
         ),
-
         conditionalPanel(
-          "input.spp_source == 'manual'",
+          "input.spp_filter_mode == 'manual'",
           p(class = "text-muted small",
-            "Enter one LANDIS species code per line. Both full binomial names ",
-            "(e.g. ", tags$code("PseudotsugaMenziesii"), ") and 8-character ",
-            "abbreviations (e.g. ", tags$code("PseuMenz"), ") are supported."),
+            "Enter one LANDIS species code per line. These are matched against ",
+            "the lookup CSV; unmatched codes receive default values."),
           textAreaInput("manual_species_codes",
                         label   = NULL,
-                        rows    = 8,
+                        rows    = 6,
                         value   = "",
-                        placeholder = "PseudotsugaMenziesii\nAbiesAmabilis\nPinusContorta\n..."),
-          actionButton("load_manual_species", "Build Table from Manual Entry",
-                       class = "btn-sm btn-secondary w-100",
-                       icon  = icon("list"))
+                        placeholder = "PseudotsugaMenziesii\nAbiesAmabilis\nPinusContorta\n...")
         ),
-
+        actionButton("build_spp_table", "Build Species Table",
+                     class = "btn-sm btn-secondary w-100",
+                     icon  = icon("list-check")),
         uiOutput("spp_load_status"),
 
         hr(),
 
-        h6("FIA Bark Parameter Estimation"),
+        # ---- Step 3: FIA bark parameters ----------------------------------
+        h6("Step 3 — Fetch FIA Bark Parameters"),
         p(class = "text-muted small",
-          "Queries the USFS Forest Inventory and Analysis (FIA) database for ",
-          "bark thickness (BARK_THICK) and DBH (DIA) measurements. Used to ",
-          "estimate ", tags$b("MaximumBarkThickness"), " (asymptotic bark ",
-          "thickness in cm) and ", tags$b("AgeDBH"), " (age at half-maximum ",
-          "bark thickness) via the SCF Eq. 10 Michaelis-Menten form."),
+          "Reads FIA TREE table data (BARK_THICK, DIA, TOTAGE) for the selected ",
+          "states. Estimates ", tags$b("MaximumBarkThickness"), " (asymptotic ",
+          "bark thickness in cm) and ", tags$b("AgeDBH"), " (Michaelis-Menten ",
+          "half-saturation age) from SCF Eq. 10. Reads local CSV files if ",
+          "available and non-empty; downloads via rFIA for any missing states."),
 
-        h6("FIA States to Query"),
-        p(class = "text-muted small",
-          "Select one or more states. rFIA downloads the FIA TREE table for each ",
-          "selected state from the USFS FIADB. Downloads are cached in a temp ",
-          "folder for the session; use the local directory option below to persist ",
-          "them between sessions. Each state is roughly 50\u2013500 MB."),
+        h6("FIA States"),
         selectizeInput("fia_states", label = NULL,
           choices  = c(
-            # West
-            "AK" = "AK", "AZ" = "AZ", "CA" = "CA", "CO" = "CO",
-            "HI" = "HI", "ID" = "ID", "MT" = "MT", "NM" = "NM",
-            "NV" = "NV", "OR" = "OR", "UT" = "UT", "WA" = "WA", "WY" = "WY",
-            # Midwest
-            "IA" = "IA", "IL" = "IL", "IN" = "IN", "KS" = "KS",
-            "MI" = "MI", "MN" = "MN", "MO" = "MO", "ND" = "ND",
-            "NE" = "NE", "OH" = "OH", "SD" = "SD", "WI" = "WI",
-            # South
-            "AL" = "AL", "AR" = "AR", "FL" = "FL", "GA" = "GA",
-            "KY" = "KY", "LA" = "LA", "MS" = "MS", "NC" = "NC",
-            "OK" = "OK", "SC" = "SC", "TN" = "TN", "TX" = "TX",
-            "VA" = "VA", "WV" = "WV",
-            # Northeast
-            "CT" = "CT", "DE" = "DE", "MA" = "MA", "MD" = "MD",
-            "ME" = "ME", "NH" = "NH", "NJ" = "NJ", "NY" = "NY",
-            "PA" = "PA", "RI" = "RI", "VT" = "VT"
+            "AK"="AK","AZ"="AZ","CA"="CA","CO"="CO","HI"="HI",
+            "ID"="ID","MT"="MT","NM"="NM","NV"="NV","OR"="OR",
+            "UT"="UT","WA"="WA","WY"="WY",
+            "IA"="IA","IL"="IL","IN"="IN","KS"="KS","MI"="MI",
+            "MN"="MN","MO"="MO","ND"="ND","NE"="NE","OH"="OH",
+            "SD"="SD","WI"="WI",
+            "AL"="AL","AR"="AR","FL"="FL","GA"="GA","KY"="KY",
+            "LA"="LA","MS"="MS","NC"="NC","OK"="OK","SC"="SC",
+            "TN"="TN","TX"="TX","VA"="VA","WV"="WV",
+            "CT"="CT","DE"="DE","MA"="MA","MD"="MD","ME"="ME",
+            "NH"="NH","NJ"="NJ","NY"="NY","PA"="PA","RI"="RI","VT"="VT"
           ),
           selected = c("OR", "WA", "ID", "MT"),
           multiple = TRUE,
-          options  = list(plugins = list("remove_button"), maxItems = 50)
+          options  = list(plugins = list("remove_button"), maxItems = 51)
         ),
 
-        h6("Local FIA Directory (optional)"),
+        h6("Local FIA Data Directory"),
         p(class = "text-muted small",
-          "If you have previously run rFIA::getFIA() and saved the output, point ",
-          "to that directory here to skip re-downloading. Leave blank to let rFIA ",
-          "download fresh into a session temp folder."),
+          "Directory containing pre-downloaded FIA state CSVs ",
+          "(e.g. ", tags$code("OR_TREE.csv"), "). Files must be non-empty. ",
+          "Empty or missing files for a state will be downloaded via rFIA ",
+          "and saved here for future use. Leave blank to use a session ",
+          "temp folder (data lost on restart)."),
         textInput("fia_local_dir", label = NULL,
-                  placeholder = "/path/to/fia_csvs/",
-                  value       = ""),
+                  placeholder = "/path/to/FIA_RAW/",
+                  value = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/FIA/FIA_RAW"),
 
         actionButton("fetch_fia_bark", "Fetch FIA Bark Parameters",
                      class = "btn-success w-100",
@@ -460,12 +466,12 @@ ui <- page_navbar(
             plotOutput("bark_curve_plot", height = "500px")
           ),
 
-          nav_panel("FIA Species Mapping",
+          nav_panel("Species Lookup Table",
             br(),
             p(class = "text-muted",
-              "Built-in lookup table: LANDIS species codes \u2192 FIA SPCD integers. ",
-              "If your species code is not mapped, add a row manually or contact the ",
-              "developer to extend the lookup table."),
+              "Contents of the loaded LANDIS \u2192 FIA species lookup CSV. ",
+              "Load a different CSV in Step 1 to update this table. ",
+              "Add rows to the CSV file to support additional species."),
             DTOutput("fia_lookup_dt")
           )
         )
@@ -801,6 +807,7 @@ server <- function(input, output, session) {
     scores_df           = NULL,
 
     # Species table outputs
+    spp_lookup          = NULL,   # tibble from user lookup CSV: SpeciesName/FIA_SPCD/SCIENTIFIC_NAME
     spp_codes           = NULL,   # character vector of LANDIS species codes
     spp_table           = NULL,   # editable tibble: SpeciesCode/AgeDBH/MaxBT/Note
     fia_trees           = NULL    # raw FIA TREE records (cached to avoid re-download)
@@ -1930,23 +1937,81 @@ server <- function(input, output, session) {
   # Species Table tab
   # ===========================================================================
 
-  # Helper: populate the table with default values for a set of species codes
-  init_spp_table <- function(codes) {
-    rv$spp_codes <- codes
-    rv$spp_table <- build_default_species_table(codes)
-  }
+  # ---------------------------------------------------------------------------
+  # Step 1: Load species lookup CSV
+  # ---------------------------------------------------------------------------
+  observeEvent(input$load_lookup_csv, {
+    req(nchar(trimws(input$lookup_csv_path)) > 0)
+    tryCatch({
+      lkup <- load_species_lookup(input$lookup_csv_path)
+      rv$spp_lookup <- lkup
+      output$lookup_load_status <- renderUI(
+        tags$span(class = "text-success small", icon("check"),
+                  sprintf(" Loaded lookup: %d species, %d with FIA SPCDs.",
+                          nrow(lkup), sum(!is.na(lkup$FIA_SPCD))))
+      )
+    }, error = function(e) {
+      output$lookup_load_status <- renderUI(
+        tags$span(class = "text-danger small", icon("xmark"), " ", conditionMessage(e))
+      )
+    })
+  })
 
   # ---------------------------------------------------------------------------
-  # Load species codes from NECN CSV
+  # Step 2: Build species table from lookup + optional filter
   # ---------------------------------------------------------------------------
-  observeEvent(input$load_necn_species, {
-    req(nchar(trimws(input$necn_csv_path)) > 0)
+  observeEvent(input$build_spp_table, {
+    req(rv$spp_lookup)
+
     tryCatch({
-      codes <- parse_necn_species(input$necn_csv_path)
-      init_spp_table(codes)
+      lkup <- rv$spp_lookup
+
+      codes <- switch(input$spp_filter_mode,
+
+        "all" = lkup$SpeciesName,
+
+        "necn" = {
+          req(nchar(trimws(input$necn_csv_path)) > 0)
+          necn_codes <- parse_necn_species(input$necn_csv_path)
+          # Keep only codes that appear in the lookup; warn about unmatched
+          matched   <- intersect(necn_codes, lkup$SpeciesName)
+          unmatched <- setdiff(necn_codes, lkup$SpeciesName)
+          if (length(unmatched) > 0) {
+            showNotification(
+              paste0("NECN codes not found in lookup (will use defaults): ",
+                     paste(unmatched, collapse = ", ")),
+              type = "warning", duration = 8
+            )
+            # Still include unmatched so user can edit manually
+            c(matched, unmatched)
+          } else {
+            matched
+          }
+        },
+
+        "manual" = {
+          raw <- input$manual_species_codes
+          req(nchar(trimws(raw)) > 0)
+          codes <- unique(trimws(strsplit(raw, "[\n,;]+")[[1]]))
+          codes[nchar(codes) > 0]
+        }
+      )
+
+      if (length(codes) == 0) {
+        output$spp_load_status <- renderUI(
+          tags$span(class = "text-warning small", "No species codes found.")
+        )
+        return()
+      }
+
+      rv$spp_codes <- codes
+      rv$spp_table <- build_default_species_table(codes, lookup = lkup)
+
       output$spp_load_status <- renderUI(
         tags$span(class = "text-success small", icon("check"),
-                  sprintf(" Loaded %d species from NECN CSV.", length(codes)))
+                  sprintf(" Table built: %d species (%d mapped to FIA SPCDs).",
+                          length(codes),
+                          sum(!is.na(rv$spp_table$FIA_SPCD))))
       )
     }, error = function(e) {
       output$spp_load_status <- renderUI(
@@ -1956,64 +2021,46 @@ server <- function(input, output, session) {
   })
 
   # ---------------------------------------------------------------------------
-  # Load species codes from manual entry
-  # ---------------------------------------------------------------------------
-  observeEvent(input$load_manual_species, {
-    raw <- input$manual_species_codes
-    req(nchar(trimws(raw)) > 0)
-    codes <- unique(trimws(strsplit(raw, "[\n,;]+")[[1]]))
-    codes <- codes[nchar(codes) > 0]
-    if (length(codes) == 0) {
-      output$spp_load_status <- renderUI(
-        tags$span(class = "text-warning small", "No valid species codes found.")
-      )
-      return()
-    }
-    init_spp_table(codes)
-    output$spp_load_status <- renderUI(
-      tags$span(class = "text-success small", icon("check"),
-                sprintf(" Built table for %d species.", length(codes)))
-    )
-  })
-
-  # ---------------------------------------------------------------------------
-  # Fetch FIA bark parameters
+  # Step 3: Fetch FIA bark parameters
   # ---------------------------------------------------------------------------
   observeEvent(input$fetch_fia_bark, {
-    req(rv$spp_codes)
+    req(rv$spp_codes, rv$spp_lookup)
     req(length(input$fia_states) > 0)
 
-    withProgress(message = "Querying FIA database...", value = 0, {
-
+    withProgress(message = "Loading FIA data...", value = 0, {
       tryCatch({
-        # ---- Step 1: load FIA tree data (cached in rv$fia_trees) ----------
+
+        # Load / download FIA TREE data
+        # rv$fia_trees is invalidated when states change (see observer below)
         fia_dir_val <- trimws(input$fia_local_dir)
-        if (is.null(rv$fia_trees)) {
-          incProgress(0.1, detail = paste("Downloading FIA for states:",
-                                          paste(input$fia_states, collapse = ", ")))
-          rv$fia_trees <- load_fia_trees(
-            states  = input$fia_states,
-            fia_dir = if (nchar(fia_dir_val) > 0 && dir.exists(fia_dir_val))
-                        fia_dir_val else NULL
-          )
+        dir_arg     <- if (nchar(fia_dir_val) > 0) fia_dir_val else NULL
+
+        incProgress(0.1, detail = paste("States:",
+                                        paste(input$fia_states, collapse = ", ")))
+
+        # Re-use cached data if states haven't changed, otherwise reload
+        if (is.null(rv$fia_trees) ||
+            !identical(sort(attr(rv$fia_trees, "states")), sort(input$fia_states))) {
+          rv$fia_trees <- load_fia_trees(states = input$fia_states,
+                                          fia_dir = dir_arg)
+          attr(rv$fia_trees, "states") <- input$fia_states
         }
 
-        # ---- Step 2: estimate bark parameters --------------------------------
-        incProgress(0.6, detail = "Estimating bark parameters per species...")
+        incProgress(0.7, detail = "Estimating bark parameters...")
         params <- estimate_bark_params_from_fia(
           species_codes = rv$spp_codes,
-          fia_trees     = rv$fia_trees
+          fia_trees     = rv$fia_trees,
+          lookup        = rv$spp_lookup
         )
-
-        # Merge with existing table (preserve any manual edits for species that
-        # didn't get FIA estimates, but overwrite where FIA data were found)
         rv$spp_table <- params
 
-        incProgress(0.3, detail = "Done.")
+        incProgress(0.2, detail = "Done.")
+        n_fia <- sum(!is.na(params$FIA_SPCD) &
+                       !grepl("defaults used", params$Note))
         output$fia_fetch_status <- renderUI(
           tags$span(class = "text-success small", icon("check"),
-                    sprintf(" FIA parameters estimated for %d of %d species.",
-                            sum(!is.na(params$FIA_SPCD)), nrow(params)))
+                    sprintf(" Done: FIA parameters estimated for %d of %d species.",
+                            n_fia, nrow(params)))
         )
       }, error = function(e) {
         output$fia_fetch_status <- renderUI(
@@ -2029,50 +2076,49 @@ server <- function(input, output, session) {
   # ---------------------------------------------------------------------------
   output$spp_table_dt <- renderDT({
     req(rv$spp_table)
-    # Columns the user can edit: AgeDBH and MaximumBarkThickness
     dt <- rv$spp_table %>%
-      select(SpeciesCode, AgeDBH, MaximumBarkThickness, CommonName, Note) %>%
-      mutate(across(where(is.numeric), ~ round(., 3)))
+      select(SpeciesCode, AgeDBH, MaximumBarkThickness, ScientificName, FIA_SPCD, Note) %>%
+      mutate(AgeDBH = as.integer(AgeDBH),
+             MaximumBarkThickness = round(MaximumBarkThickness, 2))
 
     datatable(
       dt,
-      editable  = list(target = "cell", disable = list(columns = c(0, 3, 4))),
+      # Allow editing only AgeDBH (col 1) and MaximumBarkThickness (col 2)
+      editable  = list(target = "cell",
+                       disable = list(columns = c(0L, 3L, 4L, 5L))),
       rownames  = FALSE,
       selection = "none",
       options   = list(
-        pageLength  = 30,
-        scrollX     = TRUE,
-        columnDefs  = list(
-          list(width = "120px", targets = 0),   # SpeciesCode
-          list(width = "80px",  targets = 1),   # AgeDBH
-          list(width = "150px", targets = 2),   # MaximumBarkThickness
-          list(width = "160px", targets = 3),   # CommonName
-          list(width = "400px", targets = 4)    # Note
+        pageLength = 30,
+        scrollX    = TRUE,
+        columnDefs = list(
+          list(width = "160px", targets = 0),  # SpeciesCode
+          list(width =  "80px", targets = 1),  # AgeDBH
+          list(width = "140px", targets = 2),  # MaxBT
+          list(width = "180px", targets = 3),  # ScientificName
+          list(width =  "70px", targets = 4),  # FIA_SPCD
+          list(width = "360px", targets = 5)   # Note
         )
       ),
-      colnames  = c("SpeciesCode", "AgeDBH", "MaxBarkThickness (cm)",
-                    "Common Name", "Note")
+      colnames = c("SpeciesCode", "AgeDBH", "MaxBarkThickness (cm)",
+                   "Scientific Name", "FIA SPCD", "Note")
     ) %>%
       formatStyle(c("AgeDBH", "MaximumBarkThickness"),
-                  backgroundColor = "#fffde7",
-                  cursor = "pointer") %>%
+                  backgroundColor = "#fffde7", cursor = "pointer") %>%
       formatRound("MaximumBarkThickness", digits = 2)
   })
 
-  # Capture cell edits and write back to rv$spp_table
+  # Write cell edits back to rv$spp_table
   observeEvent(input$spp_table_dt_cell_edit, {
-    info <- input$spp_table_dt_cell_edit
-    # Columns in DT (0-indexed): 0=SpeciesCode, 1=AgeDBH, 2=MaxBT, 3=CommonName, 4=Note
+    info     <- input$spp_table_dt_cell_edit
+    # DT col index (0-based): 0=SpeciesCode,1=AgeDBH,2=MaxBT,3=Sci,4=SPCD,5=Note
     col_name <- c("SpeciesCode", "AgeDBH", "MaximumBarkThickness",
-                  "CommonName", "Note")[info$col + 1]
-    row_i    <- info$row    # 1-indexed because rownames=FALSE means DT shifts by 1
-    new_val  <- info$value
-
-    tbl <- rv$spp_table
+                  "ScientificName", "FIA_SPCD", "Note")[info$col + 1L]
+    tbl      <- rv$spp_table
     if (col_name == "AgeDBH") {
-      tbl[row_i, col_name] <- as.integer(round(as.numeric(new_val)))
+      tbl[info$row, col_name] <- as.integer(round(as.numeric(info$value)))
     } else if (col_name == "MaximumBarkThickness") {
-      tbl[row_i, col_name] <- round(as.numeric(new_val), 3)
+      tbl[info$row, col_name] <- round(as.numeric(info$value), 3)
     }
     rv$spp_table <- tbl
   })
@@ -2081,9 +2127,7 @@ server <- function(input, output, session) {
   # Bark thickness curve plot
   # ---------------------------------------------------------------------------
   output$bark_curve_plot <- renderPlot({
-    req(rv$spp_table)
-    req(nrow(rv$spp_table) > 0)
-
+    req(rv$spp_table, nrow(rv$spp_table) > 0)
     curve_df <- bark_curve_data(rv$spp_table, max_age = 600)
 
     ggplot(curve_df, aes(x = Age, y = BarkThickness_cm,
@@ -2092,14 +2136,11 @@ server <- function(input, output, session) {
       geom_hline(aes(yintercept = MaximumBarkThickness, colour = SpeciesCode),
                  linetype = "dashed", linewidth = 0.3, alpha = 0.5) +
       labs(
-        x      = "Stand Age (years)",
-        y      = "Bark Thickness (cm, one side)",
-        colour = "Species",
-        title  = "SCF Eq. 10 — Bark Thickness vs Age",
-        caption = paste0(
-          "Dashed lines = MaximumBarkThickness asymptote. ",
-          "AgeDBH = age at half-maximum bark thickness."
-        )
+        x       = "Stand Age (years)",
+        y       = "Bark Thickness (cm, one side)",
+        colour  = "Species",
+        title   = "SCF Eq. 10 — Bark Thickness vs Age",
+        caption = "Dashed lines = MaximumBarkThickness asymptote. AgeDBH = age at half-maximum bark thickness."
       ) +
       theme_bw(base_size = 12) +
       theme(legend.position = "right",
@@ -2107,22 +2148,21 @@ server <- function(input, output, session) {
   })
 
   # ---------------------------------------------------------------------------
-  # FIA lookup table viewer
+  # Lookup table viewer
   # ---------------------------------------------------------------------------
   output$fia_lookup_dt <- renderDT({
+    req(rv$spp_lookup)
     datatable(
-      landis_to_fia_lookup,
+      rv$spp_lookup,
       rownames = FALSE,
       options  = list(pageLength = 30, scrollX = TRUE),
-      colnames = c("LANDIS Code", "FIA SPCD", "Common Name")
+      colnames = c("LANDIS Code", "FIA SPCD", "Scientific Name")
     )
   })
 
   # ---------------------------------------------------------------------------
   # Download handlers
   # ---------------------------------------------------------------------------
-
-  # Fire_Spp_Table.csv — only the 3 columns SCF needs
   output$dl_fire_spp_table <- downloadHandler(
     filename = "Fire_Spp_Table.csv",
     content  = function(f) {
@@ -2133,7 +2173,6 @@ server <- function(input, output, session) {
     }
   )
 
-  # Full table including common name and notes
   output$dl_spp_table_full <- downloadHandler(
     filename = "Fire_Spp_Table_annotated.csv",
     content  = function(f) {

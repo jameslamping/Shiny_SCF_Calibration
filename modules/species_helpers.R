@@ -9,159 +9,149 @@
 # FIA TREE table fields used:
 #   SPCD       : species code (integer)
 #   DIA        : DBH outside bark (inches)
-#   BARK_THICK : bark thickness in tenths of an inch, one-side measurement
-#   TOTAGE     : total tree age (rings at breast height + growth years to BH)
-#   STATUSCD   : 1 = live, 2 = dead (filter to 1)
+#   BARK_THICK : bark thickness, tenths of an inch, one-side measurement
+#                (e.g. value 6 = 0.6 inches one side)
+#   TOTAGE     : total tree age at breast height (present for increment-cored trees)
+#   STATUSCD   : 1 = live, 2 = dead  →  keep only 1
 # =============================================================================
 
 pacman::p_load(dplyr, tibble, readr, stringr, purrr)
 
-# rFIA is available on CRAN; install if missing
+# rFIA is available on CRAN; install once if missing
 if (!requireNamespace("rFIA", quietly = TRUE)) {
   message("Installing rFIA from CRAN...")
   install.packages("rFIA")
 }
 
-# -----------------------------------------------------------------------------
-# LANDIS species code → FIA SPCD lookup table
-# Covers full PascalCase binomials (NECN style) and 8-char abbreviations.
-# Add rows here for project-specific codes not yet listed.
-# -----------------------------------------------------------------------------
-landis_to_fia_lookup <- tribble(
-  ~landis_code,               ~fia_spcd,  ~common_name,
-  # ---- Firs (Abies) -------------------------------------------------------
-  "AbiesAmabilis",             11L,        "Pacific silver fir",
-  "AbieAmab",                  11L,        "Pacific silver fir",
-  "AbiesConcolor",             15L,        "white fir",
-  "AbieConc",                  15L,        "white fir",
-  "AbiesGrandis",              17L,        "grand fir",
-  "AbieGran",                  17L,        "grand fir",
-  "AbiesLasiocarpa",           19L,        "subalpine fir",
-  "AbieLasi",                  19L,        "subalpine fir",
-  "AbiesMagnifica",            20L,        "California red fir",
-  "AbieMagn",                  20L,        "California red fir",
-  "AbiesProcera",              22L,        "noble fir",
-  "AbieProc",                  22L,        "noble fir",
-  # ---- Incense-cedar -------------------------------------------------------
-  "CalocedrusDecurrens",       81L,        "incense-cedar",
-  "CaloDecu",                  81L,        "incense-cedar",
-  # ---- Yellow-cedar --------------------------------------------------------
-  "ChamaecyparisNootkatensis", 42L,        "Alaska yellow-cedar",
-  "ChamNoot",                  42L,        "Alaska yellow-cedar",
-  # ---- Larch (Larix) -------------------------------------------------------
-  "LarixLyallii",              72L,        "subalpine larch",
-  "LariLyal",                  72L,        "subalpine larch",
-  "LarixOccidentalis",         73L,        "western larch",
-  "LariOcci",                  73L,        "western larch",
-  # ---- Maples, Alders, Madrone, Birch (hardwoods) -------------------------
-  "AcerMacrophyllum",          312L,       "bigleaf maple",
-  "AcerMacr",                  312L,       "bigleaf maple",
-  "AlnusRubra",                351L,       "red alder",
-  "AlnuRubr",                  351L,       "red alder",
-  "ArbutusMenziesii",          361L,       "Pacific madrone",
-  "ArbuMenz",                  361L,       "Pacific madrone",
-  "BetulaPapyrifera",          375L,       "paper birch",
-  "BetuPapi",                  375L,       "paper birch",
-  # ---- Spruce (Picea) ------------------------------------------------------
-  "PiceaEngelmannii",          93L,        "Engelmann spruce",
-  "PiceEnge",                  93L,        "Engelmann spruce",
-  "PiceaSitchensis",           98L,        "Sitka spruce",
-  "PiceSitc",                  98L,        "Sitka spruce",
-  # ---- Pine (Pinus) --------------------------------------------------------
-  "PinusAlbicaulis",           101L,       "whitebark pine",
-  "PinuAlbi",                  101L,       "whitebark pine",
-  "PinusContorta",             108L,       "lodgepole pine",
-  "PinuCont",                  108L,       "lodgepole pine",
-  "PinusJeffreyi",             116L,       "Jeffrey pine",
-  "PinuJeff",                  116L,       "Jeffrey pine",
-  "PinusLambertiana",          117L,       "sugar pine",
-  "PinuLamb",                  117L,       "sugar pine",
-  "PinusMonticola",            119L,       "western white pine",
-  "PinuMont",                  119L,       "western white pine",
-  "PinusPonderosa",            122L,       "ponderosa pine",
-  "PinuPond",                  122L,       "ponderosa pine",
-  # ---- Poplar / Aspen (Populus) --------------------------------------------
-  "PopulusBalsamifera",        743L,       "balsam poplar",
-  "PopuBals",                  743L,       "balsam poplar",
-  "PopulusTremuloides",        746L,       "quaking aspen",
-  "PopuTrem",                  746L,       "quaking aspen",
-  # ---- Douglas-fir ---------------------------------------------------------
-  "PseudotsugaMenziesii",      202L,       "Douglas-fir",
-  "PseuMenz",                  202L,       "Douglas-fir",
-  # ---- Oak -----------------------------------------------------------------
-  "QuercusGarryana",           815L,       "Oregon white oak",
-  "QuerGarr",                  815L,       "Oregon white oak",
-  # ---- Yew, Cedars, Hemlocks -----------------------------------------------
-  "TaxusBrevifolia",           231L,       "Pacific yew",
-  "TaxuBrev",                  231L,       "Pacific yew",
-  "ThujaPlicata",              242L,       "western redcedar",
-  "ThujPlic",                  242L,       "western redcedar",
-  "TsugaHeterophylla",         263L,       "western hemlock",
-  "TsugHete",                  263L,       "western hemlock",
-  "TsugaMertensiana",          264L,       "mountain hemlock",
-  "TsugMert",                  264L,       "mountain hemlock"
-)
 
+# =============================================================================
+# load_species_lookup
+# Read user-supplied LANDIS → FIA SPCD lookup CSV.
+# Expected columns (case-insensitive): SpeciesName, FIA_SPCD, SCIENTIFIC_NAME
+# Returns a tibble with standardised column names.
+# =============================================================================
+load_species_lookup <- function(csv_path) {
+  if (!file.exists(csv_path)) stop("Lookup CSV not found: ", csv_path)
 
-# -----------------------------------------------------------------------------
-# parse_necn_species
-# Read SpeciesCode column from a NECN species parameter CSV.
-# Returns a character vector of species codes.
-# -----------------------------------------------------------------------------
-parse_necn_species <- function(csv_path) {
-  if (!file.exists(csv_path)) stop("NECN CSV not found: ", csv_path)
-  df <- read_csv(csv_path, show_col_types = FALSE)
-  if (!"SpeciesCode" %in% names(df)) {
-    stop("No 'SpeciesCode' column found in: ", basename(csv_path))
+  df <- read_csv(csv_path, show_col_types = FALSE, name_repair = "minimal")
+
+  # Normalise column names to lower-case for robust matching
+  names(df) <- tolower(names(df))
+
+  required <- c("speciesname", "fia_spcd")
+  missing  <- setdiff(required, names(df))
+  if (length(missing) > 0) {
+    stop("Lookup CSV is missing required columns: ",
+         paste(missing, collapse = ", "),
+         "\nExpected: SpeciesName, FIA_SPCD, SCIENTIFIC_NAME")
   }
-  df$SpeciesCode
+
+  df <- df %>%
+    rename(
+      SpeciesName     = speciesname,
+      FIA_SPCD        = fia_spcd
+    ) %>%
+    mutate(
+      FIA_SPCD        = as.integer(FIA_SPCD),
+      SCIENTIFIC_NAME = if ("scientific_name" %in% names(.)) scientific_name else NA_character_
+    ) %>%
+    select(SpeciesName, FIA_SPCD, SCIENTIFIC_NAME) %>%
+    filter(!is.na(SpeciesName), !is.na(FIA_SPCD))
+
+  df
 }
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # load_fia_trees
-# Download or read FIA TREE table for the given states.
-# Returns a data frame with columns: SPCD, DIA, BARK_THICK, TOTAGE.
+# Load FIA TREE table for the requested states.
 #
-# fia_dir  : path to a directory containing pre-downloaded FIA state CSVs
-#            (e.g. OR_TREE.csv).  If NULL or empty, data are downloaded fresh
-#            using rFIA::getFIA() into a session-temp folder.
-# states   : two-letter state abbreviation vector (default PNW).
-# -----------------------------------------------------------------------------
-load_fia_trees <- function(states = c("OR", "WA", "ID", "MT"),
-                           fia_dir = NULL) {
+# Strategy (in order):
+#   1. For each state, look for {STATE}_TREE.csv in fia_dir (if provided).
+#      Only use files that exist AND are non-empty (> 0 bytes).
+#   2. For any states with missing/empty files, download via rFIA::getFIA()
+#      into fia_dir (or a session temp folder if fia_dir is NULL).
+#      getFIA() writes {STATE}_TREE.csv; subsequent calls skip re-download.
+#   3. Read all TREE CSVs directly with read_csv() — avoids rFIA::readFIA()
+#      which fails with "OneIndex" error on empty files.
+#
+# Returns a tibble filtered to live trees with bark & DBH measurements,
+# with derived columns dia_cm and bark_cm.
+# =============================================================================
+load_fia_trees <- function(states, fia_dir = NULL) {
 
   if (!requireNamespace("rFIA", quietly = TRUE)) {
-    stop("The 'rFIA' package is required. Install it with:\n",
-         "  install.packages('rFIA')")
+    stop("The 'rFIA' package is required. Install with: install.packages('rFIA')")
   }
 
-  # Decide whether to read local or download
-  if (!is.null(fia_dir) && nchar(fia_dir) > 0 && dir.exists(fia_dir)) {
-    message("Reading FIA data from: ", fia_dir)
-    db <- rFIA::readFIA(fia_dir, states = states,
-                        tables  = "TREE",
-                        nCores  = 1,
-                        inMemory = TRUE)
+  # Resolve the directory we will read from / download into
+  if (!is.null(fia_dir) && nchar(trimws(fia_dir)) > 0) {
+    if (!dir.exists(fia_dir)) dir.create(fia_dir, recursive = TRUE)
+    work_dir <- fia_dir
   } else {
-    dl_dir <- file.path(tempdir(), "fia_download")
-    dir.create(dl_dir, showWarnings = FALSE, recursive = TRUE)
-    message("Downloading FIA TREE table for: ", paste(states, collapse = ", "))
-    db <- rFIA::getFIA(states  = states,
-                       tables  = "TREE",
-                       dir     = dl_dir,
-                       nCores  = 1)
+    work_dir <- file.path(tempdir(), "fia_download")
+    dir.create(work_dir, showWarnings = FALSE, recursive = TRUE)
   }
 
-  # Extract TREE table (rFIA stores it as db$TREE)
-  trees <- db$TREE
-  if (is.null(trees) || nrow(trees) == 0) {
-    stop("No TREE records returned from FIA for states: ", paste(states, collapse = ", "))
+  # Check which states already have non-empty TREE CSVs locally
+  tree_paths     <- file.path(work_dir, paste0(states, "_TREE.csv"))
+  names(tree_paths) <- states
+  needs_download <- states[
+    !file.exists(tree_paths) | file.info(tree_paths)$size == 0
+  ]
+
+  # Download missing / empty states via rFIA::getFIA()
+  if (length(needs_download) > 0) {
+    message("rFIA: downloading TREE table for: ",
+            paste(needs_download, collapse = ", "), " → ", work_dir)
+    tryCatch(
+      rFIA::getFIA(
+        states = needs_download,
+        tables = "TREE",
+        dir    = work_dir,
+        nCores = 1
+      ),
+      error = function(e) {
+        stop("rFIA::getFIA() failed for states [",
+             paste(needs_download, collapse = ", "), "]: ",
+             conditionMessage(e))
+      }
+    )
   }
 
-  trees <- trees %>%
+  # Verify files now exist and are non-empty after download attempt
+  still_missing <- states[
+    !file.exists(tree_paths) | file.info(tree_paths)$size == 0
+  ]
+  if (length(still_missing) > 0) {
+    stop("FIA TREE CSV is still empty or missing after download for: ",
+         paste(still_missing, collapse = ", "),
+         "\nExpected files:\n  ",
+         paste(tree_paths[still_missing], collapse = "\n  "))
+  }
+
+  # Read CSVs directly — much more robust than rFIA::readFIA()
+  message("Reading FIA TREE CSVs for: ", paste(states, collapse = ", "))
+  trees_raw <- map_dfr(tree_paths, function(p) {
+    read_csv(p, show_col_types = FALSE,
+             col_types = cols(.default = col_guess()))
+  })
+
+  # Normalise column names to upper-case (FIA CSVs can vary in case)
+  names(trees_raw) <- toupper(names(trees_raw))
+
+  # Validate required columns
+  req_cols <- c("SPCD", "DIA", "BARK_THICK", "STATUSCD")
+  missing_cols <- setdiff(req_cols, names(trees_raw))
+  if (length(missing_cols) > 0) {
+    stop("FIA TREE CSV is missing expected columns: ",
+         paste(missing_cols, collapse = ", "))
+  }
+
+  # Filter and convert units
+  trees <- trees_raw %>%
     filter(
-      STATUSCD == 1L,         # live trees only
+      STATUSCD == 1L,       # live trees only
       !is.na(DIA),
       !is.na(BARK_THICK),
       DIA > 0,
@@ -169,74 +159,82 @@ load_fia_trees <- function(states = c("OR", "WA", "ID", "MT"),
     ) %>%
     select(SPCD, DIA, BARK_THICK, any_of("TOTAGE")) %>%
     mutate(
-      # Unit conversions
+      SPCD     = as.integer(SPCD),
       # DIA        : inches → cm
+      dia_cm   = DIA * 2.54,
       # BARK_THICK : tenths-of-an-inch (one side) → cm
-      dia_cm       = DIA * 2.54,
-      bark_cm      = (BARK_THICK / 10) * 2.54
+      #              value 6 = 0.6 in × 2.54 = 1.524 cm
+      bark_cm  = (BARK_THICK / 10) * 2.54
     )
 
+  if (nrow(trees) == 0) {
+    stop("No live trees with bark/DBH measurements found for states: ",
+         paste(states, collapse = ", "))
+  }
+
+  message(sprintf("FIA TREE data loaded: %s live trees across %s states.",
+                  format(nrow(trees), big.mark = ","), length(states)))
   trees
 }
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # estimate_bark_params_from_fia
-# Given a data frame of FIA TREE records (from load_fia_trees) and a vector of
-# LANDIS species codes, estimate MaximumBarkThickness and AgeDBH per species.
+# Map LANDIS species codes → FIA SPCDs via the user lookup, then compute
+# MaximumBarkThickness and AgeDBH from the FIA TREE data.
 #
-# Returns a tibble with columns:
-#   SpeciesCode, AgeDBH, MaximumBarkThickness, CommonName, FIA_SPCD, Note
-# -----------------------------------------------------------------------------
-estimate_bark_params_from_fia <- function(species_codes,
-                                          fia_trees,
-                                          lookup = landis_to_fia_lookup) {
-  # Map LANDIS codes → FIA SPCD
+# lookup    : tibble from load_species_lookup() — cols SpeciesName, FIA_SPCD,
+#             SCIENTIFIC_NAME
+# Returns a tibble: SpeciesCode, AgeDBH, MaximumBarkThickness,
+#                   ScientificName, FIA_SPCD, Note
+# =============================================================================
+estimate_bark_params_from_fia <- function(species_codes, fia_trees, lookup) {
+
+  # Map LANDIS codes to FIA SPCD via lookup
   mapped <- tibble(SpeciesCode = species_codes) %>%
-    left_join(lookup %>% select(landis_code, fia_spcd, common_name),
-              by = c("SpeciesCode" = "landis_code"))
+    left_join(lookup, by = c("SpeciesCode" = "SpeciesName"))
 
-  # Unique SPCDs to process
-  spcd_vec <- unique(na.omit(mapped$fia_spcd))
-
-  # Filter FIA trees to relevant species
+  # Unique SPCDs with data
+  spcd_vec  <- unique(na.omit(mapped$FIA_SPCD))
   trees_sub <- fia_trees %>% filter(SPCD %in% spcd_vec)
 
-  # --- Per-species summaries ------------------------------------------------
+  # --- Per-species bark summary ---------------------------------------------
   bark_summary <- trees_sub %>%
     group_by(SPCD) %>%
     summarise(
-      n_trees           = n(),
-      # MaximumBarkThickness: 95th percentile of bark thickness (in cm)
-      # This approximates the asymptotic bark thickness at very large DBH
-      max_bark_cm       = quantile(bark_cm, 0.95, na.rm = TRUE),
-      # Bark thickness at top-5% trees by DBH (more direct measurement)
+      n_trees = n(),
+      # 95th-percentile bark thickness across all trees
+      p95_bark_cm = quantile(bark_cm, 0.95, na.rm = TRUE),
+      # Mean bark thickness for the top-5% largest trees by DBH
       bark_at_large_dia = {
         q95_dia <- quantile(dia_cm, 0.95, na.rm = TRUE)
         mean(bark_cm[dia_cm >= q95_dia], na.rm = TRUE)
       },
-      max_dia_cm        = max(dia_cm, na.rm = TRUE),
+      max_dia_cm = max(dia_cm, na.rm = TRUE),
       .groups = "drop"
     ) %>%
     mutate(
-      # Use the larger of the two estimates as MaximumBarkThickness
-      MaximumBarkThickness = round(pmax(max_bark_cm, bark_at_large_dia, na.rm = TRUE), 2)
+      # MaximumBarkThickness: take the larger of the two estimates (cm, 2 dp)
+      MaximumBarkThickness = round(
+        pmax(p95_bark_cm, bark_at_large_dia, na.rm = TRUE), 2
+      )
     )
 
-  # --- AgeDBH fitting -------------------------------------------------------
-  # Only attempt if TOTAGE column is present
+  # --- AgeDBH via Michaelis-Menten fit on TOTAGE ----------------------------
+  # BarkThickness = MaxBT × Age / (Age + AgeDBH)
+  # Only attempted when TOTAGE is present and ≥ 15 aged trees per species
   age_fits <- if ("TOTAGE" %in% names(fia_trees)) {
     trees_sub %>%
       filter(!is.na(TOTAGE), TOTAGE > 5) %>%
       group_by(SPCD) %>%
-      filter(n() >= 15) %>%                    # need at least 15 aged trees
+      filter(n() >= 15) %>%
       summarise(
-        n_aged    = n(),
-        age_dbh   = {
-          this_max_bt <- quantile(bark_cm, 0.95, na.rm = TRUE)
+        n_aged  = n(),
+        age_dbh = {
+          max_bt <- quantile(bark_cm, 0.95, na.rm = TRUE)
           fit <- tryCatch(
             nls(
-              bark_cm ~ this_max_bt * TOTAGE / (TOTAGE + theta),
+              bark_cm ~ max_bt * TOTAGE / (TOTAGE + theta),
               data    = cur_data(),
               start   = list(theta = 60),
               control = nls.control(maxiter = 200, warnOnly = TRUE)
@@ -248,76 +246,92 @@ estimate_bark_params_from_fia <- function(species_codes,
         .groups = "drop"
       )
   } else {
-    tibble(SPCD = integer(), n_aged = integer(), age_dbh = numeric())
+    tibble(SPCD = integer(0), n_aged = integer(0), age_dbh = numeric(0))
   }
 
-  # --- Combine and fall back to defaults ------------------------------------
+  # --- Combine, apply bark-class heuristic where nls failed -----------------
   results <- bark_summary %>%
-    left_join(age_fits %>% select(SPCD, n_aged, age_dbh),
-              by = "SPCD") %>%
+    left_join(age_fits %>% select(SPCD, n_aged, age_dbh), by = "SPCD") %>%
     mutate(
       AgeDBH = case_when(
-        !is.na(age_dbh) & age_dbh > 0 ~ as.integer(round(age_dbh)),
-        # Rough proxy: larger-barked = slower growth = higher AgeDBH
-        MaximumBarkThickness >= 30     ~ 80L,
-        MaximumBarkThickness >= 15     ~ 60L,
-        TRUE                           ~ 40L
+        !is.na(age_dbh) & age_dbh > 0  ~ as.integer(round(age_dbh)),
+        MaximumBarkThickness >= 30      ~ 80L,   # thick-barked → slow
+        MaximumBarkThickness >= 15      ~ 60L,   # moderate
+        TRUE                            ~ 40L    # thin-barked → fast
       ),
       fia_note = paste0(
-        "FIA SPCD ", SPCD, " | n=", n_trees, " trees",
-        if_else(!is.na(n_aged), paste0(" | AgeDBH from nls (n=", n_aged, ")"),
-                " | AgeDBH estimated from bark thickness class")
+        "n=", n_trees, " trees | MaxBT from 95th pct + large-DBH avg",
+        if_else(!is.na(n_aged),
+                paste0(" | AgeDBH nls fit (n_aged=", n_aged, ")"),
+                " | AgeDBH from bark-thickness class heuristic")
       )
     )
 
-  # --- Build output tibble --------------------------------------------------
+  # --- Build final output tibble --------------------------------------------
   out <- mapped %>%
-    left_join(results %>% select(SPCD, AgeDBH, MaximumBarkThickness, fia_note),
-              by = c("fia_spcd" = "SPCD")) %>%
+    left_join(
+      results %>% select(SPCD, AgeDBH, MaximumBarkThickness, fia_note),
+      by = c("FIA_SPCD" = "SPCD")
+    ) %>%
     mutate(
       MaximumBarkThickness = if_else(!is.na(MaximumBarkThickness),
                                      MaximumBarkThickness, 10.0),
-      AgeDBH               = if_else(!is.na(AgeDBH), AgeDBH, 100L),
+      AgeDBH = if_else(!is.na(AgeDBH), AgeDBH, 100L),
       Note = case_when(
-        is.na(fia_spcd)              ~ "No FIA mapping — default values (AgeDBH=100, MaxBT=10 cm)",
-        is.na(fia_note)              ~ paste0("FIA SPCD ", fia_spcd,
-                                               " — no records in selected states; defaults used"),
-        TRUE                         ~ fia_note
+        is.na(FIA_SPCD)  ~ "Not in lookup CSV — defaults used (AgeDBH=100, MaxBT=10 cm)",
+        is.na(fia_note)  ~ paste0("SPCD ", FIA_SPCD,
+                                   " — no FIA records in selected states; defaults used"),
+        TRUE             ~ paste0("SPCD ", FIA_SPCD, " | ", fia_note)
       ),
-      CommonName = coalesce(common_name, "Unknown")
+      ScientificName = coalesce(SCIENTIFIC_NAME, "")
     ) %>%
-    select(SpeciesCode, AgeDBH, MaximumBarkThickness, CommonName, FIA_SPCD = fia_spcd, Note)
+    select(SpeciesCode, AgeDBH, MaximumBarkThickness,
+           ScientificName, FIA_SPCD, Note)
 
   out
 }
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # build_default_species_table
-# Quick stub table for species codes with no FIA data yet — used to populate
-# the editable DT so the user can enter values manually.
-# -----------------------------------------------------------------------------
-build_default_species_table <- function(species_codes,
-                                        lookup = landis_to_fia_lookup) {
-  tibble(SpeciesCode = species_codes) %>%
-    left_join(lookup %>% distinct(landis_code, .keep_all = TRUE) %>%
-                select(landis_code, fia_spcd, common_name),
-              by = c("SpeciesCode" = "landis_code")) %>%
-    mutate(
-      AgeDBH               = 100L,
-      MaximumBarkThickness = 10.0,
-      CommonName           = coalesce(common_name, "Unknown"),
-      FIA_SPCD             = fia_spcd,
-      Note                 = "Default — click 'Fetch FIA Parameters' to estimate from data"
-    ) %>%
-    select(SpeciesCode, AgeDBH, MaximumBarkThickness, CommonName, FIA_SPCD, Note)
+# Populate a stub table (default AgeDBH=100, MaxBT=10) for the given species
+# codes, joining scientific names from the lookup where available.
+# Used to pre-fill the editable DT before FIA data are fetched.
+# =============================================================================
+build_default_species_table <- function(species_codes, lookup = NULL) {
+  tbl <- tibble(SpeciesCode = species_codes) %>%
+    mutate(AgeDBH = 100L, MaximumBarkThickness = 10.0)
+
+  if (!is.null(lookup) && nrow(lookup) > 0) {
+    tbl <- tbl %>%
+      left_join(lookup %>% select(SpeciesName, FIA_SPCD, SCIENTIFIC_NAME),
+                by = c("SpeciesCode" = "SpeciesName")) %>%
+      mutate(
+        ScientificName = coalesce(SCIENTIFIC_NAME, ""),
+        Note = if_else(
+          !is.na(FIA_SPCD),
+          paste0("Default — SPCD ", FIA_SPCD,
+                 "; click 'Fetch FIA Parameters' to estimate from data"),
+          "Not in lookup CSV — enter values manually"
+        )
+      ) %>%
+      select(SpeciesCode, AgeDBH, MaximumBarkThickness,
+             ScientificName, FIA_SPCD, Note)
+  } else {
+    tbl <- tbl %>%
+      mutate(ScientificName = "", FIA_SPCD = NA_integer_,
+             Note = "Default — load lookup CSV and fetch FIA data")
+  }
+
+  tbl
 }
 
 
-# -----------------------------------------------------------------------------
-# Bark thickness curve helper for the preview plot
-# Returns a data frame of Age vs BarkThickness for each species in spp_table
-# -----------------------------------------------------------------------------
+# =============================================================================
+# bark_curve_data
+# Generate SCF Eq. 10 curve points for all species in spp_table.
+# Returns a long tibble for ggplot: SpeciesCode, Age, BarkThickness_cm.
+# =============================================================================
 bark_curve_data <- function(spp_table, max_age = 500) {
   ages <- seq(0, max_age, by = 5)
   map_dfr(seq_len(nrow(spp_table)), function(i) {
