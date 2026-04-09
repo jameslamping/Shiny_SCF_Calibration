@@ -43,6 +43,7 @@ pacman::p_load(
 source("modules/era_helpers.R")
 source("modules/ignition_helpers.R")
 source("modules/spread_helpers.R")
+source("modules/species_helpers.R")
 source("modules/ui_helpers.R")
 options(jsonlite.named_vectors_as_objects = FALSE)
 
@@ -170,11 +171,25 @@ ui <- page_navbar(
         hr(),
         h6("Ignition Surface (Kernel)"),
         p(class = "text-muted small",
-          "Applied to the LANDIS template grid extent."),
+          "A Gaussian kernel is applied to historical ignition point locations ",
+          "to produce a smooth probability surface on the LANDIS template grid. ",
+          "Higher-weight cells are more likely to be selected as ignition origins ",
+          "by SCF each time step."),
         sliderInput("kernel_bw", "Bandwidth (m)", min = 1000, max = 30000,
                     value = 7000, step = 500),
+        p(class = "text-muted small",
+          tags$b("Bandwidth:"), " Controls the spatial spread (standard deviation) of ",
+          "the Gaussian kernel around each historical ignition point. Smaller values ",
+          "concentrate ignition probability tightly around observed locations; larger ",
+          "values spread probability more broadly across the landscape. Typical range: ",
+          "5\u201315 km for regional calibrations."),
         sliderInput("kernel_maxdist", "Max Distance (m)", min = 5000, max = 75000,
                     value = 25000, step = 1000),
+        p(class = "text-muted small",
+          tags$b("Max Distance:"), " Hard cutoff radius beyond which the kernel weight ",
+          "drops to zero, regardless of bandwidth. Prevents ignition probability from ",
+          "bleeding into areas with no nearby historical fires. Set to roughly 3\u20134\u00d7 ",
+          "the bandwidth to retain the full shape of the Gaussian tail."),
 
         hr(),
         actionButton("run_ignition", "Run Ignition Calibration",
@@ -219,16 +234,67 @@ ui <- page_navbar(
             br(), br(),
             plotOutput("startup_clim_plot", height = "400px")
           ),
-          nav_panel("Download Maps",
+          nav_panel("Landscape Maps",
             br(),
-            p(class = "text-muted",
-              "Ignition allocation surfaces as GeoTIFFs on the LANDIS template grid."),
+
+            h5("Ignition Allocation Surfaces"),
+            p(class = "text-muted small",
+              "Spatial weights for fire ignition locations on the LANDIS template ",
+              "grid. Exported as double-precision float (FLT8S) as required by SCF."),
             fluidRow(
-              column(4, downloadButton("dl_lightning_map",  "Lightning .tif",
+              column(4, downloadButton("dl_lightning_map",  "Lightning_Ignition_Map.tif",
                                        class = "btn-sm btn-outline-secondary w-100")),
-              column(4, downloadButton("dl_accidental_map", "Accidental .tif",
+              column(4, downloadButton("dl_accidental_map", "Accidental_Ignition_Map.tif",
                                        class = "btn-sm btn-outline-secondary w-100")),
-              column(4, downloadButton("dl_rx_map",         "Rx .tif",
+              column(4, downloadButton("dl_rx_map",         "Rx_Ignition_Map.tif",
+                                       class = "btn-sm btn-outline-secondary w-100"))
+            ),
+
+            hr(),
+            h5("Terrain Maps"),
+            p(class = "text-muted small",
+              "Ground slope (degrees) and uphill slope azimuth (0\u2013359\u00b0 from N) ",
+              "derived from a SRTM/3DEP DEM fetched via elevatr and resampled to the ",
+              "LANDIS template grid. Required by SCF for spread direction physics."),
+            actionButton("gen_terrain_maps", "Fetch DEM & Generate Terrain Maps",
+                         class = "btn-sm btn-outline-primary", icon = icon("mountain")),
+            br(),
+            uiOutput("terrain_maps_status"),
+            br(),
+            fluidRow(
+              column(6,
+                h6("Ground Slope (degrees)"),
+                tmapOutput("ground_slope_preview", height = "260px")
+              ),
+              column(6,
+                h6("Uphill Slope Azimuth (degrees from N)"),
+                tmapOutput("uphill_slope_preview", height = "260px")
+              )
+            ),
+            br(),
+            fluidRow(
+              column(6, downloadButton("dl_ground_slope", "GroundSlope.tif  (INT2S)",
+                                       class = "btn-sm btn-outline-secondary w-100")),
+              column(6, downloadButton("dl_uphill_slope", "UphillSlope.tif  (INT2S)",
+                                       class = "btn-sm btn-outline-secondary w-100"))
+            ),
+
+            hr(),
+            h5("Suppression Maps"),
+            p(class = "text-muted small",
+              "Blank suppression maps (0.0 everywhere) for initial calibration. ",
+              "Replace with zone-based maps once fire behavior is validated. ",
+              "Exported as single-precision float (FLT4S) as required by SCF. ",
+              "Requires the LANDIS template to be loaded first."),
+            fluidRow(
+              column(4, downloadButton("dl_supp_accidental",
+                                       "Suppression_Accidental_3Zones.tif",
+                                       class = "btn-sm btn-outline-secondary w-100")),
+              column(4, downloadButton("dl_supp_lightning",
+                                       "Suppression_Lightning_3Zones.tif",
+                                       class = "btn-sm btn-outline-secondary w-100")),
+              column(4, downloadButton("dl_supp_rx",
+                                       "Suppression_Rx_3Zones.tif",
                                        class = "btn-sm btn-outline-secondary w-100"))
             )
           )
@@ -238,7 +304,154 @@ ui <- page_navbar(
   ),
 
   # ---------------------------------------------------------------------------
-  # Tab 2: Spread Calibration
+  # Tab 2: Species Table
+  # ---------------------------------------------------------------------------
+  nav_panel(
+    title = "Species Table",
+    icon  = icon("leaf"),
+
+    layout_columns(
+      col_widths = c(4, 8),
+
+      # -- Left: inputs -------------------------------------------------------
+      card(
+        card_header("Species Table Inputs"),
+
+        h6("Species Source"),
+        radioButtons("spp_source", label = NULL,
+          choices = c(
+            "Load from NECN species CSV"  = "necn",
+            "Enter species codes manually" = "manual"
+          ),
+          selected = "necn"
+        ),
+
+        conditionalPanel(
+          "input.spp_source == 'necn'",
+          p(class = "text-muted small",
+            "Point to the NECN species parameter CSV. The ",
+            tags$code("SpeciesCode"), " column will be imported as the species list."),
+          textInput("necn_csv_path", label = NULL,
+                    placeholder = "/path/to/NECN_sp.csv",
+                    value = "/Users/jlamping/Desktop/LANDIS/OLYM/WarmWet/Rep2/extensions/NECN_sp_02032026.csv"),
+          actionButton("load_necn_species", "Load Species from NECN CSV",
+                       class = "btn-sm btn-secondary w-100",
+                       icon  = icon("folder-open"))
+        ),
+
+        conditionalPanel(
+          "input.spp_source == 'manual'",
+          p(class = "text-muted small",
+            "Enter one LANDIS species code per line. Both full binomial names ",
+            "(e.g. ", tags$code("PseudotsugaMenziesii"), ") and 8-character ",
+            "abbreviations (e.g. ", tags$code("PseuMenz"), ") are supported."),
+          textAreaInput("manual_species_codes",
+                        label   = NULL,
+                        rows    = 8,
+                        value   = "",
+                        placeholder = "PseudotsugaMenziesii\nAbiesAmabilis\nPinusContorta\n..."),
+          actionButton("load_manual_species", "Build Table from Manual Entry",
+                       class = "btn-sm btn-secondary w-100",
+                       icon  = icon("list"))
+        ),
+
+        uiOutput("spp_load_status"),
+
+        hr(),
+
+        h6("FIA Bark Parameter Estimation"),
+        p(class = "text-muted small",
+          "Queries the USFS Forest Inventory and Analysis (FIA) database for ",
+          "bark thickness (BARK_THICK) and DBH (DIA) measurements. Used to ",
+          "estimate ", tags$b("MaximumBarkThickness"), " (asymptotic bark ",
+          "thickness in cm) and ", tags$b("AgeDBH"), " (age at half-maximum ",
+          "bark thickness) via the SCF Eq. 10 Michaelis-Menten form."),
+
+        checkboxGroupInput("fia_states", "FIA States to Query",
+          choices  = c("WA", "OR", "ID", "MT", "CA", "NV", "AZ", "CO", "WY",
+                       "UT", "NM", "AK"),
+          selected = c("OR", "WA", "ID", "MT"),
+          inline   = TRUE
+        ),
+
+        h6("Local FIA Directory (optional)"),
+        p(class = "text-muted small",
+          "If you have already downloaded FIA state CSV files (via rFIA or ",
+          "the FIADB download tool), specify the folder here to avoid ",
+          "re-downloading. Leave blank to download fresh into a temp folder. ",
+          "Note: FIA downloads can be several hundred MB per state."),
+        textInput("fia_local_dir", label = NULL,
+                  placeholder = "/path/to/fia_csvs/",
+                  value       = ""),
+
+        actionButton("fetch_fia_bark", "Fetch FIA Bark Parameters",
+                     class = "btn-success w-100",
+                     icon  = icon("database")),
+        br(), br(),
+        uiOutput("fia_fetch_status")
+      ),
+
+      # -- Right: outputs ------------------------------------------------------
+      card(
+        card_header("Fire_Spp_Table.csv"),
+        full_screen = TRUE,
+
+        navset_tab(
+
+          nav_panel("Species Parameters",
+            br(),
+            p(class = "text-muted",
+              "Double-click any cell in the ",
+              tags$b("AgeDBH"), " or ", tags$b("MaximumBarkThickness"),
+              " columns to edit values directly. Changes are saved automatically."),
+            p(class = "text-muted small",
+              tags$b("AgeDBH:"), " Age (years) at which bark thickness equals half of ",
+              "MaximumBarkThickness. Lower values = faster bark development. ",
+              "Typical range: 30\u2013150 years depending on species.",
+              br(),
+              tags$b("MaximumBarkThickness:"), " Asymptotic bark thickness (cm, one side) ",
+              "approached at very large DBH. Ponderosa pine \u224840 mm, lodgepole pine ",
+              "\u22488 mm, Douglas-fir \u224825 mm."),
+            br(),
+            DTOutput("spp_table_dt"),
+            br(),
+            fluidRow(
+              column(6,
+                downloadButton("dl_fire_spp_table", "Download Fire_Spp_Table.csv",
+                               class = "btn-primary w-100")
+              ),
+              column(6,
+                downloadButton("dl_spp_table_full", "Download Full Table (with notes)",
+                               class = "btn-sm btn-outline-secondary w-100")
+              )
+            )
+          ),
+
+          nav_panel("Bark Thickness Curves",
+            br(),
+            p(class = "text-muted",
+              "SCF Eq. 10: BarkThickness = (MaxBarkThickness \u00d7 Age) / (Age + AgeDBH). ",
+              "Curves show predicted bark thickness vs stand age for each species in ",
+              "the table. Thicker-barked species at a given age are more resistant to ",
+              "fire-induced cambium kill."),
+            plotOutput("bark_curve_plot", height = "500px")
+          ),
+
+          nav_panel("FIA Species Mapping",
+            br(),
+            p(class = "text-muted",
+              "Built-in lookup table: LANDIS species codes \u2192 FIA SPCD integers. ",
+              "If your species code is not mapped, add a row manually or contact the ",
+              "developer to extend the lookup table."),
+            DTOutput("fia_lookup_dt")
+          )
+        )
+      )
+    )
+  ),
+
+  # ---------------------------------------------------------------------------
+  # Tab 3: Spread Calibration
   # ---------------------------------------------------------------------------
   nav_panel(
     title = "Spread Calibration",
@@ -545,6 +758,8 @@ server <- function(input, output, session) {
     surf_accidental = NULL,
     surf_rx         = NULL,
     startup_df      = NULL,
+    ground_slope_r  = NULL,   # slope in degrees on template grid (INT2S export)
+    uphill_slope_r  = NULL,   # upslope azimuth 0-359 deg on template grid (INT2S export)
 
     # Spread outputs
     pairs_clean         = NULL,
@@ -560,7 +775,12 @@ server <- function(input, output, session) {
     slope_r             = NULL,
     aspect_r            = NULL,
     candidate_grid      = NULL,
-    scores_df           = NULL
+    scores_df           = NULL,
+
+    # Species table outputs
+    spp_codes           = NULL,   # character vector of LANDIS species codes
+    spp_table           = NULL,   # editable tibble: SpeciesCode/AgeDBH/MaxBT/Note
+    fia_trees           = NULL    # raw FIA TREE records (cached to avoid re-download)
   )
 
   # ---------------------------------------------------------------------------
@@ -1159,10 +1379,10 @@ server <- function(input, output, session) {
     tm_shape(ff) +
       tm_raster(
         col        = names(ff)[1],
-        col.scale  = tm_scale_continuous(
+        col.scale  = tm_scale_intervals(
           values   = "brewer.yl_gn",
-          value.na = NA,
-          limits   = c(0, 1)
+          breaks   = c(0, 0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 1.0),
+          value.na = NA
         ),
         col.legend = tm_legend(title = "Fine Fuel Load\n(0\u20131)"),
         col_alpha  = 0.85
@@ -1271,8 +1491,12 @@ server <- function(input, output, session) {
     tm_shape(sl) +
       tm_raster(
         col        = names(sl)[1],
-        col.scale  = tm_scale_continuous(
-          values   = "brewer.yl_or_rd", value.na = NA),
+        col.scale  = tm_scale_intervals(
+          values   = "brewer.yl_or_rd",
+          n        = 7,
+          style    = "pretty",
+          value.na = NA
+        ),
         col.legend = tm_legend(title = "Slope (deg)"),
         col_alpha  = 0.85
       ) +
@@ -1291,10 +1515,13 @@ server <- function(input, output, session) {
     tm_shape(asp) +
       tm_raster(
         col        = names(asp)[1],
-        col.scale  = tm_scale_continuous(
-          values   = "brewer.rd_yl_bu", value.na = NA,
-          limits   = c(0, 360)),
-        col.legend = tm_legend(title = "Aspect (deg\nfrom N)"),
+        col.scale  = tm_scale_intervals(
+          values   = "brewer.rd_yl_bu",
+          breaks   = c(0, 45, 90, 135, 180, 225, 270, 315, 360),
+          labels   = c("N","NE","E","SE","S","SW","W","NW"),
+          value.na = NA
+        ),
+        col.legend = tm_legend(title = "Aspect"),
         col_alpha  = 0.85
       ) +
       tm_shape(bnd) + tm_borders(col = "gray30", lwd = 1.2)
@@ -1500,15 +1727,146 @@ server <- function(input, output, session) {
 
   output$dl_lightning_map <- downloadHandler(
     filename = "Lightning_Ignition_Map.tif",
-    content  = function(f) writeRaster(rv$surf_lightning, f, overwrite = TRUE))
+    content  = function(f) writeRaster(rv$surf_lightning,  f, datatype = "FLT8S", overwrite = TRUE))
 
   output$dl_accidental_map <- downloadHandler(
     filename = "Accidental_Ignition_Map.tif",
-    content  = function(f) writeRaster(rv$surf_accidental, f, overwrite = TRUE))
+    content  = function(f) writeRaster(rv$surf_accidental, f, datatype = "FLT8S", overwrite = TRUE))
 
   output$dl_rx_map <- downloadHandler(
     filename = "Rx_Ignition_Map.tif",
-    content  = function(f) writeRaster(rv$surf_rx, f, overwrite = TRUE))
+    content  = function(f) writeRaster(rv$surf_rx,         f, datatype = "FLT8S", overwrite = TRUE))
+
+  # ---- Terrain maps -------------------------------------------------------
+  observeEvent(input$gen_terrain_maps, {
+    req(rv$template_r, rv$working_crs, rv$template_mask)
+
+    output$terrain_maps_status <- renderUI(
+      tags$span(class = "text-muted small", icon("spinner", class = "fa-spin"),
+                " Fetching DEM and computing terrain maps...")
+    )
+
+    withProgress(message = "Generating terrain maps...", value = 0, {
+      setProgress(0.1, detail = "Fetching DEM via elevatr...")
+
+      template_ext_v <- vect(ext(rv$template_r), crs = rv$working_crs)
+
+      terrain_result <- tryCatch(
+        fetch_terrain(
+          cal_vect    = template_ext_v,
+          working_crs = rv$working_crs,
+          z           = 10,
+          progress_fn = function(msg) setProgress(0.3, detail = msg)
+        ),
+        error = function(e) {
+          output$terrain_maps_status <- renderUI(
+            tags$span(class = "text-danger small", icon("xmark"),
+                      " Terrain fetch failed: ", conditionMessage(e))
+          )
+          NULL
+        }
+      )
+      req(terrain_result)
+
+      setProgress(0.75, detail = "Resampling to LANDIS template grid...")
+
+      slope_res  <- resample(terrain_result$slope,  rv$template_r, method = "bilinear")
+      aspect_res <- resample(terrain_result$aspect, rv$template_r, method = "bilinear")
+
+      # Mask to active template cells (NA outside park boundary)
+      slope_res  <- mask(slope_res,  rv$template_mask)
+      aspect_res <- mask(aspect_res, rv$template_mask)
+
+      # Ground slope: degrees, rounded to nearest integer
+      gs <- round(slope_res)
+      names(gs) <- "slope_deg"
+      rv$ground_slope_r <- gs
+
+      # Uphill azimuth: (aspect + 180) %% 360, clamped 0-359
+      us <- clamp(round((aspect_res + 180) %% 360), lower = 0, upper = 359)
+      names(us) <- "uphill_azimuth_deg"
+      rv$uphill_slope_r <- us
+
+      setProgress(1.0)
+      output$terrain_maps_status <- renderUI(
+        tags$span(class = "text-success small", icon("check"),
+                  " Terrain maps ready for download.")
+      )
+    })
+  })
+
+  output$ground_slope_preview <- renderTmap({
+    req(rv$ground_slope_r)
+    sl <- rv$ground_slope_r
+    if (ncell(sl) > 800000L)
+      sl <- aggregate(sl, ceiling(sqrt(ncell(sl) / 800000L)), fun = "mean", na.rm = TRUE)
+    tm_shape(sl) +
+      tm_raster(
+        col        = names(sl)[1],
+        col.scale  = tm_scale_intervals(
+          values   = "brewer.yl_or_rd",
+          n        = 7,
+          style    = "pretty",
+          value.na = NA
+        ),
+        col.legend = tm_legend(title = "Slope (deg)")
+      )
+  })
+
+  output$uphill_slope_preview <- renderTmap({
+    req(rv$uphill_slope_r)
+    az <- rv$uphill_slope_r
+    if (ncell(az) > 800000L)
+      az <- aggregate(az, ceiling(sqrt(ncell(az) / 800000L)), fun = "mean", na.rm = TRUE)
+    tm_shape(az) +
+      tm_raster(
+        col        = names(az)[1],
+        col.scale  = tm_scale_intervals(
+          values   = "brewer.rd_yl_bu",
+          breaks   = c(0, 45, 90, 135, 180, 225, 270, 315, 360),
+          labels   = c("N","NE","E","SE","S","SW","W","NW"),
+          value.na = NA
+        ),
+        col.legend = tm_legend(title = "Uphill Azimuth")
+      )
+  })
+
+  output$dl_ground_slope <- downloadHandler(
+    filename = "GroundSlope.tif",
+    content  = function(f) {
+      req(rv$ground_slope_r)
+      writeRaster(rv$ground_slope_r, f, datatype = "INT2S", overwrite = TRUE)
+    })
+
+  output$dl_uphill_slope <- downloadHandler(
+    filename = "UphillSlope.tif",
+    content  = function(f) {
+      req(rv$uphill_slope_r)
+      writeRaster(rv$uphill_slope_r, f, datatype = "INT2S", overwrite = TRUE)
+    })
+
+  # ---- Blank suppression maps (0.0 everywhere on template grid) -----------
+  make_blank_suppression <- function() {
+    req(rv$template_mask)
+    r <- rv$template_mask * 0.0
+    names(r) <- "suppression"
+    r
+  }
+
+  output$dl_supp_accidental <- downloadHandler(
+    filename = "Suppression_Accidental_3Zones.tif",
+    content  = function(f) writeRaster(make_blank_suppression(), f,
+                                       datatype = "FLT4S", overwrite = TRUE))
+
+  output$dl_supp_lightning <- downloadHandler(
+    filename = "Suppression_Lightning_3Zones.tif",
+    content  = function(f) writeRaster(make_blank_suppression(), f,
+                                       datatype = "FLT4S", overwrite = TRUE))
+
+  output$dl_supp_rx <- downloadHandler(
+    filename = "Suppression_Rx_3Zones.tif",
+    content  = function(f) writeRaster(make_blank_suppression(), f,
+                                       datatype = "FLT4S", overwrite = TRUE))
 
   output$dl_spread_coef <- downloadHandler(
     filename = "spread_coefficients.csv",
@@ -1544,6 +1902,222 @@ server <- function(input, output, session) {
   output$dl_scores <- downloadHandler(
     filename = "candidate_scores.csv",
     content  = function(f) write_csv(rv$scores_df, f))
+
+  # ===========================================================================
+  # Species Table tab
+  # ===========================================================================
+
+  # Helper: populate the table with default values for a set of species codes
+  init_spp_table <- function(codes) {
+    rv$spp_codes <- codes
+    rv$spp_table <- build_default_species_table(codes)
+  }
+
+  # ---------------------------------------------------------------------------
+  # Load species codes from NECN CSV
+  # ---------------------------------------------------------------------------
+  observeEvent(input$load_necn_species, {
+    req(nchar(trimws(input$necn_csv_path)) > 0)
+    tryCatch({
+      codes <- parse_necn_species(input$necn_csv_path)
+      init_spp_table(codes)
+      output$spp_load_status <- renderUI(
+        tags$span(class = "text-success small", icon("check"),
+                  sprintf(" Loaded %d species from NECN CSV.", length(codes)))
+      )
+    }, error = function(e) {
+      output$spp_load_status <- renderUI(
+        tags$span(class = "text-danger small", icon("xmark"), " ", conditionMessage(e))
+      )
+    })
+  })
+
+  # ---------------------------------------------------------------------------
+  # Load species codes from manual entry
+  # ---------------------------------------------------------------------------
+  observeEvent(input$load_manual_species, {
+    raw <- input$manual_species_codes
+    req(nchar(trimws(raw)) > 0)
+    codes <- unique(trimws(strsplit(raw, "[\n,;]+")[[1]]))
+    codes <- codes[nchar(codes) > 0]
+    if (length(codes) == 0) {
+      output$spp_load_status <- renderUI(
+        tags$span(class = "text-warning small", "No valid species codes found.")
+      )
+      return()
+    }
+    init_spp_table(codes)
+    output$spp_load_status <- renderUI(
+      tags$span(class = "text-success small", icon("check"),
+                sprintf(" Built table for %d species.", length(codes)))
+    )
+  })
+
+  # ---------------------------------------------------------------------------
+  # Fetch FIA bark parameters
+  # ---------------------------------------------------------------------------
+  observeEvent(input$fetch_fia_bark, {
+    req(rv$spp_codes)
+    req(length(input$fia_states) > 0)
+
+    withProgress(message = "Querying FIA database...", value = 0, {
+
+      tryCatch({
+        # ---- Step 1: load FIA tree data (cached in rv$fia_trees) ----------
+        fia_dir_val <- trimws(input$fia_local_dir)
+        if (is.null(rv$fia_trees)) {
+          incProgress(0.1, detail = paste("Downloading FIA for states:",
+                                          paste(input$fia_states, collapse = ", ")))
+          rv$fia_trees <- load_fia_trees(
+            states  = input$fia_states,
+            fia_dir = if (nchar(fia_dir_val) > 0 && dir.exists(fia_dir_val))
+                        fia_dir_val else NULL
+          )
+        }
+
+        # ---- Step 2: estimate bark parameters --------------------------------
+        incProgress(0.6, detail = "Estimating bark parameters per species...")
+        params <- estimate_bark_params_from_fia(
+          species_codes = rv$spp_codes,
+          fia_trees     = rv$fia_trees
+        )
+
+        # Merge with existing table (preserve any manual edits for species that
+        # didn't get FIA estimates, but overwrite where FIA data were found)
+        rv$spp_table <- params
+
+        incProgress(0.3, detail = "Done.")
+        output$fia_fetch_status <- renderUI(
+          tags$span(class = "text-success small", icon("check"),
+                    sprintf(" FIA parameters estimated for %d of %d species.",
+                            sum(!is.na(params$FIA_SPCD)), nrow(params)))
+        )
+      }, error = function(e) {
+        output$fia_fetch_status <- renderUI(
+          tags$span(class = "text-danger small", icon("xmark"),
+                    " FIA fetch failed: ", conditionMessage(e))
+        )
+      })
+    })
+  })
+
+  # ---------------------------------------------------------------------------
+  # Render editable DT
+  # ---------------------------------------------------------------------------
+  output$spp_table_dt <- renderDT({
+    req(rv$spp_table)
+    # Columns the user can edit: AgeDBH and MaximumBarkThickness
+    dt <- rv$spp_table %>%
+      select(SpeciesCode, AgeDBH, MaximumBarkThickness, CommonName, Note) %>%
+      mutate(across(where(is.numeric), ~ round(., 3)))
+
+    datatable(
+      dt,
+      editable  = list(target = "cell", disable = list(columns = c(0, 3, 4))),
+      rownames  = FALSE,
+      selection = "none",
+      options   = list(
+        pageLength  = 30,
+        scrollX     = TRUE,
+        columnDefs  = list(
+          list(width = "120px", targets = 0),   # SpeciesCode
+          list(width = "80px",  targets = 1),   # AgeDBH
+          list(width = "150px", targets = 2),   # MaximumBarkThickness
+          list(width = "160px", targets = 3),   # CommonName
+          list(width = "400px", targets = 4)    # Note
+        )
+      ),
+      colnames  = c("SpeciesCode", "AgeDBH", "MaxBarkThickness (cm)",
+                    "Common Name", "Note")
+    ) %>%
+      formatStyle(c("AgeDBH", "MaximumBarkThickness"),
+                  backgroundColor = "#fffde7",
+                  cursor = "pointer") %>%
+      formatRound("MaximumBarkThickness", digits = 2)
+  })
+
+  # Capture cell edits and write back to rv$spp_table
+  observeEvent(input$spp_table_dt_cell_edit, {
+    info <- input$spp_table_dt_cell_edit
+    # Columns in DT (0-indexed): 0=SpeciesCode, 1=AgeDBH, 2=MaxBT, 3=CommonName, 4=Note
+    col_name <- c("SpeciesCode", "AgeDBH", "MaximumBarkThickness",
+                  "CommonName", "Note")[info$col + 1]
+    row_i    <- info$row    # 1-indexed because rownames=FALSE means DT shifts by 1
+    new_val  <- info$value
+
+    tbl <- rv$spp_table
+    if (col_name == "AgeDBH") {
+      tbl[row_i, col_name] <- as.integer(round(as.numeric(new_val)))
+    } else if (col_name == "MaximumBarkThickness") {
+      tbl[row_i, col_name] <- round(as.numeric(new_val), 3)
+    }
+    rv$spp_table <- tbl
+  })
+
+  # ---------------------------------------------------------------------------
+  # Bark thickness curve plot
+  # ---------------------------------------------------------------------------
+  output$bark_curve_plot <- renderPlot({
+    req(rv$spp_table)
+    req(nrow(rv$spp_table) > 0)
+
+    curve_df <- bark_curve_data(rv$spp_table, max_age = 600)
+
+    ggplot(curve_df, aes(x = Age, y = BarkThickness_cm,
+                         colour = SpeciesCode, group = SpeciesCode)) +
+      geom_line(linewidth = 0.8) +
+      geom_hline(aes(yintercept = MaximumBarkThickness, colour = SpeciesCode),
+                 linetype = "dashed", linewidth = 0.3, alpha = 0.5) +
+      labs(
+        x      = "Stand Age (years)",
+        y      = "Bark Thickness (cm, one side)",
+        colour = "Species",
+        title  = "SCF Eq. 10 — Bark Thickness vs Age",
+        caption = paste0(
+          "Dashed lines = MaximumBarkThickness asymptote. ",
+          "AgeDBH = age at half-maximum bark thickness."
+        )
+      ) +
+      theme_bw(base_size = 12) +
+      theme(legend.position = "right",
+            plot.caption = element_text(size = 8, colour = "grey50"))
+  })
+
+  # ---------------------------------------------------------------------------
+  # FIA lookup table viewer
+  # ---------------------------------------------------------------------------
+  output$fia_lookup_dt <- renderDT({
+    datatable(
+      landis_to_fia_lookup,
+      rownames = FALSE,
+      options  = list(pageLength = 30, scrollX = TRUE),
+      colnames = c("LANDIS Code", "FIA SPCD", "Common Name")
+    )
+  })
+
+  # ---------------------------------------------------------------------------
+  # Download handlers
+  # ---------------------------------------------------------------------------
+
+  # Fire_Spp_Table.csv — only the 3 columns SCF needs
+  output$dl_fire_spp_table <- downloadHandler(
+    filename = "Fire_Spp_Table.csv",
+    content  = function(f) {
+      req(rv$spp_table)
+      rv$spp_table %>%
+        select(SpeciesCode, AgeDBH, MaximumBarkThickness) %>%
+        write_csv(f)
+    }
+  )
+
+  # Full table including common name and notes
+  output$dl_spp_table_full <- downloadHandler(
+    filename = "Fire_Spp_Table_annotated.csv",
+    content  = function(f) {
+      req(rv$spp_table)
+      write_csv(rv$spp_table, f)
+    }
+  )
 }
 
 shinyApp(ui, server)
