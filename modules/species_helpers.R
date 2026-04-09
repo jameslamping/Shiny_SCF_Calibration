@@ -317,7 +317,7 @@ estimate_bark_params_from_fia <- function(species_codes, fia_trees, lookup) {
   # ---------------------------------------------------------------------------
   # Build age column: prefer TOTAGE, else BHAGE + correction
   trees_age <- trees_sub %>%
-    left_join(years_to_bh, by = "SPCD") %>%
+    left_join(years_to_bh, by = c("SPCD" = "fia_spcd")) %>%
     mutate(
       ytbh = coalesce(ytbh, 4L),
       Age  = case_when(
@@ -338,7 +338,7 @@ estimate_bark_params_from_fia <- function(species_codes, fia_trees, lookup) {
         fit <- tryCatch(
           nls(
             dia_cm ~ dmax_est * Age / (Age + theta),
-            data    = cur_data(),
+            data    = pick(everything()),
             start   = list(theta = 60),
             control = nls.control(maxiter = 300, warnOnly = TRUE)
           ),
