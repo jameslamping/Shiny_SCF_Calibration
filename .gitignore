@@ -43,6 +43,10 @@ Rplots.pdf
 *.log
 rsconnect/
 
+# Local data inputs — too large for git; see data_raw/ERA-Interim/README.txt
+# for ERA-Interim setup instructions
+data_raw/
+
 # user paths
 paths.rtf
 
