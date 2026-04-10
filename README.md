@@ -1,4 +1,4 @@
-<p align="center">
+<p align="right">
   <img src="scf_fire_calibration_icon.svg" width="160" alt="SCF Fire Calibration App icon"/>
 </p>
 
