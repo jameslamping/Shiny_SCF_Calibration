@@ -1,5 +1,5 @@
-<p align="right">
-  <img src="scf_fire_calibration_icon.svg" width="160" alt="SCF Fire Calibration App icon"/>
+<p align="center">
+  <img src="scf_fire_calibration_icon.svg" width="350" alt="SCF Fire Calibration App icon"/>
 </p>
 
 # SCF Fire Calibration Shiny App
