@@ -45,3 +45,6 @@ rsconnect/
 
 # user paths
 paths.rtf
+
+# Claude Code project instructions (local only)
+CLAUDE.md
