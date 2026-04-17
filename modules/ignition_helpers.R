@@ -366,49 +366,218 @@ make_kernel_surface <- function(points_df, template, bandwidth_m, maxdist_m) {
 }
 
 
+# Shared theme element for all ignition diagnostic plots
+.ign_theme <- function(base_size = 12) {
+  theme_bw(base_size = base_size) +
+    theme(
+      strip.background = element_rect(fill = "#2c5f2e"),
+      strip.text       = element_text(color = "white", face = "bold"),
+      legend.position  = "bottom"
+    )
+}
+
+# Internal: compute full E[n] = (1 - pi) * lambda for one coef row
+.predict_ign_row <- function(fwi_vec, row) {
+  lambda <- exp(row$b0 + row$b1 * fwi_vec)
+  if (row$distribution == "Poisson") {
+    lambda
+  } else {
+    # plogis() is the standard inverse-logit: 1 / (1 + exp(-x))
+    # pi is the structural-zero probability; (1 - pi) * lambda is E[n]
+    pi <- plogis(row$bz0 + row$bz1 * fwi_vec)
+    (1 - pi) * lambda
+  }
+}
+
+# Internal: observed mean count and zero-fraction per integer FWI bin
+.obs_binned <- function(model_data) {
+  model_data %>%
+    mutate(FWI_bin = round(FWI)) %>%
+    group_by(FWI_bin, ignition_type) %>%
+    summarise(mean_n    = mean(n),
+              zero_frac = mean(n == 0),
+              n_days    = n(),
+              .groups   = "drop")
+}
+
+
 # -----------------------------------------------------------------------------
 # plot_ignition_diagnostics
-# Observed vs. predicted ignition counts by FWI bin.
+# Observed mean daily ignitions (bars) vs. full model E[n] (line).
 # -----------------------------------------------------------------------------
 
 plot_ignition_diagnostics <- function(model_data, coef_df) {
 
-  predict_ign <- function(fwi_vec, row) {
-    if (row$distribution == "Poisson") {
-      exp(row$b0 + row$b1 * fwi_vec)
-    } else {
-      lambda <- exp(row$b0 + row$b1 * fwi_vec)
-      p_zero <- 1 / (1 + exp(row$bz0 + row$bz1 * fwi_vec))
-      (1 - p_zero) * lambda
-    }
-  }
-
-  fwi_seq <- seq(0, max(model_data$FWI, na.rm = TRUE), length.out = 100)
+  fwi_seq <- seq(0, max(model_data$FWI, na.rm = TRUE), length.out = 200)
 
   pred_df <- map_dfr(seq_len(nrow(coef_df)), function(i) {
     row <- coef_df[i, ]
-    tibble(FWI = fwi_seq,
-           pred = predict_ign(fwi_seq, row),
+    tibble(FWI           = fwi_seq,
+           pred          = .predict_ign_row(fwi_seq, row),
+           ignition_type = row$ignition_type,
+           distribution  = row$distribution)
+  })
+
+  obs <- .obs_binned(model_data)
+
+  dist_label <- unique(pred_df$distribution)
+  subtitle <- if (length(dist_label) == 1 && dist_label == "Poisson") {
+    "Bars = observed mean daily ignitions per FWI bin  |  Line = Poisson E[n]"
+  } else {
+    "Bars = observed mean daily ignitions per FWI bin  |  Line = ZIP E[n] = (1\u2212\u03c0)\u00d7\u03bb"
+  }
+
+  ggplot() +
+    geom_col(data = obs, aes(FWI_bin, mean_n),
+             fill = "#c8d8c8", width = 1) +
+    geom_line(data = pred_df, aes(FWI, pred),
+              color = "#a0522d", linewidth = 1.1) +
+    facet_wrap(~ignition_type, scales = "free_y") +
+    labs(title    = "Observed vs. Fitted Ignition Rate",
+         subtitle = subtitle,
+         x = "Fire Weather Index (FWI)", y = "Mean daily ignitions") +
+    .ign_theme()
+}
+
+
+# -----------------------------------------------------------------------------
+# plot_zero_inflation
+# Shows how the structural-zero probability (pi) varies with FWI alongside
+# the observed fraction of zero-count days.  ZIP only.
+# -----------------------------------------------------------------------------
+
+plot_zero_inflation <- function(model_data, coef_df) {
+
+  zip_rows <- coef_df %>% filter(distribution != "Poisson")
+  if (nrow(zip_rows) == 0) {
+    return(ggplot() +
+             annotate("text", x = 0.5, y = 0.5,
+                      label = "Zero-inflation panel only available for ZIP model.",
+                      size = 5, hjust = 0.5) +
+             theme_void())
+  }
+
+  fwi_seq <- seq(0, max(model_data$FWI, na.rm = TRUE), length.out = 200)
+
+  pi_df <- map_dfr(seq_len(nrow(zip_rows)), function(i) {
+    row <- zip_rows[i, ]
+    tibble(FWI           = fwi_seq,
+           pi            = plogis(row$bz0 + row$bz1 * fwi_seq),
            ignition_type = row$ignition_type)
   })
 
-  obs_binned <- model_data %>%
-    mutate(FWI_bin = round(FWI)) %>%
-    group_by(FWI_bin, ignition_type) %>%
-    summarise(mean_n = mean(n), .groups = "drop")
+  obs <- .obs_binned(model_data) %>% filter(n_days >= 5)
 
   ggplot() +
-    geom_col(data = obs_binned, aes(FWI_bin, mean_n),
+    geom_col(data = obs, aes(FWI_bin, zero_frac),
+             fill = "#e8d5b0", width = 1) +
+    geom_line(data = pi_df, aes(FWI, pi),
+              color = "#6a3d9a", linewidth = 1.2) +
+    geom_hline(yintercept = 0.5, linetype = "dotted", color = "grey40") +
+    facet_wrap(~ignition_type) +
+    scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
+    labs(
+      title    = "Zero-Inflation Component: Structural-Zero Probability (\u03c0) vs FWI",
+      subtitle = paste0(
+        "Bars = observed fraction of zero-count days (bins with \u22655 days)\n",
+        "Line = \u03c0 = plogis(bz0 + bz1 \u00d7 FWI)  |  Values above 50% line: ",
+        "most days are structurally zero"
+      ),
+      x = "Fire Weather Index (FWI)",
+      y = "Probability of structural zero (\u03c0)"
+    ) +
+    .ign_theme()
+}
+
+
+# -----------------------------------------------------------------------------
+# plot_count_component
+# Isolates lambda = exp(b0 + b1 * FWI) for Poisson and ZIP side-by-side.
+# Helps explain how b0/b1 differ when zeros are modelled separately.
+# -----------------------------------------------------------------------------
+
+plot_count_component <- function(model_data, coef_df) {
+
+  fwi_seq <- seq(0, max(model_data$FWI, na.rm = TRUE), length.out = 200)
+
+  lambda_df <- map_dfr(seq_len(nrow(coef_df)), function(i) {
+    row   <- coef_df[i, ]
+    label <- if (row$distribution == "Poisson") "Poisson \u03bb" else "ZIP \u03bb (count component)"
+    tibble(FWI           = fwi_seq,
+           lambda        = exp(row$b0 + row$b1 * fwi_seq),
+           model         = label,
+           ignition_type = row$ignition_type)
+  })
+
+  obs <- .obs_binned(model_data)
+
+  ggplot() +
+    geom_col(data = obs, aes(FWI_bin, mean_n),
              fill = "#c8d8c8", width = 1) +
-    geom_line(data = pred_df, aes(FWI, pred),
-              color = "#a0522d", linewidth = 1) +
+    geom_line(data = lambda_df,
+              aes(FWI, lambda, color = model, linetype = model),
+              linewidth = 1.1) +
+    scale_color_manual(
+      values = c("Poisson \u03bb" = "#a0522d",
+                 "ZIP \u03bb (count component)" = "#2980b9")
+    ) +
+    scale_linetype_manual(
+      values = c("Poisson \u03bb" = "solid",
+                 "ZIP \u03bb (count component)" = "dashed")
+    ) +
     facet_wrap(~ignition_type, scales = "free_y") +
     labs(
-      title    = "Ignition Model Diagnostics",
-      subtitle = "Bars = observed mean daily ignitions per FWI bin; line = fitted model",
-      x = "Fire Weather Index (FWI)", y = "Mean daily ignitions"
+      title    = "Count Component (\u03bb) by Model",
+      subtitle = paste0(
+        "\u03bb = exp(b0 + b1 \u00d7 FWI)  |  SCF uses B0/B1 from this component\n",
+        "ZIP \u03bb > Poisson \u03bb at low FWI because ZIP attributes zeros to \u03c0, ",
+        "not to a low count rate"
+      ),
+      x = "Fire Weather Index (FWI)", y = "\u03bb (expected count | non-structural-zero day)",
+      color = NULL, linetype = NULL
     ) +
-    theme_bw(base_size = 12) +
-    theme(strip.background = element_rect(fill = "#2c5f2e"),
-          strip.text = element_text(color = "white", face = "bold"))
+    .ign_theme()
+}
+
+
+# -----------------------------------------------------------------------------
+# plot_ignition_residuals
+# Mean (observed - predicted) per 2-unit FWI bin.  Flags systematic bias.
+# -----------------------------------------------------------------------------
+
+plot_ignition_residuals <- function(model_data, coef_df) {
+
+  fwi_seq_full <- model_data$FWI
+
+  resid_df <- map_dfr(seq_len(nrow(coef_df)), function(i) {
+    row   <- coef_df[i, ]
+    d     <- model_data %>% filter(ignition_type == row$ignition_type, !is.na(FWI))
+    mu    <- .predict_ign_row(d$FWI, row)
+    label <- if (row$distribution == "Poisson") "Poisson" else "ZIP"
+    tibble(FWI           = d$FWI,
+           residual      = d$n - mu,
+           model         = label,
+           ignition_type = row$ignition_type)
+  }) %>%
+    mutate(FWI_bin = round(FWI / 2) * 2) %>%
+    group_by(FWI_bin, ignition_type, model) %>%
+    summarise(mean_r = mean(residual),
+              sd_r   = sd(residual),
+              .groups = "drop")
+
+  ggplot(resid_df, aes(FWI_bin, mean_r, color = model)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_ribbon(aes(ymin = mean_r - sd_r, ymax = mean_r + sd_r, fill = model),
+                alpha = 0.15, color = NA) +
+    geom_line(linewidth = 1.0) +
+    scale_color_manual(values = c("Poisson" = "#a0522d", "ZIP" = "#2980b9")) +
+    scale_fill_manual(values  = c("Poisson" = "#a0522d", "ZIP" = "#2980b9")) +
+    facet_wrap(~ignition_type, scales = "free_y") +
+    labs(
+      title    = "Model Residuals by FWI Bin",
+      subtitle = "Mean \u00b1 SD of (observed \u2212 predicted) per 2-unit FWI bin  |  Zero line = perfect fit",
+      x = "Fire Weather Index (FWI)", y = "Mean residual (observed \u2212 predicted)",
+      color = NULL, fill = NULL
+    ) +
+    .ign_theme()
 }

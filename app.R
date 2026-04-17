@@ -216,7 +216,25 @@ ui <- page_navbar(
                            class = "btn-sm btn-outline-primary")
           ),
           nav_panel("Diagnostics",
-            plotOutput("ign_diag_plot", height = "450px")
+            br(),
+            p(class = "text-muted small",
+              "Four diagnostic panels for evaluating the fitted ignition model. ",
+              "Run Ignition Calibration first. ZIP model selected in the inputs ",
+              "adds the zero-inflation and count-component panels."),
+            navset_tab(
+              nav_panel("Observed vs Fitted",
+                plotOutput("ign_diag_plot", height = "420px")
+              ),
+              nav_panel("Zero-Inflation (\u03c0)",
+                plotOutput("ign_zero_inf_plot", height = "420px")
+              ),
+              nav_panel("Count Component (\u03bb)",
+                plotOutput("ign_lambda_plot", height = "420px")
+              ),
+              nav_panel("Residuals",
+                plotOutput("ign_resid_plot", height = "420px")
+              )
+            )
           ),
           nav_panel("ERA Startup Codes",
             br(),
@@ -1164,6 +1182,21 @@ server <- function(input, output, session) {
   output$ign_diag_plot <- renderPlot({
     req(rv$ign_model_data, rv$ign_coef)
     plot_ignition_diagnostics(rv$ign_model_data, rv$ign_coef)
+  })
+
+  output$ign_zero_inf_plot <- renderPlot({
+    req(rv$ign_model_data, rv$ign_coef)
+    plot_zero_inflation(rv$ign_model_data, rv$ign_coef)
+  })
+
+  output$ign_lambda_plot <- renderPlot({
+    req(rv$ign_model_data, rv$ign_coef)
+    plot_count_component(rv$ign_model_data, rv$ign_coef)
+  })
+
+  output$ign_resid_plot <- renderPlot({
+    req(rv$ign_model_data, rv$ign_coef)
+    plot_ignition_residuals(rv$ign_model_data, rv$ign_coef)
   })
 
   # ---------------------------------------------------------------------------
