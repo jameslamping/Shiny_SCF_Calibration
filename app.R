@@ -258,7 +258,9 @@ ui <- page_navbar(
             h5("Ignition Allocation Surfaces"),
             p(class = "text-muted small",
               "Spatial weights for fire ignition locations on the LANDIS template ",
-              "grid. Exported as double-precision float (FLT8S) as required by SCF."),
+              "grid. Exported as 32-bit signed integers (INT4S), scaled 0\u2013100. ",
+              "SCF truncates raster values to integer at load time, so a 0\u20131 float ",
+              "map collapses to weight 0 or 1 only \u2014 use this integer-scaled output."),
             fluidRow(
               column(4, downloadButton("dl_lightning_map",  "Lightning_Ignition_Map.tif",
                                        class = "btn-sm btn-outline-secondary w-100")),
@@ -1790,15 +1792,15 @@ server <- function(input, output, session) {
 
   output$dl_lightning_map <- downloadHandler(
     filename = "Lightning_Ignition_Map.tif",
-    content  = function(f) writeRaster(rv$surf_lightning,  f, datatype = "FLT8S", overwrite = TRUE))
+    content  = function(f) writeRaster(rv$surf_lightning,  f, datatype = "INT4S", overwrite = TRUE))
 
   output$dl_accidental_map <- downloadHandler(
     filename = "Accidental_Ignition_Map.tif",
-    content  = function(f) writeRaster(rv$surf_accidental, f, datatype = "FLT8S", overwrite = TRUE))
+    content  = function(f) writeRaster(rv$surf_accidental, f, datatype = "INT4S", overwrite = TRUE))
 
   output$dl_rx_map <- downloadHandler(
     filename = "Rx_Ignition_Map.tif",
-    content  = function(f) writeRaster(rv$surf_rx,         f, datatype = "FLT8S", overwrite = TRUE))
+    content  = function(f) writeRaster(rv$surf_rx,         f, datatype = "INT4S", overwrite = TRUE))
 
   # ---- Terrain maps -------------------------------------------------------
   observeEvent(input$gen_terrain_maps, {

@@ -296,10 +296,13 @@ make_ignition_surfaces <- function(ign_df, template, working_crs,
     surfaces[[typ]] <- make_kernel_surface(pts, template, bw_m, maxdist_m)
   }
 
-  # Rx: uniform surface (no empirical Rx data in FPA FOD)
+  # Rx: uniform surface (no empirical Rx data in FPA FOD).
+  # Set all active cells to 100 so every cell carries equal weight after
+  # SCF's integer cast — consistent with the 0-100 scale used for the
+  # empirical Lightning and Accidental surfaces.
   rx_r <- rast(template)
   tv   <- values(template, mat = FALSE)
-  values(rx_r) <- ifelse(is.na(tv), NA_real_, 1.0)
+  values(rx_r) <- ifelse(is.na(tv), NA_real_, 100)
   surfaces[["Rx"]] <- rx_r
 
   surfaces
@@ -355,13 +358,18 @@ make_kernel_surface <- function(points_df, template, bandwidth_m, maxdist_m) {
   smooth_r <- focal(count_r, w = kernel, fun = "sum",
                     na.policy = "omit", na.rm = TRUE)
   
-  # ---- Step 4: normalize to 0-1 -------------------------------------------
+  # ---- Step 4: scale to 0-100 integers ---------------------------------------
+  # SCF's MapUtility.ReadMap() casts pixel values to (int) at load time, and
+  # PreShuffleEther() casts again when building the weighted selector.  Any
+  # value in [0, 1) truncates to 0 and the cell is never selected as an ignition
+  # site.  Scaling to the range 0-100 (rounded integers) preserves the full
+  # relative variation in ignition probability while surviving both int casts.
   sv  <- values(smooth_r, mat = FALSE)
   mx  <- max(sv, na.rm = TRUE)
-  if (is.finite(mx) && mx > 0) sv <- sv / mx
+  if (is.finite(mx) && mx > 0) sv <- round(sv / mx * 100)
   sv[!active_mask] <- NA
   values(smooth_r) <- sv
-  
+
   smooth_r
 }
 
