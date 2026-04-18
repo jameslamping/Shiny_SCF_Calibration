@@ -795,34 +795,33 @@ plot_expected_ignitions <- function(annual_df) {
     mutate(ignition_type = factor(ignition_type,
                                    levels = c("Lightning", "Accidental", "Total")))
 
-  means_df <- plot_df %>%
-    group_by(scenario, ignition_type) %>%
-    summarise(mean_val = mean(expected_annual), .groups = "drop")
-
   scenario_colors <- c(
     "Regional (unadjusted)" = "#a0522d",
     "Landscape-adjusted"    = "#2980b9",
     "Park intercept"        = "#27ae60"
   )
 
-  ggplot(plot_df, aes(expected_annual, fill = scenario)) +
-    geom_histogram(bins = 12, alpha = 0.75, color = "white") +
-    geom_vline(data = means_df,
-               aes(xintercept = mean_val, color = scenario),
-               linetype = "dashed", linewidth = 1) +
-    scale_fill_manual(values  = scenario_colors, na.value = "grey70") +
-    scale_color_manual(values = scenario_colors, na.value = "grey70") +
-    # facet_grid: rows = scenario (each gets its own x-axis via scales="free_x"),
-    # cols = ignition type. This prevents the large regional values from crushing
-    # the landscape-adjusted bars into a zero-width spike on a shared axis.
-    facet_grid(scenario ~ ignition_type, scales = "free") +
+  # One panel per ignition type, each with its own y-axis scale.
+  # Scenarios are side-by-side boxes so magnitudes can be compared directly.
+  # Boxplot works much better than histogram here: the landscape-adjusted
+  # values are tightly clustered relative to their mean and all collapse into
+  # a single histogram bin, whereas a boxplot shows median + spread clearly.
+  ggplot(plot_df, aes(x = scenario, y = expected_annual, fill = scenario)) +
+    geom_boxplot(alpha = 0.75, outlier.shape = 21, outlier.size = 2,
+                 width = 0.5) +
+    geom_jitter(width = 0.08, size = 1.2, alpha = 0.5, color = "grey30") +
+    scale_fill_manual(values = scenario_colors, na.value = "grey70") +
+    facet_wrap(~ignition_type, scales = "free_y", nrow = 1) +
     labs(
       title    = "Expected Annual Ignitions — Calibration FWI Climatology",
-      subtitle = "Each row is a scenario with its own scale  |  Dashed line = mean  |  Bottom row = what SCF will simulate",
-      x = "Expected ignitions per year",
-      y = "Number of years",
-      fill = NULL, color = NULL
+      subtitle = "Each point = one calibration year  |  Landscape-adjusted / Park intercept = what SCF will simulate",
+      x = NULL,
+      y = "Expected ignitions per year",
+      fill = NULL
     ) +
     .ign_theme(base_size = 12) +
-    theme(legend.position = "none")   # scenario already labelled by row strip
+    theme(
+      legend.position = "none",
+      axis.text.x     = element_text(angle = 25, hjust = 1, size = 9)
+    )
 }
