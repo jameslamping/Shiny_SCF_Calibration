@@ -811,10 +811,13 @@ plot_expected_ignitions <- function(annual_df) {
                  width = 0.5) +
     geom_jitter(width = 0.08, size = 1.2, alpha = 0.5, color = "grey30") +
     scale_fill_manual(values = scenario_colors, na.value = "grey70") +
-    facet_wrap(~ignition_type, scales = "free_y", nrow = 1) +
+    # facet_grid: rows = scenario, cols = ignition type.
+    # scales = "free_y" gives each ROW its own y-axis so the landscape-adjusted
+    # values (~20-60/yr) are not crushed by the regional scale (~600-2000/yr).
+    facet_grid(scenario ~ ignition_type, scales = "free_y") +
     labs(
       title    = "Expected Annual Ignitions — Calibration FWI Climatology",
-      subtitle = "Each point = one calibration year  |  Landscape-adjusted / Park intercept = what SCF will simulate",
+      subtitle = "Each point = one calibration year  |  Landscape-adjusted / Park intercept rows = what SCF will simulate",
       x = NULL,
       y = "Expected ignitions per year",
       fill = NULL
@@ -822,6 +825,7 @@ plot_expected_ignitions <- function(annual_df) {
     .ign_theme(base_size = 12) +
     theme(
       legend.position = "none",
-      axis.text.x     = element_text(angle = 25, hjust = 1, size = 9)
+      axis.text.x     = element_blank(),
+      axis.ticks.x    = element_blank()
     )
 }

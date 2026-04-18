@@ -279,7 +279,7 @@ ui <- page_navbar(
                 DTOutput("expected_ign_table")
               ),
               column(7,
-                plotOutput("expected_ign_plot", height = "320px")
+                plotOutput("expected_ign_plot", height = "480px")
               )
             )
           ),
