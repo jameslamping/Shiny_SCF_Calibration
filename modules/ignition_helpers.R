@@ -694,16 +694,23 @@ fit_park_intercept <- function(park_model_data, coef_regional,
                     data = d, family = poisson(link = "log"))
     b0_park  <- unname(coef(m)[1])
 
+    # Only b0 is re-estimated at park scale.
+    # b1 transfers unchanged (FWI slope is a climate signal, not area-dependent).
+    # bz0 / bz1 transfer unchanged: the zero-inflation component answers
+    # "is today structurally fire-free?" — that is a regional climate question
+    # (rain, snowpack) that applies equally to any sub-region.  Keeping the
+    # regional bz params ensures the same fire-weather gating logic is used.
+    # Distribution stays whatever the regional fit used (Poisson or ZIP).
     out[[typ]] <- tibble(
       ignition_type = typ,
-      distribution  = "Poisson",
+      distribution  = reg$distribution,
       b0  = b0_park,
       b1  = b1_fixed,
-      bz0 = NA_real_,
-      bz1 = NA_real_,
+      bz0 = reg$bz0,
+      bz1 = reg$bz1,
       method = sprintf(
-        "Park intercept: b0 from %d fires in template; b1=%.4f fixed from regional fit",
-        n_fires, b1_fixed)
+        "Park intercept: b0 from %d fires in template; b1/bz0/bz1 fixed from regional %s fit",
+        n_fires, reg$distribution)
     )
   }
 
