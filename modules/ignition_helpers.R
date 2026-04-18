@@ -13,7 +13,7 @@
 # =============================================================================
 
 if (!require("pacman", quietly = TRUE)) install.packages("pacman")
-pacman::p_load(terra, dplyr, lubridate, tidyr, ggplot2, glue)
+pacman::p_load(terra, dplyr, lubridate, tidyr, ggplot2, glue, scales)
 
 # -----------------------------------------------------------------------------
 # Utility helpers
@@ -588,4 +588,230 @@ plot_ignition_residuals <- function(model_data, coef_df) {
       color = NULL, fill = NULL
     ) +
     .ign_theme()
+}
+
+
+# =============================================================================
+# SCALE ADJUSTMENT HELPERS
+# Functions for adjusting ignition model coefficients from calibration-region
+# scale to LANDIS landscape scale, and for summarising expected annual
+# ignitions at the landscape scale.
+#
+# Two approaches:
+#   Option A — Area offset: adjust b0 by log(template_area / cal_area).
+#              Assumes uniform ignition density across the calibration region.
+#   Option B — Park-specific intercept: re-estimate b0 from FPA FOD points
+#              within the template extent, holding b1 fixed from regional fit.
+#              Requires enough fire history within the template (~15+ years).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# compute_landscape_areas
+# Returns calibration boundary area, template landscape area, and the log
+# area ratio used as the b0 offset in Option A.
+# Both inputs must be in the same projected CRS (working_crs).
+# -----------------------------------------------------------------------------
+
+compute_landscape_areas <- function(cal_vect_proj, template_r) {
+  cal_area_ha  <- sum(expanse(cal_vect_proj, unit = "ha"))
+
+  cell_ha      <- prod(res(template_r)) / 1e4        # m² -> ha
+  n_active     <- sum(!is.na(values(template_r, mat = FALSE)))
+  tmpl_area_ha <- n_active * cell_ha
+
+  list(
+    cal_area_ha  = cal_area_ha,
+    tmpl_area_ha = tmpl_area_ha,
+    ratio        = tmpl_area_ha / cal_area_ha,
+    log_ratio    = log(tmpl_area_ha / cal_area_ha)
+  )
+}
+
+
+# -----------------------------------------------------------------------------
+# apply_area_offset  (Option A)
+# Adjusts b0 for each ignition type by log(template_area / cal_area).
+# b1, bz0, bz1 are unchanged — only the intercept scales with area.
+# -----------------------------------------------------------------------------
+
+apply_area_offset <- function(coef_df, cal_area_ha, tmpl_area_ha) {
+  log_offset <- log(tmpl_area_ha / cal_area_ha)
+  coef_df %>%
+    mutate(
+      b0     = b0 + log_offset,
+      method = sprintf("Area offset: log(%.0f / %.0f) = %.4f added to b0",
+                       tmpl_area_ha, cal_area_ha, log_offset)
+    )
+}
+
+
+# -----------------------------------------------------------------------------
+# filter_fpa_to_template  (Option B helper)
+# Keeps only FPA FOD records whose locations fall within the active (non-NA)
+# cells of the LANDIS template raster.  Uses terra::extract() for exactness.
+# ign_df must have columns x, y in the same CRS as template_r.
+# -----------------------------------------------------------------------------
+
+filter_fpa_to_template <- function(ign_df, template_r) {
+  if (nrow(ign_df) == 0) return(ign_df)
+
+  pts_v     <- vect(ign_df, geom = c("x", "y"), crs = crs(template_r))
+  tmpl_vals <- extract(template_r, pts_v)[, 2]   # NA where outside landscape
+  ign_df[!is.na(tmpl_vals), ]
+}
+
+
+# -----------------------------------------------------------------------------
+# fit_park_intercept  (Option B)
+# Re-estimates b0 for each ignition type using FPA FOD fires within the
+# template extent, holding b1 fixed at the regional value.  Always returns
+# Poisson (ZIP is not feasible at park scale with sparse data).
+# Falls back to area-offset-adjusted coef if <3 fires exist for a type.
+# -----------------------------------------------------------------------------
+
+fit_park_intercept <- function(park_model_data, coef_regional,
+                                cal_area_ha, tmpl_area_ha) {
+  out <- list()
+
+  for (typ in c("Lightning", "Accidental")) {
+    d   <- park_model_data %>% filter(ignition_type == typ, !is.na(FWI))
+    reg <- coef_regional   %>% filter(ignition_type == typ)
+    n_fires <- sum(d$n)
+
+    if (n_fires < 3) {
+      message(sprintf(
+        "%s: only %d fires in template — too few to fit. Using area-offset b0.",
+        typ, n_fires))
+      fallback <- apply_area_offset(reg, cal_area_ha, tmpl_area_ha)
+      out[[typ]] <- fallback %>%
+        mutate(method = paste0("Fallback (area offset): ", method,
+                               sprintf(" [only %d fires in template]", n_fires)))
+      next
+    }
+
+    b1_fixed <- reg$b1
+    m        <- glm(n ~ 1, offset = b1_fixed * FWI,
+                    data = d, family = poisson(link = "log"))
+    b0_park  <- unname(coef(m)[1])
+
+    out[[typ]] <- tibble(
+      ignition_type = typ,
+      distribution  = "Poisson",
+      b0  = b0_park,
+      b1  = b1_fixed,
+      bz0 = NA_real_,
+      bz1 = NA_real_,
+      method = sprintf(
+        "Park intercept: b0 from %d fires in template; b1=%.4f fixed from regional fit",
+        n_fires, b1_fixed)
+    )
+  }
+
+  bind_rows(out)
+}
+
+
+# -----------------------------------------------------------------------------
+# predict_annual_ignitions
+# Applies adjusted coefficients to the ERA FWI daily time series to produce
+# expected annual ignition counts at the landscape scale.
+# Returns tibble(year, ignition_type, expected_annual, scenario).
+# -----------------------------------------------------------------------------
+
+predict_annual_ignitions <- function(coef_df, fwi_daily,
+                                      scenario_label = "Landscape-adjusted") {
+  d <- fwi_daily %>% mutate(year = year(date))
+
+  map_dfr(seq_len(nrow(coef_df)), function(i) {
+    row <- coef_df[i, ]
+    d %>%
+      mutate(E_n = .predict_ign_row(value, row)) %>%
+      group_by(year) %>%
+      summarise(expected_annual = sum(E_n, na.rm = TRUE), .groups = "drop") %>%
+      mutate(ignition_type = row$ignition_type,
+             scenario      = scenario_label)
+  })
+}
+
+
+# -----------------------------------------------------------------------------
+# summarise_expected_ignitions
+# Summary statistics table from predict_annual_ignitions() output.
+# -----------------------------------------------------------------------------
+
+summarise_expected_ignitions <- function(annual_df) {
+  type_rows <- annual_df %>%
+    group_by(scenario, ignition_type) %>%
+    summarise(
+      mean_annual   = round(mean(expected_annual),              1),
+      median_annual = round(median(expected_annual),            1),
+      sd_annual     = round(sd(expected_annual),                1),
+      p10_annual    = round(quantile(expected_annual, 0.10),    1),
+      p90_annual    = round(quantile(expected_annual, 0.90),    1),
+      .groups = "drop"
+    )
+
+  # Total row per scenario
+  total_rows <- annual_df %>%
+    group_by(scenario, year) %>%
+    summarise(expected_annual = sum(expected_annual), .groups = "drop") %>%
+    group_by(scenario) %>%
+    summarise(
+      ignition_type = "TOTAL",
+      mean_annual   = round(mean(expected_annual),           1),
+      median_annual = round(median(expected_annual),         1),
+      sd_annual     = round(sd(expected_annual),             1),
+      p10_annual    = round(quantile(expected_annual, 0.10), 1),
+      p90_annual    = round(quantile(expected_annual, 0.90), 1),
+      .groups = "drop"
+    )
+
+  bind_rows(type_rows, total_rows) %>%
+    arrange(scenario, ignition_type)
+}
+
+
+# -----------------------------------------------------------------------------
+# plot_expected_ignitions
+# Distribution of expected annual ignitions across the FWI climatology period.
+# Shows both regional (unadjusted) and landscape-adjusted scenarios together.
+# -----------------------------------------------------------------------------
+
+plot_expected_ignitions <- function(annual_df) {
+  # Add total column per year/scenario
+  totals <- annual_df %>%
+    group_by(scenario, year) %>%
+    summarise(expected_annual = sum(expected_annual), .groups = "drop") %>%
+    mutate(ignition_type = "Total")
+
+  plot_df <- bind_rows(annual_df, totals) %>%
+    mutate(ignition_type = factor(ignition_type,
+                                   levels = c("Lightning", "Accidental", "Total")))
+
+  means_df <- plot_df %>%
+    group_by(scenario, ignition_type) %>%
+    summarise(mean_val = mean(expected_annual), .groups = "drop")
+
+  scenario_colors <- c(
+    "Regional (unadjusted)" = "#a0522d",
+    "Landscape-adjusted"    = "#2980b9",
+    "Park intercept"        = "#27ae60"
+  )
+
+  ggplot(plot_df, aes(expected_annual, fill = scenario, color = scenario)) +
+    geom_histogram(bins = 12, alpha = 0.55, position = "identity") +
+    geom_vline(data = means_df,
+               aes(xintercept = mean_val, color = scenario),
+               linetype = "dashed", linewidth = 1) +
+    scale_fill_manual(values  = scenario_colors, na.value = "grey70") +
+    scale_color_manual(values = scenario_colors, na.value = "grey70") +
+    facet_wrap(~ignition_type, scales = "free", nrow = 1) +
+    labs(
+      title    = "Expected Annual Ignitions — Calibration FWI Climatology",
+      subtitle = "Histograms across calibration years  |  Dashed line = mean  |  Landscape-adjusted = what SCF will simulate",
+      x = "Expected ignitions per year",
+      y = "Number of years",
+      fill = NULL, color = NULL
+    ) +
+    .ign_theme(base_size = 12)
 }

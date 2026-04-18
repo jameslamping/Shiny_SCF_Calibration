@@ -215,6 +215,75 @@ ui <- page_navbar(
             downloadButton("dl_ign_coef", "Download Coefficients CSV",
                            class = "btn-sm btn-outline-primary")
           ),
+
+          nav_panel("Scale Adjustment",
+            br(),
+            p(class = "text-muted small",
+              "Ignition model coefficients are calibrated using all fires across the ",
+              "large calibration boundary. Before using them in LANDIS, the Poisson ",
+              "intercept (b0) must be scaled down to match the size of your LANDIS ",
+              "landscape. The slope (b1) and zero-inflation terms (bz0, bz1) transfer ",
+              "without modification."),
+            fluidRow(
+              column(5,
+                h6("Scaling Method"),
+                radioButtons("scale_method", NULL,
+                  choices = c(
+                    "A \u2014 Area Offset (recommended)" = "area_offset",
+                    "B \u2014 Park-Specific Intercept from FPA FOD" = "park_intercept"
+                  ),
+                  selected = "area_offset"
+                ),
+                p(class = "text-muted small",
+                  strong("Option A:"), " adjusts b0 by log(landscape area / calibration area). ",
+                  "Assumes uniform fire density across the calibration region. ",
+                  "Calculated automatically when calibration runs."),
+                p(class = "text-muted small",
+                  strong("Option B:"), " re-estimates b0 from FPA FOD fires within the ",
+                  "LANDIS template extent, holding b1 fixed from the regional fit. ",
+                  "Requires \u226515 years of fire history within the template. ",
+                  "Falls back to Option A if fewer than 3 fires are found."),
+                hr(),
+                h6("Landscape Areas"),
+                uiOutput("area_summary_ui"),
+                br(),
+                conditionalPanel(
+                  "input.scale_method == 'park_intercept'",
+                  actionButton("fit_park_b0", "Fit Park-Scale Intercept",
+                               class = "btn-sm btn-outline-primary w-100"),
+                  br(), br(),
+                  uiOutput("park_fit_status_ui")
+                )
+              ),
+              column(7,
+                h6("Adjusted Coefficients"),
+                p(class = "text-muted small",
+                  "Coefficients to enter into the SCF parameter file. ",
+                  "b0 has been adjusted; all other values are unchanged."),
+                DTOutput("adjusted_coef_table"),
+                br(),
+                downloadButton("dl_adjusted_coef",
+                               "Download Adjusted Coefficients CSV",
+                               class = "btn-sm btn-outline-primary")
+              )
+            ),
+            hr(),
+            h6("Expected Annual Ignitions at LANDIS Landscape Scale"),
+            p(class = "text-muted small",
+              "Expected ignitions per year computed by applying model coefficients to ",
+              "the ERA FWI daily climatology. Shows regional (unadjusted) and ",
+              "landscape-adjusted rates side by side so you can verify the scaling ",
+              "before running LANDIS."),
+            fluidRow(
+              column(5,
+                DTOutput("expected_ign_table")
+              ),
+              column(7,
+                plotOutput("expected_ign_plot", height = "320px")
+              )
+            )
+          ),
+
           nav_panel("Diagnostics",
             br(),
             p(class = "text-muted small",
@@ -800,12 +869,18 @@ server <- function(input, output, session) {
     wind_daily     = NULL,
 
     # Ignition outputs
-    ign_df          = NULL,
-    ign_model_data  = NULL,
-    ign_coef        = NULL,
-    surf_lightning  = NULL,
-    surf_accidental = NULL,
-    surf_rx         = NULL,
+    ign_df               = NULL,
+    ign_model_data       = NULL,
+    ign_coef             = NULL,
+    surf_lightning       = NULL,
+    surf_accidental      = NULL,
+    surf_rx              = NULL,
+    # Scale adjustment
+    landscape_areas      = NULL,   # list(cal_ha, tmpl_ha, ratio, log_ratio)
+    ign_coef_adjusted    = NULL,   # scale-adjusted coefficients
+    park_ign_df          = NULL,   # FPA FOD within template (Option B)
+    park_model_data      = NULL,   # daily park counts (Option B)
+    expected_ignitions   = NULL,   # tibble(year, ignition_type, expected_annual, scenario)
     startup_df      = NULL,
     ground_slope_r  = NULL,   # slope in degrees on template grid (INT2S export)
     uphill_slope_r  = NULL,   # upslope azimuth 0-359 deg on template grid (INT2S export)
@@ -1199,6 +1274,169 @@ server <- function(input, output, session) {
   output$ign_resid_plot <- renderPlot({
     req(rv$ign_model_data, rv$ign_coef)
     plot_ignition_residuals(rv$ign_model_data, rv$ign_coef)
+  })
+
+  # ---------------------------------------------------------------------------
+  # Scale Adjustment — auto-compute Option A whenever calibration completes
+  # ---------------------------------------------------------------------------
+
+  observeEvent(rv$ign_coef, {
+    req(rv$cal_vect_proj, rv$template_r, rv$ign_coef, rv$era_fwi_daily)
+
+    # Landscape areas (used by both options)
+    rv$landscape_areas <- compute_landscape_areas(rv$cal_vect_proj, rv$template_r)
+
+    # Default adjusted coef = Option A (area offset)
+    rv$ign_coef_adjusted <- apply_area_offset(
+      rv$ign_coef,
+      rv$landscape_areas$cal_area_ha,
+      rv$landscape_areas$tmpl_area_ha
+    )
+
+    # Expected ignitions: regional (unadjusted) + landscape-adjusted
+    regional_annual  <- predict_annual_ignitions(
+      rv$ign_coef, rv$era_fwi_daily, scenario_label = "Regional (unadjusted)"
+    )
+    adjusted_annual  <- predict_annual_ignitions(
+      rv$ign_coef_adjusted, rv$era_fwi_daily, scenario_label = "Landscape-adjusted"
+    )
+    rv$expected_ignitions <- bind_rows(regional_annual, adjusted_annual)
+  })
+
+  # Re-apply Option A when user switches back to it
+  observeEvent(input$scale_method, {
+    req(rv$ign_coef, rv$landscape_areas, rv$era_fwi_daily)
+    if (input$scale_method == "area_offset") {
+      rv$ign_coef_adjusted <- apply_area_offset(
+        rv$ign_coef,
+        rv$landscape_areas$cal_area_ha,
+        rv$landscape_areas$tmpl_area_ha
+      )
+      adjusted_annual <- predict_annual_ignitions(
+        rv$ign_coef_adjusted, rv$era_fwi_daily, scenario_label = "Landscape-adjusted"
+      )
+      regional_annual <- predict_annual_ignitions(
+        rv$ign_coef, rv$era_fwi_daily, scenario_label = "Regional (unadjusted)"
+      )
+      rv$expected_ignitions <- bind_rows(regional_annual, adjusted_annual)
+    }
+  }, ignoreInit = TRUE)
+
+  # Option B: fit park-specific intercept from FPA FOD within template
+  observeEvent(input$fit_park_b0, {
+    req(rv$ign_df, rv$template_r, rv$era_fwi_daily,
+        rv$ign_coef, rv$landscape_areas)
+
+    output$park_fit_status_ui <- renderUI(
+      tags$span(class = "text-warning small",
+                icon("spinner", class = "fa-spin"), " Filtering FPA FOD to template...")
+    )
+
+    tryCatch({
+      # Filter FPA FOD to template extent
+      rv$park_ign_df    <- filter_fpa_to_template(rv$ign_df, rv$template_r)
+      n_park            <- nrow(rv$park_ign_df)
+
+      output$park_fit_status_ui <- renderUI(
+        tags$span(class = "text-info small",
+                  sprintf(" %d FPA FOD fires within template extent. Fitting...", n_park))
+      )
+
+      # Build daily park counts
+      rv$park_model_data <- build_ignition_model_data(rv$park_ign_df, rv$era_fwi_daily)
+
+      # Fit park intercept (b1 fixed from regional)
+      rv$ign_coef_adjusted <- fit_park_intercept(
+        rv$park_model_data, rv$ign_coef,
+        rv$landscape_areas$cal_area_ha,
+        rv$landscape_areas$tmpl_area_ha
+      )
+
+      # Update expected ignitions with park intercept results
+      park_annual    <- predict_annual_ignitions(
+        rv$ign_coef_adjusted, rv$era_fwi_daily, scenario_label = "Park intercept"
+      )
+      regional_annual <- predict_annual_ignitions(
+        rv$ign_coef, rv$era_fwi_daily, scenario_label = "Regional (unadjusted)"
+      )
+      rv$expected_ignitions <- bind_rows(regional_annual, park_annual)
+
+      output$park_fit_status_ui <- renderUI(
+        tags$span(class = "text-success small",
+                  icon("check"), sprintf(" Done. %d fires in template used.", n_park))
+      )
+    }, error = function(e) {
+      output$park_fit_status_ui <- renderUI(
+        tags$span(class = "text-danger small",
+                  icon("xmark"), " Error: ", conditionMessage(e))
+      )
+    })
+  })
+
+  # -- Area summary UI ---------------------------------------------------------
+  output$area_summary_ui <- renderUI({
+    req(rv$landscape_areas)
+    a <- rv$landscape_areas
+    tags$table(class = "table table-sm table-bordered small",
+      tags$tbody(
+        tags$tr(tags$th("Calibration boundary"),
+                tags$td(sprintf("%.2f M ha", a$cal_area_ha / 1e6))),
+        tags$tr(tags$th("LANDIS template"),
+                tags$td(sprintf("%.0f ha  (%.2f%%)",
+                                a$tmpl_area_ha,
+                                a$ratio * 100))),
+        tags$tr(tags$th("log(area ratio)"),
+                tags$td(sprintf("%.4f  \u2192 b0 adjusted by this amount",
+                                a$log_ratio)))
+      )
+    )
+  })
+
+  # -- Adjusted coefficients table --------------------------------------------
+  output$adjusted_coef_table <- renderDT({
+    req(rv$ign_coef_adjusted)
+    rv$ign_coef_adjusted %>%
+      select(ignition_type, distribution, b0, b1, bz0, bz1) %>%
+      mutate(across(where(is.numeric), ~round(.x, 6))) %>%
+      datatable(options = list(dom = "t", paging = FALSE),
+                rownames = FALSE, class = "table-sm table-striped")
+  })
+
+  output$dl_adjusted_coef <- downloadHandler(
+    filename = "ignition_coefficients_adjusted.csv",
+    content  = function(f) {
+      req(rv$ign_coef_adjusted, rv$landscape_areas)
+      a <- rv$landscape_areas
+      write.csv(
+        rv$ign_coef_adjusted %>%
+          mutate(cal_area_ha  = a$cal_area_ha,
+                 tmpl_area_ha = a$tmpl_area_ha,
+                 log_offset   = a$log_ratio),
+        f, row.names = FALSE
+      )
+    }
+  )
+
+  # -- Expected ignitions table + plot ----------------------------------------
+  output$expected_ign_table <- renderDT({
+    req(rv$expected_ignitions)
+    summarise_expected_ignitions(rv$expected_ignitions) %>%
+      rename(Type = ignition_type, Scenario = scenario,
+             Mean = mean_annual, Median = median_annual,
+             SD = sd_annual, P10 = p10_annual, P90 = p90_annual) %>%
+      datatable(
+        options = list(dom = "t", paging = FALSE, ordering = FALSE),
+        rownames = FALSE, class = "table-sm table-striped"
+      ) %>%
+      formatStyle("Type",
+        target = "row",
+        fontWeight = styleEqual("TOTAL", "bold")
+      )
+  })
+
+  output$expected_ign_plot <- renderPlot({
+    req(rv$expected_ignitions)
+    plot_expected_ignitions(rv$expected_ignitions)
   })
 
   # ---------------------------------------------------------------------------
