@@ -778,6 +778,185 @@ summarise_expected_ignitions <- function(annual_df) {
 }
 
 
+# =============================================================================
+# LANDIS VALIDATION HELPERS
+# Compare simulated annual ignitions from a SCF events log against the
+# expected annual ignitions from the fitted + scaled model.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# load_scf_events_log
+# Reads a socialclimatefire-events-log.csv and returns annual ignition counts
+# per simulation year and ignition type, plus a Total row.
+# -----------------------------------------------------------------------------
+
+load_scf_events_log <- function(path) {
+  if (!file.exists(path)) stop("Events log not found: ", path)
+
+  df <- read.csv(path, stringsAsFactors = FALSE)
+  names(df) <- trimws(names(df))
+
+  required <- c("SimulationYear", "IgnitionType")
+  missing  <- setdiff(required, names(df))
+  if (length(missing) > 0)
+    stop("Events log missing columns: ", paste(missing, collapse = ", "))
+
+  annual <- df %>%
+    mutate(
+      ignition_type = trimws(IgnitionType),
+      ignition_type = case_when(
+        grepl("lightning",  ignition_type, ignore.case = TRUE) ~ "Lightning",
+        grepl("accidental", ignition_type, ignore.case = TRUE) ~ "Accidental",
+        TRUE ~ ignition_type
+      )
+    ) %>%
+    group_by(SimulationYear, ignition_type) %>%
+    summarise(n_fires = n(), .groups = "drop")
+
+  # Zero-fill missing type × year combinations
+  full_grid <- expand.grid(
+    SimulationYear = unique(annual$SimulationYear),
+    ignition_type  = c("Lightning", "Accidental"),
+    stringsAsFactors = FALSE
+  )
+  annual <- full_grid %>%
+    left_join(annual, by = c("SimulationYear", "ignition_type")) %>%
+    mutate(n_fires = replace_na(n_fires, 0L))
+
+  annual
+}
+
+
+# -----------------------------------------------------------------------------
+# summarise_ignition_validation
+# Side-by-side summary table: expected (from model) vs simulated (from SCF).
+# expected_df: output of predict_annual_ignitions() for landscape-adjusted coef.
+# simulated_df: output of load_scf_events_log().
+# -----------------------------------------------------------------------------
+
+summarise_ignition_validation <- function(expected_df, simulated_df) {
+  # Totals per year
+  exp_total <- expected_df %>%
+    group_by(year) %>%
+    summarise(expected_annual = sum(expected_annual), .groups = "drop") %>%
+    mutate(ignition_type = "Total")
+
+  sim_total <- simulated_df %>%
+    group_by(SimulationYear) %>%
+    summarise(n_fires = sum(n_fires), .groups = "drop") %>%
+    mutate(ignition_type = "Total")
+
+  exp_all <- bind_rows(expected_df, exp_total)
+  sim_all <- bind_rows(simulated_df, sim_total)
+
+  exp_sum <- exp_all %>%
+    group_by(ignition_type) %>%
+    summarise(
+      exp_mean = round(mean(expected_annual), 1),
+      exp_p10  = round(quantile(expected_annual, 0.10), 1),
+      exp_p90  = round(quantile(expected_annual, 0.90), 1),
+      .groups = "drop"
+    )
+
+  sim_sum <- sim_all %>%
+    group_by(ignition_type) %>%
+    summarise(
+      sim_mean = round(mean(n_fires), 1),
+      sim_min  = min(n_fires),
+      sim_max  = max(n_fires),
+      sim_n_yr = n_distinct(SimulationYear),
+      .groups = "drop"
+    )
+
+  left_join(exp_sum, sim_sum, by = "ignition_type") %>%
+    mutate(
+      in_range = sim_mean >= exp_p10 & sim_mean <= exp_p90,
+      ignition_type = factor(ignition_type,
+                              levels = c("Lightning", "Accidental", "Total"))
+    ) %>%
+    arrange(ignition_type) %>%
+    select(
+      `Type`          = ignition_type,
+      `Expected mean` = exp_mean,
+      `Exp P10`       = exp_p10,
+      `Exp P90`       = exp_p90,
+      `Simulated mean`= sim_mean,
+      `Sim min`       = sim_min,
+      `Sim max`       = sim_max,
+      `Sim years`     = sim_n_yr,
+      `Mean in P10-P90` = in_range
+    )
+}
+
+
+# -----------------------------------------------------------------------------
+# plot_ignition_validation
+# Boxplot of expected annual ignitions (ERA FWI climatology, adjusted coef)
+# overlaid with simulated annual counts from the SCF events log.
+# -----------------------------------------------------------------------------
+
+plot_ignition_validation <- function(expected_df, simulated_df) {
+  # Add totals
+  exp_total <- expected_df %>%
+    group_by(year) %>%
+    summarise(expected_annual = sum(expected_annual), .groups = "drop") %>%
+    mutate(ignition_type = "Total")
+
+  sim_total <- simulated_df %>%
+    group_by(SimulationYear) %>%
+    summarise(n_fires = sum(n_fires), .groups = "drop") %>%
+    mutate(ignition_type = "Total")
+
+  exp_plot <- bind_rows(expected_df, exp_total) %>%
+    mutate(ignition_type = factor(ignition_type,
+                                   levels = c("Lightning", "Accidental", "Total")))
+
+  sim_plot <- bind_rows(simulated_df, sim_total) %>%
+    mutate(ignition_type = factor(ignition_type,
+                                   levels = c("Lightning", "Accidental", "Total")))
+
+  ggplot() +
+    # Expected distribution from ERA FWI climatology
+    geom_boxplot(
+      data  = exp_plot,
+      aes(x = ignition_type, y = expected_annual),
+      fill  = "#c8d8c8", color = "#2c5f2e",
+      width = 0.45, outlier.shape = NA, alpha = 0.8
+    ) +
+    # Individual simulated years as points
+    geom_jitter(
+      data  = sim_plot,
+      aes(x = ignition_type, y = n_fires, color = "SCF simulated years"),
+      width = 0.12, size = 3, alpha = 0.85, shape = 18
+    ) +
+    # Simulated mean line per type
+    stat_summary(
+      data = sim_plot,
+      aes(x = ignition_type, y = n_fires, color = "SCF simulated years"),
+      fun = mean, geom = "point", shape = 95, size = 10
+    ) +
+    scale_color_manual(
+      values = c("SCF simulated years" = "#a0522d"),
+      guide  = guide_legend(override.aes = list(shape = 18, size = 3))
+    ) +
+    facet_wrap(~ignition_type, scales = "free_y", nrow = 1) +
+    labs(
+      title    = "LANDIS Ignition Validation",
+      subtitle = paste0(
+        "Green box = expected annual range from ERA FWI climatology (adjusted coef)\n",
+        "Brown diamonds = individual SCF simulation years  |  \u2014 = simulated mean"
+      ),
+      x = NULL, y = "Annual ignitions", color = NULL
+    ) +
+    .ign_theme(base_size = 12) +
+    theme(
+      axis.text.x    = element_blank(),
+      axis.ticks.x   = element_blank(),
+      legend.position = "bottom"
+    )
+}
+
+
 # -----------------------------------------------------------------------------
 # plot_expected_ignitions
 # Distribution of expected annual ignitions across the FWI climatology period.

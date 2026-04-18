@@ -284,6 +284,36 @@ ui <- page_navbar(
             )
           ),
 
+          nav_panel("LANDIS Validation",
+            br(),
+            p(class = "text-muted small",
+              "Load a SCF fire events log (socialclimatefire-events-log.csv) to ",
+              "compare simulated annual ignitions against the expected range from ",
+              "the fitted model. Run Scale Adjustment first so the comparison uses ",
+              "landscape-scale coefficients."),
+            fluidRow(
+              column(8,
+                textInput("events_log_path", label = NULL,
+                          placeholder = "/path/to/socialclimatefire-events-log.csv")
+              ),
+              column(4,
+                actionButton("load_events_log", "Load Events Log",
+                             class = "btn-sm btn-outline-primary w-100")
+              )
+            ),
+            uiOutput("events_log_status_ui"),
+            br(),
+            h6("Annual Ignition Comparison"),
+            p(class = "text-muted small",
+              "Expected range (green box) = ERA FWI climatology applied to scaled ",
+              "model coefficients. Simulated points = each LANDIS simulation year. ",
+              "Simulated mean should fall within the P10\u2013P90 expected range."),
+            fluidRow(
+              column(5, DTOutput("validation_table")),
+              column(7, plotOutput("validation_plot", height = "360px"))
+            )
+          ),
+
           nav_panel("Diagnostics",
             br(),
             p(class = "text-muted small",
@@ -881,6 +911,8 @@ server <- function(input, output, session) {
     park_ign_df          = NULL,   # FPA FOD within template (Option B)
     park_model_data      = NULL,   # daily park counts (Option B)
     expected_ignitions   = NULL,   # tibble(year, ignition_type, expected_annual, scenario)
+    # LANDIS validation
+    simulated_ignitions  = NULL,   # annual counts from SCF events log
     startup_df      = NULL,
     ground_slope_r  = NULL,   # slope in degrees on template grid (INT2S export)
     uphill_slope_r  = NULL,   # upslope azimuth 0-359 deg on template grid (INT2S export)
@@ -1437,6 +1469,71 @@ server <- function(input, output, session) {
   output$expected_ign_plot <- renderPlot({
     req(rv$expected_ignitions)
     plot_expected_ignitions(rv$expected_ignitions)
+  })
+
+  # ---------------------------------------------------------------------------
+  # LANDIS Validation
+  # ---------------------------------------------------------------------------
+
+  observeEvent(input$load_events_log, {
+    req(nchar(trimws(input$events_log_path)) > 0)
+
+    output$events_log_status_ui <- renderUI(
+      tags$span(class = "text-warning small",
+                icon("spinner", class = "fa-spin"), " Loading events log...")
+    )
+
+    tryCatch({
+      rv$simulated_ignitions <- load_scf_events_log(
+        trimws(input$events_log_path)
+      )
+      n_yrs   <- n_distinct(rv$simulated_ignitions$SimulationYear)
+      n_fires <- sum(rv$simulated_ignitions$n_fires)
+      output$events_log_status_ui <- renderUI(
+        tags$span(class = "text-success small",
+                  icon("check"),
+                  sprintf(" Loaded: %d simulation years, %d total fire events (%.1f/yr)",
+                          n_yrs, n_fires, n_fires / n_yrs))
+      )
+    }, error = function(e) {
+      output$events_log_status_ui <- renderUI(
+        tags$span(class = "text-danger small",
+                  icon("xmark"), " Error: ", conditionMessage(e))
+      )
+    })
+  })
+
+  output$validation_table <- renderDT({
+    req(rv$simulated_ignitions, rv$expected_ignitions)
+    # Use only the landscape-adjusted (or park intercept) expected scenario
+    exp_adj <- rv$expected_ignitions %>%
+      filter(!grepl("Regional", scenario)) %>%
+      select(year, ignition_type, expected_annual)
+
+    summarise_ignition_validation(exp_adj, rv$simulated_ignitions) %>%
+      datatable(
+        options = list(dom = "t", paging = FALSE, ordering = FALSE),
+        rownames = FALSE, class = "table-sm table-striped"
+      ) %>%
+      formatStyle(
+        "Mean in P10-P90",
+        backgroundColor = styleEqual(c(TRUE, FALSE), c("#d4edda", "#f8d7da")),
+        color           = styleEqual(c(TRUE, FALSE), c("#155724", "#721c24"))
+      ) %>%
+      formatStyle(
+        "Type",
+        target    = "row",
+        fontWeight = styleEqual("Total", "bold")
+      )
+  })
+
+  output$validation_plot <- renderPlot({
+    req(rv$simulated_ignitions, rv$expected_ignitions)
+    exp_adj <- rv$expected_ignitions %>%
+      filter(!grepl("Regional", scenario)) %>%
+      select(year, ignition_type, expected_annual)
+
+    plot_ignition_validation(exp_adj, rv$simulated_ignitions)
   })
 
   # ---------------------------------------------------------------------------
