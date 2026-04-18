@@ -656,7 +656,7 @@ filter_fpa_to_template <- function(ign_df, template_r) {
   if (nrow(ign_df) == 0) return(ign_df)
 
   pts_v     <- vect(ign_df, geom = c("x", "y"), crs = crs(template_r))
-  tmpl_vals <- extract(template_r, pts_v)[, 2]   # NA where outside landscape
+  tmpl_vals <- terra::extract(template_r, pts_v)[, 2]  # explicit: tidyr also exports extract()
   ign_df[!is.na(tmpl_vals), ]
 }
 
@@ -798,20 +798,24 @@ plot_expected_ignitions <- function(annual_df) {
     "Park intercept"        = "#27ae60"
   )
 
-  ggplot(plot_df, aes(expected_annual, fill = scenario, color = scenario)) +
-    geom_histogram(bins = 12, alpha = 0.55, position = "identity") +
+  ggplot(plot_df, aes(expected_annual, fill = scenario)) +
+    geom_histogram(bins = 12, alpha = 0.75, color = "white") +
     geom_vline(data = means_df,
                aes(xintercept = mean_val, color = scenario),
                linetype = "dashed", linewidth = 1) +
     scale_fill_manual(values  = scenario_colors, na.value = "grey70") +
     scale_color_manual(values = scenario_colors, na.value = "grey70") +
-    facet_wrap(~ignition_type, scales = "free", nrow = 1) +
+    # facet_grid: rows = scenario (each gets its own x-axis via scales="free_x"),
+    # cols = ignition type. This prevents the large regional values from crushing
+    # the landscape-adjusted bars into a zero-width spike on a shared axis.
+    facet_grid(scenario ~ ignition_type, scales = "free") +
     labs(
       title    = "Expected Annual Ignitions — Calibration FWI Climatology",
-      subtitle = "Histograms across calibration years  |  Dashed line = mean  |  Landscape-adjusted = what SCF will simulate",
+      subtitle = "Each row is a scenario with its own scale  |  Dashed line = mean  |  Bottom row = what SCF will simulate",
       x = "Expected ignitions per year",
       y = "Number of years",
       fill = NULL, color = NULL
     ) +
-    .ign_theme(base_size = 12)
+    .ign_theme(base_size = 12) +
+    theme(legend.position = "none")   # scenario already labelled by row strip
 }
