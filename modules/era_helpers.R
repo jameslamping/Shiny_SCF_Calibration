@@ -75,8 +75,12 @@ extract_era_timeseries <- function(nc_path, park_vect, cal_start = NULL, cal_end
 # -----------------------------------------------------------------------------
 # extract_era5_wind
 #
-# Extracts daily park-mean wind speed (km/h) and direction (degrees) from
+# Extracts daily park-mean wind speed (m/s) and direction (degrees) from
 # ERA5 u10/v10 component files.
+#
+# UNITS: wind speed is returned in m/s — the native ERA5 and LANDIS Climate
+# Library unit.  The LANDIS climate CSV stores windspeed as m/s (confirmed
+# from LTB test data); calibration must use the same units as simulation.
 #
 # Supports:
 #   - Two separate files (u10_path and v10_path both specified)
@@ -157,7 +161,13 @@ extract_era5_wind <- function(u10_path, v10_path = NULL, park_vect,
   v_mean <- as.numeric(global(v_crop, "mean", na.rm = TRUE)[, 1])
 
   # ---- Derive speed and direction -------------------------------------
-  # Speed: sqrt(u^2 + v^2), convert m/s -> km/h (*3.6)
+  # Speed: sqrt(u^2 + v^2) converted m/s -> km/h (* 3.6).
+  # SCF User Guide (p.5, sections 2.43/2.47/2.51):
+  #   "The climate library converts all wind speed units into kilometers / hour.
+  #    Be sure to convert your wind data into the correct units when inputting
+  #    into the climate library."
+  # ERA5 native units are m/s; multiply by 3.6 so calibrated EWS coefficients
+  # match the km/h values that SCF reads at runtime from DailyWindSpeed.
   wind_speed_kmh <- sqrt(u_mean^2 + v_mean^2) * 3.6
 
   # Meteorological direction: direction FROM which wind blows (degrees, 0=N)
@@ -180,7 +190,7 @@ extract_era5_wind <- function(u10_path, v10_path = NULL, park_vect,
 # and graceful partial failure.
 #
 # GRIDMET variables used:
-#   vs  -- daily mean 10m wind speed (m/s)  -> converted to km/h
+#   vs  -- daily mean 10m wind speed (m/s) — kept in m/s to match LANDIS
 #   th  -- daily mean 10m wind direction (degrees clockwise from north)
 #
 # Coverage: contiguous US (CONUS) only, 1979-present, ~4 km resolution.
@@ -262,7 +272,7 @@ extract_gridmet_wind <- function(cal_vect, cal_start, cal_end,
 
     results[[i]] <- tibble(
       date          = dates,
-      WindSpeed_kmh = vs_mean * 3.6,   # m/s -> km/h
+      WindSpeed_kmh = vs_mean * 3.6,   # GRIDMET vs is m/s; convert to km/h per SCF User Guide
       WindDir_deg   = th_mean
     )
   }

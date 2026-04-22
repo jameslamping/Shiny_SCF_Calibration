@@ -37,7 +37,7 @@ if (!require("pacman", quietly = TRUE)) install.packages("pacman")
 pacman::p_load(
   shiny, bslib, terra, dplyr, lubridate, readr, tidyr,
   ggplot2, glue, DT, tmap, purrr, stringr, broom, sf, scales,
-  climateR, elevatr
+  climateR, elevatr, patchwork
 )
 
 source("modules/era_helpers.R")
@@ -45,6 +45,8 @@ source("modules/ignition_helpers.R")
 source("modules/spread_helpers.R")
 source("modules/species_helpers.R")
 source("modules/ui_helpers.R")
+source("modules/validation_helpers.R")
+source("modules/mortality_helpers.R")
 options(jsonlite.named_vectors_as_objects = FALSE)
 
 # =============================================================================
@@ -618,6 +620,23 @@ ui <- page_navbar(
                   placeholder = "/path/to/Historic_Geomac.gdb"),
 
         hr(),
+        h6("Combustion Buoyancy (Cb)"),
+        selectInput("combustion_buoyancy", NULL,
+          choices  = c("Low intensity — Cb = 10 (flat terrain / low-severity)"   = "10",
+                       "Moderate intensity — Cb = 25 (recommended for most landscapes)" = "25",
+                       "High intensity — Cb = 50 (active crown fire landscapes)" = "50"),
+          selected = "10"
+        ),
+        p(class = "text-muted small",
+          "Controls how slope amplifies effective wind speed (EWS) in the Nelson ",
+          "(2002) formula. SCF uses the same Cb tiers at runtime: Cb=10 for fires ",
+          "with intensity index 1-3, Cb=25 for 4-6, and Cb=50 for 7-10. ",
+          tags$b("Calibrate at the Cb matching your landscape's typical fire intensity."),
+          " Using Cb=10 when your landscape burns at Cb=25+ causes severely ",
+          "under-estimated coefficients — fires spread too rapidly in simulation. ",
+          "Cb affects only sloped terrain; flat landscapes are insensitive to this choice."),
+
+        hr(),
         h6("Cleaning Thresholds"),
         p(class = "text-muted small",
           "These filters control which perimeter pairs are used for each model."),
@@ -642,12 +661,22 @@ ui <- page_navbar(
 
         hr(),
         h6("Spread Rasterization"),
-        numericInput("spread_res_m", "Cell Size (m)",
-                     value = 90, min = 30, max = 2000, step = 10),
+        fluidRow(
+          column(8,
+            numericInput("spread_res_m", "Cell Size (m)",
+                         value = 90, min = 30, max = 2000, step = 10)
+          ),
+          column(4,
+            div(style = "padding-top: 28px;",
+                uiOutput("spread_res_reset_ui"))
+          )
+        ),
+        uiOutput("spread_res_hint_ui"),
         p(class = "text-muted small",
           "Resolution used to rasterize GeoMAC perimeters across the calibration ",
-          "boundary. Defaults to the LANDIS template cell size. Finer resolution ",
-          "captures more fire detail but increases processing time."),
+          "boundary. Should match the LANDIS template cell size (auto-filled when ",
+          "template is loaded). Finer resolution captures more fire detail but ",
+          "increases processing time."),
 
         hr(),
         h6("Sampling Control"),
@@ -842,6 +871,74 @@ ui <- page_navbar(
                            class = "btn-sm btn-outline-secondary")
           ),
 
+          nav_panel("Threshold Search",
+            br(),
+            h5("Cleaning Threshold & Sampling Control Search"),
+            p(class = "text-muted small",
+              "Tests all combinations of cleaning thresholds and sampling controls. ",
+              "Perimeters are rasterized once for the widest thresholds; subsequent ",
+              "grid points filter from cache and refit cheaply. Requires GeoMAC ",
+              "perimeters to be loaded (click Run Spread Fitting first, or the search ",
+              "loads them automatically). Score = w_AUC \u00d7 AUC + w_R\u00b2 \u00d7 R\u00b2(Q75 fit)."),
+            fluidRow(
+              column(3,
+                h6("Max Gap \u2014 Spread Prob (days)"),
+                textInput("search_gap_sp", NULL, value = "1, 2, 3, 5"),
+                p(class = "text-muted small", "Comma-separated values to try.")
+              ),
+              column(3,
+                h6("Max Gap \u2014 Daily Area (days)"),
+                textInput("search_gap_da", NULL, value = "3, 7, 14"),
+                p(class = "text-muted small", "Comma-separated values to try.")
+              ),
+              column(3,
+                h6("Neg Growth Tolerance (ha)"),
+                textInput("search_neg_tol", NULL, value = "0.5, 1.0, 2.0"),
+                p(class = "text-muted small", "Comma-separated values to try.")
+              ),
+              column(3,
+                h6("Failure:Success Ratio"),
+                textInput("search_fail_ratio", NULL, value = "2, 3, 5"),
+                p(class = "text-muted small", "Comma-separated values to try.")
+              )
+            ),
+            fluidRow(
+              column(3,
+                numericInput("search_max_samples", "Max Cells Per Pair",
+                             value = 25000, min = 1000, step = 1000)
+              ),
+              column(3,
+                numericInput("search_w_auc", "AUC Weight",
+                             value = 0.6, min = 0, max = 1, step = 0.1)
+              ),
+              column(3,
+                numericInput("search_w_r2", "R\u00b2 Weight",
+                             value = 0.4, min = 0, max = 1, step = 0.1)
+              ),
+              column(3,
+                div(style = "padding-top: 25px;",
+                    uiOutput("search_grid_size_ui"))
+              )
+            ),
+            hr(),
+            fluidRow(
+              column(4,
+                actionButton("run_threshold_search", "Run Threshold Search",
+                             class = "btn-success w-100", icon = icon("magnifying-glass"))
+              ),
+              column(4,
+                uiOutput("apply_best_ui")
+              ),
+              column(4,
+                uiOutput("threshold_search_status_ui")
+              )
+            ),
+            br(),
+            DTOutput("threshold_search_table"),
+            br(),
+            plotOutput("threshold_search_plot", height = "320px")
+          ),
+
           nav_panel("Score Candidates",
             br(),
             p(class = "text-muted",
@@ -869,6 +966,529 @@ ui <- page_navbar(
         )
       )
     )
+  ),
+
+  # ---------------------------------------------------------------------------
+  # Tab 4: Mortality Calibration
+  # ---------------------------------------------------------------------------
+  nav_panel(
+    title = "Mortality Calibration",
+    icon  = icon("tree"),
+
+    layout_columns(
+      col_widths = c(3, 9),
+
+      # -- Left: inputs ---------------------------------------------------------
+      card(
+        card_header("Mortality Inputs"),
+
+        # ---- A: Clay ----------------------------------------------------------
+        h6("Clay Raster (SOLUS100 + SoilGrids)"),
+        p(class = "text-muted small",
+          "Uses the same clay data downloaded for landscape creation, processed ",
+          "internally from raw tiles. SOLUS100 is primary; SoilGrids fills NA ",
+          "gaps (native reservations, treeline). Cropped to the full calibration ",
+          "region (not just the LANDIS template)."),
+        textInput("solus_clay_dir", "SOLUS100 clay directory",
+                  placeholder = "Spatial/Soil/NRCS/clay/"),
+        textInput("sg_clay_dir",    "SoilGrids clay directory",
+                  placeholder = "Spatial/Soil/soilgrids/clay/"),
+        actionButton("process_clay", "Process Clay Raster",
+                     class = "btn-sm btn-secondary w-100"),
+        uiOutput("clay_status_ui"),
+
+        hr(),
+
+        # ---- A: MTBS dNBR -----------------------------------------------------
+        h6("MTBS dNBR Rasters"),
+        p(class = "text-muted small",
+          "Per-fire dNBR GeoTIFFs from MTBS. Files must match ",
+          tags$code("*_dnbr.tif"), " (6-class ", tags$code("*_dnbr6.tif"),
+          " files are excluded automatically)."),
+        radioButtons("mtbs_source", NULL,
+                     choices  = c("Download automatically (recommended)" = "auto",
+                                  "Point to local directory of dNBR TIFs" = "local"),
+                     selected = "auto"),
+
+        # -- Auto download panel -----------------------------------------------
+        conditionalPanel(
+          condition = "input.mtbs_source == 'auto'",
+          textInput("mtbs_out_dir",
+                    "Output directory for annual severity rasters",
+                    placeholder = "/path/to/mtbs_severity/"),
+          helpText(
+            "Queries the IIPP ArcGIS ImageServer ",
+            tags$a("(USFS_EDW_MTBS_CONUS)",
+                   href = "https://imagery.geoplatform.gov/iipp/rest/services/Fire_Aviation/USFS_EDW_MTBS_CONUS/ImageServer",
+                   target = "_blank"),
+            " and exports one GeoTIFF per calibration year, clipped to your ",
+            "calibration boundary. The 6-class thematic severity (1\u20136) is ",
+            "reclassified to approximate dNBR midpoints (Low=185, Moderate=355, ",
+            "High=600) for use in the mortality GLM. Files already present are reused."
+          ),
+          actionButton("download_mtbs", "Fetch MTBS from ImageServer",
+                       class = "btn-sm btn-secondary w-100"),
+          uiOutput("mtbs_download_status_ui")
+        ),
+
+        # -- Local directory panel ---------------------------------------------
+        conditionalPanel(
+          condition = "input.mtbs_source == 'local'",
+          helpText(
+            "Download fires manually from ",
+            tags$a("burnseverity.cr.usgs.gov/direct-download",
+                   href = "https://burnseverity.cr.usgs.gov/direct-download",
+                   target = "_blank"),
+            ", then point to the folder containing the extracted *_dnbr.tif files."
+          ),
+          textInput("mtbs_dnbr_dir", label = NULL,
+                    placeholder = "/path/to/mtbs_dnbr_tifs/")
+        ),
+
+        numericInput("mtbs_sample_frac", "Pixel Sample Fraction",
+                     value = 0.05, min = 0.01, max = 1.0, step = 0.01),
+        p(class = "text-muted small",
+          "5% = 1 in 20 pixels per fire, sufficient for GLM fitting while ",
+          "reducing memory use. Increase for larger calibration regions."),
+        actionButton("load_mtbs_dnbr", "Load MTBS dNBR Pixels",
+                     class = "btn-sm btn-secondary w-100"),
+        uiOutput("mtbs_dnbr_status_ui"),
+
+        hr(),
+
+        # ---- A: ET and CWD ----------------------------------------------------
+        h6("Potential ET & Climatic Water Deficit (TerraClimate)"),
+        p(class = "text-muted small",
+          "SCF uses ", tags$b("Potential ET (PET)"), " for SiteMortalityB2 ",
+          "(SiteVars.PotentialEvapotranspiration in FireEvent.cs), not actual ET."),
+        radioButtons("et_cwd_source", NULL,
+                     choices  = c("Fetch from TerraClimate (remote, 4km)" = "remote",
+                                  "Local annual rasters (mm/yr)"           = "local"),
+                     selected = "remote"),
+        conditionalPanel(
+          condition = "input.et_cwd_source == 'remote'",
+          textInput("tc_cache_dir",
+                    "Cache directory for TerraClimate files",
+                    placeholder = "(leave blank to use session temp dir)"),
+          helpText(
+            "Downloads TerraClimate PET (pet) and CWD (def). ",
+            "Each year-variable file is ~50\u2013100 MB. Set a permanent directory",
+            "so files are reused across sessions and not re-downloaded."
+          ),
+          actionButton("fetch_et_cwd", "Fetch TerraClimate PET & CWD",
+                       class = "btn-sm btn-secondary w-100")
+        ),
+        conditionalPanel(
+          condition = "input.et_cwd_source == 'local'",
+          textInput("et_local_path",  "Annual ET raster (mm/yr)",
+                    placeholder = "/path/to/annual_et.tif"),
+          textInput("cwd_local_path", "Annual CWD raster (mm/yr)",
+                    placeholder = "/path/to/annual_cwd.tif")
+        ),
+        uiOutput("et_cwd_status_ui"),
+
+        hr(),
+
+        # ---- A: EWS -----------------------------------------------------------
+        h6("Effective Wind Speed (EWS)"),
+        p(class = "text-muted small",
+          "Auto-computed from ERA/GRIDMET wind + terrain using Nelson (2002) ",
+          "Eq. 5. Run Spread Calibration first to load slope/aspect. If terrain ",
+          "is not available, raw wind speed is used as EWS."),
+        uiOutput("mort_ews_status_ui"),
+
+        hr(),
+
+        # ---- A: Fine fuels ----------------------------------------------------
+        h6("Fine Fuels"),
+        p(class = "text-muted small",
+          "Reuses fine fuels from the Spread Calibration tab if available. ",
+          "Otherwise LANDFIRE FBFM40 will be fetched automatically when fitting."),
+        uiOutput("mort_ff_status_ui"),
+
+        hr(),
+
+        # ---- A: Ladder fuels --------------------------------------------------
+        h6("Ladder Fuels (Canopy Base Height)"),
+        radioButtons("ladder_fuels_source", NULL,
+                     choices  = c("Fetch LANDFIRE CBH (remote)"     = "landfire",
+                                  "Local file (ladder fuel index 0-1)" = "local",
+                                  "None \u2014 placeholder (0.5)"   = "none"),
+                     selected = "landfire"),
+        conditionalPanel(
+          condition = "input.ladder_fuels_source == 'local'",
+          textInput("ladder_fuels_path", "Ladder fuel index raster",
+                    placeholder = "/path/to/ladder_fuels.tif")
+        ),
+        uiOutput("ladder_status_ui"),
+
+        hr(),
+
+        # ---- B: Cohort mortality ----------------------------------------------
+        h6("Fire Tree Mortality Database (Cohort Mortality)"),
+        p(class = "text-muted small",
+          "Cansler et al. (2020) FTM database (RDS-2020-0001-2). Available from ",
+          "the USFS Research Data Archive. Fits: ",
+          tags$b("P(mort) = logistic(B0 + B1\u00d7BarkThickness + B2\u00d7dNBR).")),
+        textInput("ftm_dir", "FTM data directory",
+                  placeholder = "/path/to/RDS-2020-0001-2/Data",
+                  value = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/FTM_Fire_mortality/RDS-2020-0001-2/Data"),
+        p(class = "text-muted small",
+          "Directory must contain: ",
+          tags$code("FTM_fires.csv"), " (fire locations), ",
+          tags$code("FTM_trees.csv"), " (tree records with ",
+          tags$code("yr1status"), ", ", tags$code("DBH_cm"), ", ",
+          tags$code("Genus_species"), "), and ",
+          tags$code("Species_BarkThickness.csv"), ". ",
+          "MTBS dNBR files must be loaded first (Step A above) — ",
+          "dNBR is extracted at each fire's location from the annual mosaics."),
+        uiOutput("ftm_status_ui"),
+
+        hr(),
+
+        # ---- C: Run buttons ---------------------------------------------------
+        actionButton("run_site_mortality", "Fit Site Mortality",
+                     class = "btn-success w-100",
+                     icon  = icon("play")),
+        br(), br(),
+        actionButton("run_cohort_mortality", "Fit Cohort Mortality",
+                     class = "btn-outline-primary w-100",
+                     icon  = icon("play")),
+        br(), br(),
+        uiOutput("mortality_run_status")
+      ),
+
+      # -- Right: outputs -------------------------------------------------------
+      card(
+        card_header("Mortality Outputs"),
+        full_screen = TRUE,
+
+        navset_tab(
+
+          # Panel 1: Coefficients -----------------------------------------------
+          nav_panel(
+            title = "Site Mortality Coefficients",
+
+            h5("Gamma GLM \u2014 Inverse Link"),
+            p(class = "text-muted small",
+              "dNBR = 1 / (B0 + B1\u00d7Clay + B2\u00d7ET + B3\u00d7EWS + ",
+              "B4\u00d7CWD + B5\u00d7FineFuels + B6\u00d7LadderFuels). ",
+              "Coefficients are in original (unscaled) predictor units."),
+            DTOutput("site_mort_coef_table"),
+            br(),
+            downloadButton("dl_site_mort_coef",
+                           "Download Site Mortality Coefficients",
+                           class = "btn-sm btn-outline-primary"),
+
+            hr(),
+
+            h5("Cohort Mortality Coefficients"),
+            p(class = "text-muted small",
+              "P(mort) = logistic(B0 + B1\u00d7BarkThickness + B2\u00d7dNBR). ",
+              "Fit from FTM tree-level survival records."),
+            DTOutput("cohort_mort_coef_table"),
+            br(),
+            downloadButton("dl_cohort_mort_coef",
+                           "Download Cohort Mortality Coefficients",
+                           class = "btn-sm btn-outline-primary")
+          ),
+
+          # Panel 2: Diagnostics ------------------------------------------------
+          nav_panel(
+            title = "Diagnostics",
+
+            h5("Site Mortality"),
+            fluidRow(
+              column(6, plotOutput("site_mort_obs_pred_plot", height = "380px")),
+              column(6, plotOutput("site_mort_coef_plot",     height = "380px"))
+            ),
+
+            hr(),
+
+            h5("Cohort Mortality \u2014 Data Quality Checks"),
+            p(class = "text-muted small",
+              "Run ", tags$strong("Fit Cohort Mortality"), " to populate these plots. ",
+              "The yr1status distribution (top-left) is the most critical: ",
+              tags$code("yr1status=2"), " (confirmed dead) trees must be present. ",
+              "Bark thickness should be ", tags$em("lower"), " in dead trees; ",
+              "mortality rate should ", tags$em("decrease"), " with thicker bark and ",
+              tags$em("increase"), " with higher severity."),
+            fluidRow(
+              column(6, plotOutput("cohort_yr1status_plot",   height = "360px")),
+              column(6, plotOutput("cohort_bt_violin_plot",   height = "360px"))
+            ),
+            fluidRow(
+              column(6, plotOutput("cohort_bt_quintile_plot", height = "360px")),
+              column(6, plotOutput("cohort_severity_plot",    height = "360px"))
+            )
+          ),
+
+          # Panel 3: Data Summary -----------------------------------------------
+          nav_panel(
+            title = "Data Summary",
+            uiOutput("mort_data_summary_ui")
+          ),
+
+          # Panel 4: Parameter Snippet ------------------------------------------
+          nav_panel(
+            title = "Parameter Snippet",
+
+            p(class = "text-muted small",
+              "Copy these values into your SCF parameter file."),
+            verbatimTextOutput("mortality_snippet"),
+            br(),
+            downloadButton("dl_mortality_snippet",
+                           "Download Parameter Snippet (.txt)",
+                           class = "btn-sm btn-outline-primary")
+          )
+        )
+      )
+    )
+  ),
+
+  # ---------------------------------------------------------------------------
+  # Tab 5: Model Validation
+  # Publication-ready figures comparing SCF simulation output against observed
+  # datasets (FPA FOD fire occurrence/size, ERA FWI climate).
+  # ---------------------------------------------------------------------------
+  nav_panel(
+    title = "Model Validation",
+    icon  = icon("chart-line"),
+
+    layout_columns(
+      col_widths = c(3, 9),
+
+      # -- Left: inputs ---------------------------------------------------------
+      card(
+        card_header("Validation Inputs"),
+
+        h6("SCF Events Log"),
+        p(class = "text-muted small",
+          "Load a ", tags$code("socialclimatefire-events-log.csv"),
+          " from your LANDIS run output directory. All fire events across ",
+          "all simulation years will be used."),
+        textInput("val_events_path", label = NULL,
+                  placeholder = "/path/to/socialclimatefire-events-log.csv"),
+        actionButton("load_val_events", "Load Events Log",
+                     class = "btn-sm btn-outline-primary w-100",
+                     icon  = icon("upload")),
+        uiOutput("val_events_status"),
+
+        hr(),
+        h6("Cell Area (ha)"),
+        p(class = "text-muted small",
+          "Used to convert ", tags$code("TotalSitesBurned"), " to hectares. ",
+          "Auto-filled from the LANDIS template raster when loaded."),
+        numericInput("val_cell_area_ha", label = NULL,
+                     value = NA, min = 0.01, step = 0.01),
+
+        hr(),
+        p(class = "text-muted small",
+          "FPA FOD and ERA FWI data from the Ignition Calibration tab are used ",
+          "automatically. Run Ignition Calibration first for the full comparison."),
+
+        hr(),
+        h6("Download All Figures"),
+        p(class = "text-muted small",
+          "Saves all validation panels as 300 dpi PNG files in a zip archive, ",
+          "suitable for use in publication methods or supplemental sections."),
+        downloadButton("dl_val_figures",
+                       "Download All Validation Figures",
+                       class = "btn-sm btn-outline-primary w-100",
+                       icon  = icon("download"))
+      ),
+
+      # -- Right: outputs -------------------------------------------------------
+      card(
+        card_header("Model Validation Figures"),
+        full_screen = TRUE,
+        navset_tab(
+
+          nav_panel("Ignitions",
+            br(),
+            p(class = "text-muted small",
+              "Annual ignition counts: expected range from ERA FWI climatology ",
+              "applied to fitted model (green box = IQR) vs each SCF simulation ",
+              "year (red points).  Both Lightning and Accidental types plus Total. ",
+              "Run Scale Adjustment in Ignition Calibration to use ",
+              "landscape-scaled coefficients."),
+            plotOutput("val_ign_plot", height = "450px"),
+            br(),
+            downloadButton("dl_val_ign", "Download PNG (300 dpi)",
+                           class = "btn-sm btn-outline-secondary")
+          ),
+
+          nav_panel("Fire Size Distribution",
+            br(),
+            p(class = "text-muted small",
+              "Empirical cumulative distribution functions (ECDF) of individual ",
+              "fire sizes.  Observed = FPA FOD fires within the calibration boundary. ",
+              "Simulated = all SCF events across all simulation years converted to ha. ",
+              "Curves that overlap indicate the model reproduces the observed fire ",
+              "size distribution."),
+            plotOutput("val_ecdf_plot", height = "450px"),
+            br(),
+            downloadButton("dl_val_ecdf", "Download PNG (300 dpi)",
+                           class = "btn-sm btn-outline-secondary")
+          ),
+
+          nav_panel("Annual Area Burned",
+            br(),
+            p(class = "text-muted small",
+              "Distribution of total area burned per year.  Observed = FPA FOD ",
+              "annual totals within the calibration boundary during the calibration ",
+              "period.  Simulated = SCF annual totals.  Both distributions should ",
+              "overlap, though the spatial extents differ if the LANDIS landscape ",
+              "is smaller than the calibration boundary."),
+            plotOutput("val_area_plot", height = "450px"),
+            br(),
+            downloadButton("dl_val_area", "Download PNG (300 dpi)",
+                           class = "btn-sm btn-outline-secondary")
+          ),
+
+          nav_panel("Fire-Climate Relationship",
+            br(),
+            p(class = "text-muted small",
+              "Median fire size per FWI bin (IQR shown as thick bar).  ",
+              tags$b("Important:"), " observed fires span the ~14 M ha calibration boundary ",
+              "while simulated fires are confined to the smaller LANDIS landscape, ",
+              "so absolute fire sizes are not directly comparable. ",
+              "When the LANDIS template is loaded, fire sizes are automatically normalised ",
+              "as ", tags$b("% of their respective landscape area"), " — this makes the ",
+              "FWI response slope directly comparable between observed and simulated. ",
+              "If both lines show a similar upward slope with FWI the climate-fire ",
+              "sensitivity is well-captured; if the simulated line is flat or inverted, ",
+              "the b1 (FWI slope) in the spread model may need adjustment."),
+            plotOutput("val_fwi_size_plot", height = "450px"),
+            br(),
+            downloadButton("dl_val_fwi_size", "Download PNG (300 dpi)",
+                           class = "btn-sm btn-outline-secondary")
+          ),
+
+          nav_panel("Annual Count vs FWI",
+            br(),
+            p(class = "text-muted small",
+              "Annual fire count vs mean summer (Jun\u2013Sep) FWI.  Shows whether ",
+              "the interannual climate\u2013fire sensitivity is preserved in the model.  ",
+              "ERA FWI years are assigned cyclically to SCF simulation years."),
+            plotOutput("val_count_fwi_plot", height = "450px"),
+            br(),
+            downloadButton("dl_val_count_fwi", "Download PNG (300 dpi)",
+                           class = "btn-sm btn-outline-secondary")
+          ),
+
+          nav_panel("Severity (dNBR)",
+            br(),
+            p(class = "text-muted small",
+              "Panel A: histogram of mean \u0394NBR per SCF fire event (simulated).  ",
+              "Panel B: histogram of MTBS per-fire mean dNBR (observed, ", tags$code("dnbr_val"), " field) — ",
+              "directly comparable to SCF\u2019s MeanDNBR output.  ",
+              "Panel C: side-by-side violin + boxplot showing the full distributions ",
+              "regardless of sample-size differences.  If medians and shapes align, ",
+              "the model is simulating realistic severity levels."),
+            fluidRow(
+              column(5,
+                h6("MTBS Observed Severity Data"),
+                p(class = "text-muted small",
+                  "Select the states that overlap your calibration boundary, ",
+                  "then click Fetch to download MTBS fire occurrence data ",
+                  "(\u223c30 MB, cached after first download).  ",
+                  "Or provide a local MTBS shapefile / GeoPackage path."),
+                selectizeInput("mtbs_states",
+                  label   = "States",
+                  choices = c("AK","AL","AR","AZ","CA","CO","FL","GA","HI","IA",
+                              "ID","IL","IN","KS","KY","LA","MA","MD","ME","MI",
+                              "MN","MO","MS","MT","NC","ND","NE","NH","NJ","NM",
+                              "NV","NY","OH","OK","OR","PA","RI","SC","SD","TN",
+                              "TX","UT","VA","VT","WA","WI","WV","WY"),
+                  selected = c("WA","OR","ID"),
+                  multiple = TRUE,
+                  options  = list(plugins = list("remove_button"), maxItems = 50)
+                ),
+                textInput("mtbs_local_path", "Local MTBS file (optional)",
+                          placeholder = "/path/to/mtbs_fod_pts_data.shp"),
+                actionButton("fetch_mtbs", "Fetch MTBS Data",
+                             class = "btn-sm btn-outline-primary w-100",
+                             icon  = icon("cloud-arrow-down")),
+                br(), br(),
+                uiOutput("mtbs_status_ui")
+              ),
+              column(7,
+                uiOutput("val_severity_height_ui")
+              )
+            ),
+            br(),
+            downloadButton("dl_val_severity", "Download PNG (300 dpi)",
+                           class = "btn-sm btn-outline-secondary")
+          ),
+
+          nav_panel("Fire Duration",
+            br(),
+            p(class = "text-muted small",
+              "Distribution of fire duration (days) from SCF events, faceted by ",
+              "ignition type.  Green line = median; orange dashed = 90th percentile. ",
+              "Fire duration is an emergent property of the spread model; ",
+              "unusually long durations may indicate spread probability coefficients ",
+              "are too high."),
+            plotOutput("val_duration_plot", height = "450px"),
+            br(),
+            downloadButton("dl_val_duration", "Download PNG (300 dpi)",
+                           class = "btn-sm btn-outline-secondary")
+          )
+        )
+      )
+    )
+  ),
+
+  # ===========================================================================
+  # Session — save / restore all calibration settings
+  # ===========================================================================
+  nav_panel(
+    title = tagList(icon("floppy-disk"), " Session"),
+    value = "session_panel",
+    icon  = icon("floppy-disk"),
+
+    layout_columns(
+      col_widths = c(4, 8),
+
+      # -- Left: controls -------------------------------------------------------
+      card(
+        card_header("Save / Restore Settings"),
+
+        h6("Save current settings"),
+        p(class = "text-muted small",
+          "Downloads a JSON file recording every path, parameter, and choice ",
+          "currently set across all tabs. Use as documentation or to restore ",
+          "a session later."),
+        downloadButton("save_state", "Download Settings (JSON)",
+                       class = "btn-primary w-100"),
+
+        hr(),
+
+        h6("Restore saved settings"),
+        p(class = "text-muted small",
+          "Upload a settings JSON file saved by this app. All text fields, ",
+          "sliders, and radio buttons will be updated to match. Computed ",
+          "results (fitted models, loaded rasters) must be re-run after restore."),
+        fileInput("load_state_file", NULL,
+                  accept = ".json",
+                  buttonLabel = "Choose JSON…",
+                  placeholder = "No file selected"),
+        actionButton("apply_state", "Apply Loaded Settings",
+                     class = "btn-success w-100",
+                     icon  = icon("rotate-right")),
+        br(), br(),
+        uiOutput("session_apply_status")
+      ),
+
+      # -- Right: preview -------------------------------------------------------
+      card(
+        card_header("Current Settings Preview"),
+        p(class = "text-muted small",
+          "All settings that will be saved. Review before downloading."),
+        DTOutput("session_preview_dt")
+      )
+    )
   )
 )
 
@@ -878,7 +1498,36 @@ ui <- page_navbar(
 # =============================================================================
 
 server <- function(input, output, session) {
-  
+
+  # Helper: map input ID to its tab name for the session preview table
+  tab_for_input <- function(id) {
+    landscape <- c("tif_path","shp_path","cal_years","era_fwi_path","era_ffmc_path",
+                   "era_dmc_path","era_dc_path")
+    ignition  <- c("fpa_gdb_path","ign_distribution","kernel_bw","kernel_maxdist",
+                   "scale_method")
+    spread    <- c("geomac_gdb_path","spread_res_m","max_samples_per_pair",
+                   "max_gap_spread_prob","max_gap_daily_area","failure_sample_ratio",
+                   "search_gap_sp","search_gap_da","search_max_samples",
+                   "search_fail_ratio","search_neg_tol","search_w_auc","search_w_r2",
+                   "neg_growth_tol","cand_b0_min","cand_b0_max","cand_b0_step",
+                   "cand_b1_min","cand_b1_max","cand_b1_step","scf_runs_root",
+                   "score_w_aab","score_w_size","val_cell_area_ha","val_events_path",
+                   "events_log_path")
+    mortality <- c("solus_clay_dir","sg_clay_dir","mtbs_source","mtbs_out_dir",
+                   "mtbs_dnbr_dir","mtbs_sample_frac","et_cwd_source","tc_cache_dir",
+                   "et_local_path","cwd_local_path","fine_fuels_source","fine_fuels_path",
+                   "ladder_fuels_source","ladder_fuels_path","ftm_dir","mtbs_local_path")
+    species   <- c("fia_local_dir","lookup_csv_path","spp_filter_mode","necn_csv_path")
+    dplyr::case_when(
+      id %in% landscape ~ "Landscape",
+      id %in% ignition  ~ "Ignition",
+      id %in% spread    ~ "Spread",
+      id %in% mortality ~ "Mortality",
+      id %in% species   ~ "Species",
+      TRUE              ~ "Other"
+    )
+  }
+
   tmap_mode("view")
 
   rv <- reactiveValues(
@@ -890,6 +1539,7 @@ server <- function(input, output, session) {
     working_crs    = NULL,   # CRS string from template_r
     template_mask  = NULL,   # binary mask on template grid
     cell_area_ha   = NULL,
+    template_res_m = NULL,   # template raster resolution in metres (for spread UI)
 
     # ERA time series (extracted over calibration boundary)
     era_fwi_daily  = NULL,
@@ -912,16 +1562,20 @@ server <- function(input, output, session) {
     park_model_data      = NULL,   # daily park counts (Option B)
     expected_ignitions   = NULL,   # tibble(year, ignition_type, expected_annual, scenario)
     # LANDIS validation
-    simulated_ignitions  = NULL,   # annual counts from SCF events log
+    simulated_ignitions  = NULL,   # annual counts from SCF events log (ignition tab)
+    simulated_events     = NULL,   # full event-level data from SCF events log (model validation tab)
+    mtbs_fires           = NULL,   # MTBS fire occurrence data for severity comparison
     startup_df      = NULL,
     ground_slope_r  = NULL,   # slope in degrees on template grid (INT2S export)
     uphill_slope_r  = NULL,   # upslope azimuth 0-359 deg on template grid (INT2S export)
 
     # Spread outputs
     pairs_clean         = NULL,
+    spread_prob_fit     = NULL,   # full fit object from fit_spread_probability()
     spread_prob_coef    = NULL,
     spread_prob_model   = NULL,
     spread_prob_samples = NULL,
+    max_area_fit        = NULL,   # full fit object from fit_max_daily_area()
     max_area_coef       = NULL,
     spread_da_model     = NULL,
     spread_da_data      = NULL,
@@ -932,12 +1586,27 @@ server <- function(input, output, session) {
     aspect_r            = NULL,
     candidate_grid      = NULL,
     scores_df           = NULL,
+    spread_per_pair_samples = NULL,   # cache from build_spread_samples() for threshold search
+    threshold_search_results = NULL,  # tibble from search_threshold_grid()
 
     # Species table outputs
     spp_lookup          = NULL,   # tibble from user lookup CSV: SpeciesName/FIA_SPCD/SCIENTIFIC_NAME
     spp_codes           = NULL,   # character vector of LANDIS species codes
     spp_table           = NULL,   # editable tibble: SpeciesCode/AgeDBH/MaxBT/Note
-    fia_trees           = NULL    # raw FIA TREE records (cached to avoid re-download)
+    fia_trees           = NULL,   # raw FIA TREE records (cached to avoid re-download)
+
+    # Mortality outputs
+    clay_cal_r          = NULL,   # clay fraction raster over cal_vect
+    mtbs_download_result = NULL,  # result list from download_mtbs_dnbr()
+    mtbs_pixels         = NULL,   # tibble of MTBS dNBR pixels
+    et_cal_r            = NULL,   # TerraClimate ET (multi-year raster)
+    cwd_cal_r           = NULL,   # TerraClimate CWD (multi-year raster)
+    ladder_fuels_r      = NULL,   # ladder fuels raster
+    mort_pixel_df       = NULL,   # pixel_df with all predictors extracted
+    site_mort_fit       = NULL,   # list from fit_site_mortality()
+    cohort_mort_fit     = NULL,   # list from fit_cohort_mortality()
+    cohort_tree_df      = NULL,   # tree_df from load_ftm_cohort_data() (for diagnostics)
+    yr1status_counts    = NULL    # raw yr1status distribution (for diagnostics)
   )
 
   # ---------------------------------------------------------------------------
@@ -1007,8 +1676,9 @@ server <- function(input, output, session) {
         rv$template_mask <- msk
 
         # Pre-fill spread rasterization cell size from template resolution
-        updateNumericInput(session, "spread_res_m",
-                           value = round(mean(res(r))))
+        tmpl_res_m <- round(mean(res(r)))
+        rv$template_res_m <- tmpl_res_m
+        updateNumericInput(session, "spread_res_m", value = tmpl_res_m)
 
         # Reproject calibration boundary to match if already loaded
         if (!is.null(rv$cal_vect)) {
@@ -1537,6 +2207,331 @@ server <- function(input, output, session) {
   })
 
   # ---------------------------------------------------------------------------
+  # Model Validation Tab
+  # ---------------------------------------------------------------------------
+
+  # Auto-fill cell area from template raster whenever it changes
+  observeEvent(rv$cell_area_ha, {
+    req(rv$cell_area_ha)
+    updateNumericInput(session, "val_cell_area_ha", value = round(rv$cell_area_ha, 4))
+  })
+
+  # Load full events log (all columns) for Model Validation tab
+  observeEvent(input$load_val_events, {
+    req(nchar(trimws(input$val_events_path)) > 0)
+
+    output$val_events_status <- renderUI(
+      tags$span(class = "text-warning small",
+                icon("spinner", class = "fa-spin"), " Loading events log...")
+    )
+
+    tryCatch({
+      cell_ha <- if (!is.na(input$val_cell_area_ha) && input$val_cell_area_ha > 0)
+        input$val_cell_area_ha
+      else if (!is.null(rv$cell_area_ha))
+        rv$cell_area_ha
+      else 1.0
+
+      ev <- load_scf_events_full(trimws(input$val_events_path),
+                                  cell_area_ha = cell_ha)
+
+      rv$simulated_events <- ev
+
+      # Also populate the ignition-tab simulated_ignitions for cross-tab use
+      if ("IgnitionType" %in% names(ev) && "SimulationYear" %in% names(ev)) {
+        rv$simulated_ignitions <- load_scf_events_log(trimws(input$val_events_path))
+      }
+
+      n_yrs   <- n_distinct(ev$SimulationYear)
+      n_fires <- nrow(ev)
+      med_ha  <- if ("fire_size_ha" %in% names(ev))
+        round(median(ev$fire_size_ha, na.rm = TRUE), 1) else NA
+
+      output$val_events_status <- renderUI(
+        tags$span(class = "text-success small",
+                  icon("check"),
+                  sprintf(
+                    " Loaded: %d events across %d simulation years | median fire = %s ha",
+                    n_fires, n_yrs,
+                    if (is.na(med_ha)) "n/a" else scales::comma(med_ha)
+                  ))
+      )
+
+      # Sync path to ignition-tab events log input for convenience
+      updateTextInput(session, "events_log_path",
+                      value = trimws(input$val_events_path))
+
+    }, error = function(e) {
+      output$val_events_status <- renderUI(
+        tags$span(class = "text-danger small",
+                  icon("xmark"), " Error: ", conditionMessage(e))
+      )
+    })
+  })
+
+  # -- Model Validation render functions --------------------------------------
+
+  # Helper to get landscape-adjusted expected ignitions (non-regional scenario)
+  .val_exp_ign <- reactive({
+    req(rv$expected_ignitions)
+    rv$expected_ignitions %>%
+      filter(!grepl("Regional", scenario)) %>%
+      select(year, ignition_type, expected_annual)
+  })
+
+  output$val_ign_plot <- renderPlot({
+    req(rv$simulated_events)
+    exp_df <- if (!is.null(rv$expected_ignitions)) .val_exp_ign() else NULL
+    plot_val_ignitions(exp_df, rv$simulated_events)
+  })
+
+  output$val_ecdf_plot <- renderPlot({
+    req(rv$simulated_events)
+    fpa_sizes <- if (!is.null(rv$ign_df)) rv$ign_df$FIRE_SIZE_HA else NULL
+    plot_val_size_ecdf(fpa_sizes, rv$simulated_events)
+  })
+
+  output$val_area_plot <- renderPlot({
+    req(rv$simulated_events)
+    plot_val_annual_area(rv$ign_df, rv$simulated_events,
+                         year_min = input$cal_years[1],
+                         year_max = input$cal_years[2])
+  })
+
+  output$val_fwi_size_plot <- renderPlot({
+    req(rv$simulated_events)
+    # Pass landscape areas so fire sizes are normalised to % of landscape —
+    # this removes the spatial scale mismatch between FPA FOD (14M ha) and LANDIS
+    cal_ha  <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$cal_area_ha  else NULL
+    tmpl_ha <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$tmpl_area_ha else NULL
+    plot_val_fire_climate(rv$ign_df, rv$simulated_events,
+                          rv$era_fwi_daily,
+                          cal_area_ha  = cal_ha,
+                          tmpl_area_ha = tmpl_ha,
+                          min_ha       = 4)
+  })
+
+  output$val_count_fwi_plot <- renderPlot({
+    req(rv$simulated_events, rv$era_fwi_daily)
+    cal_ha  <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$cal_area_ha  else NULL
+    tmpl_ha <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$tmpl_area_ha else NULL
+    plot_val_fire_count_vs_fwi(rv$ign_df, rv$simulated_events,
+                                rv$era_fwi_daily,
+                                year_min     = input$cal_years[1],
+                                year_max     = input$cal_years[2],
+                                cal_area_ha  = cal_ha,
+                                tmpl_area_ha = tmpl_ha)
+  })
+
+  # MTBS fetch observer
+  observeEvent(input$fetch_mtbs, {
+    output$mtbs_status_ui <- renderUI(
+      tags$span(class = "text-warning small",
+                icon("spinner", class = "fa-spin"),
+                " Fetching MTBS data (may take a minute)...")
+    )
+    tryCatch({
+      mtbs <- fetch_mtbs_fires(
+        year_min    = input$cal_years[1],
+        year_max    = input$cal_years[2],
+        cal_vect    = rv$cal_vect_wgs84,
+        local_path  = if (nchar(trimws(input$mtbs_local_path)) > 0)
+                        trimws(input$mtbs_local_path) else NULL,
+        cache_dir   = tempdir(),
+        progress_fn = function(msg) message(msg)
+      )
+      rv$mtbs_fires <- mtbs
+      n_fires   <- nrow(mtbs)
+      has_dnbr  <- "MeanDNBR_obs" %in% names(mtbs) &&
+                   any(is.finite(mtbs$MeanDNBR_obs) & mtbs$MeanDNBR_obs > 0)
+      med_dnbr  <- if (has_dnbr)
+        round(median(mtbs$MeanDNBR_obs[is.finite(mtbs$MeanDNBR_obs) &
+                                         mtbs$MeanDNBR_obs > 0], na.rm = TRUE)) else NA
+      output$mtbs_status_ui <- renderUI(
+        tags$span(class = "text-success small",
+                  icon("check"),
+                  sprintf(
+                    " %s MTBS fires loaded | %s",
+                    scales::comma(n_fires),
+                    if (has_dnbr)
+                      paste0("mean dNBR available for comparison (median = ", med_dnbr, ")")
+                    else
+                      "dnbr_val field not found — severity comparison unavailable"
+                  ))
+      )
+    }, error = function(e) {
+      output$mtbs_status_ui <- renderUI(
+        tags$span(class = "text-danger small",
+                  icon("xmark"), " Error: ", conditionMessage(e))
+      )
+    })
+  })
+
+  # Dynamic height: taller when MTBS data loaded (3 panels: histograms + boxplot)
+  output$val_severity_height_ui <- renderUI({
+    has_mtbs <- !is.null(rv$mtbs_fires) && "MeanDNBR_obs" %in% names(rv$mtbs_fires) &&
+                any(is.finite(rv$mtbs_fires$MeanDNBR_obs) & rv$mtbs_fires$MeanDNBR_obs > 0)
+    h <- if (has_mtbs) "800px" else "420px"
+    plotOutput("val_severity_plot", height = h)
+  })
+
+  output$val_severity_plot <- renderPlot({
+    req(rv$simulated_events)
+    plot_val_severity(rv$simulated_events, rv$mtbs_fires)
+  })
+
+  output$val_duration_plot <- renderPlot({
+    req(rv$simulated_events)
+    plot_val_duration(rv$simulated_events)
+  })
+
+  # -- Individual panel downloads (PNG 300 dpi) --------------------------------
+
+  .make_val_png_handler <- function(plot_fn, fname) {
+    downloadHandler(
+      filename = fname,
+      content  = function(f) {
+        g <- plot_fn()
+        if (is.null(g)) {
+          writeLines("No data available.", f)
+          return()
+        }
+        ggplot2::ggsave(f, g, width = 8, height = 5.5,
+                        dpi = 300, bg = "white")
+      }
+    )
+  }
+
+  output$dl_val_ign <- .make_val_png_handler(
+    function() {
+      req(rv$simulated_events)
+      exp_df <- if (!is.null(rv$expected_ignitions)) .val_exp_ign() else NULL
+      plot_val_ignitions(exp_df, rv$simulated_events)
+    },
+    "validation_ignitions.png"
+  )
+
+  output$dl_val_ecdf <- .make_val_png_handler(
+    function() {
+      req(rv$simulated_events)
+      fpa_sizes <- if (!is.null(rv$ign_df)) rv$ign_df$FIRE_SIZE_HA else NULL
+      plot_val_size_ecdf(fpa_sizes, rv$simulated_events)
+    },
+    "validation_fire_size_ecdf.png"
+  )
+
+  output$dl_val_area <- .make_val_png_handler(
+    function() {
+      req(rv$simulated_events)
+      plot_val_annual_area(rv$ign_df, rv$simulated_events,
+                           year_min = input$cal_years[1],
+                           year_max = input$cal_years[2])
+    },
+    "validation_annual_area_burned.png"
+  )
+
+  output$dl_val_fwi_size <- .make_val_png_handler(
+    function() {
+      req(rv$simulated_events)
+      cal_ha  <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$cal_area_ha  else NULL
+      tmpl_ha <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$tmpl_area_ha else NULL
+      plot_val_fire_climate(rv$ign_df, rv$simulated_events,
+                            rv$era_fwi_daily,
+                            cal_area_ha  = cal_ha,
+                            tmpl_area_ha = tmpl_ha,
+                            min_ha       = 4)
+    },
+    "validation_fire_climate_relationship.png"
+  )
+
+  output$dl_val_count_fwi <- .make_val_png_handler(
+    function() {
+      req(rv$simulated_events, rv$era_fwi_daily)
+      cal_ha  <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$cal_area_ha  else NULL
+      tmpl_ha <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$tmpl_area_ha else NULL
+      plot_val_fire_count_vs_fwi(rv$ign_df, rv$simulated_events,
+                                  rv$era_fwi_daily,
+                                  year_min     = input$cal_years[1],
+                                  year_max     = input$cal_years[2],
+                                  cal_area_ha  = cal_ha,
+                                  tmpl_area_ha = tmpl_ha)
+    },
+    "validation_fire_count_vs_fwi.png"
+  )
+
+  output$dl_val_severity <- .make_val_png_handler(
+    function() {
+      req(rv$simulated_events)
+      plot_val_severity(rv$simulated_events, rv$mtbs_fires)
+    },
+    "validation_severity_dnbr.png"
+  )
+
+  output$dl_val_duration <- .make_val_png_handler(
+    function() {
+      req(rv$simulated_events)
+      plot_val_duration(rv$simulated_events)
+    },
+    "validation_fire_duration.png"
+  )
+
+  # -- Download all figures as ZIP --------------------------------------------
+  output$dl_val_figures <- downloadHandler(
+    filename = "scf_validation_figures.zip",
+    content  = function(f) {
+      req(rv$simulated_events)
+
+      figs <- list(
+        "01_ignitions"              =
+          tryCatch(plot_val_ignitions(
+            if (!is.null(rv$expected_ignitions)) .val_exp_ign() else NULL,
+            rv$simulated_events), error = function(e) NULL),
+        "02_fire_size_ecdf"         =
+          tryCatch(plot_val_size_ecdf(
+            if (!is.null(rv$ign_df)) rv$ign_df$FIRE_SIZE_HA else NULL,
+            rv$simulated_events), error = function(e) NULL),
+        "03_annual_area_burned"     =
+          tryCatch(plot_val_annual_area(rv$ign_df, rv$simulated_events,
+                                        input$cal_years[1], input$cal_years[2]),
+                   error = function(e) NULL),
+        "04_fire_climate"           = {
+          cal_ha  <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$cal_area_ha  else NULL
+          tmpl_ha <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$tmpl_area_ha else NULL
+          tryCatch(plot_val_fire_climate(rv$ign_df, rv$simulated_events,
+                                         rv$era_fwi_daily,
+                                         cal_area_ha = cal_ha, tmpl_area_ha = tmpl_ha,
+                                         min_ha = 4),
+                   error = function(e) NULL)
+        },
+        "05_fire_count_vs_fwi"      = if (!is.null(rv$era_fwi_daily))
+          tryCatch(plot_val_fire_count_vs_fwi(rv$ign_df, rv$simulated_events,
+                                               rv$era_fwi_daily,
+                                               input$cal_years[1],
+                                               input$cal_years[2],
+                                               cal_area_ha  = if (!is.null(rv$landscape_areas))
+                                                 rv$landscape_areas$cal_area_ha  else NULL,
+                                               tmpl_area_ha = if (!is.null(rv$landscape_areas))
+                                                 rv$landscape_areas$tmpl_area_ha else NULL),
+                   error = function(e) NULL) else NULL,
+        "06_severity_dnbr"          =
+          tryCatch(plot_val_severity(rv$simulated_events, rv$mtbs_fires),
+                   error = function(e) NULL),
+        "07_fire_duration"          =
+          tryCatch(plot_val_duration(rv$simulated_events),  error = function(e) NULL)
+      )
+
+      paths <- save_validation_figures(figs, width_in = 8, height_in = 5.5, dpi = 300)
+
+      if (length(paths) == 0) {
+        writeLines("No figures were generated.", f)
+        return()
+      }
+
+      zip(f, files = unlist(paths), flags = "-j")
+    }
+  )
+
+  # ---------------------------------------------------------------------------
   # ERA Startup Codes
   # ---------------------------------------------------------------------------
 
@@ -1635,21 +2630,23 @@ server <- function(input, output, session) {
 
       setProgress(0.2, detail = "Building perimeter pairs with effective wind...")
       climate_joined <- bind_climate_to_pairs(
-        geomac_v   = geomac_result,
-        fwi_daily  = rv$era_fwi_daily,
-        wind_daily = rv$wind_daily,
-        slope_r    = rv$slope_r,
-        aspect_r   = rv$aspect_r,
-        max_gap_sp = input$max_gap_spread_prob,
-        max_gap_da = input$max_gap_daily_area,
-        neg_tol_ha = input$neg_growth_tol
+        geomac_v            = geomac_result,
+        fwi_daily           = rv$era_fwi_daily,
+        wind_daily          = rv$wind_daily,
+        slope_r             = rv$slope_r,
+        aspect_r            = rv$aspect_r,
+        max_gap_sp          = input$max_gap_spread_prob,
+        max_gap_da          = input$max_gap_daily_area,
+        neg_tol_ha          = input$neg_growth_tol,
+        combustion_buoyancy = as.numeric(input$combustion_buoyancy)
       )
       rv$pairs_clean <- climate_joined$pairs
 
       setProgress(0.5, detail = "Fitting max daily area model...")
       da_fit             <- fit_max_daily_area(climate_joined$pairs)
-      rv$max_area_coef   <- da_fit$coef
-      rv$spread_da_model <- da_fit$model
+      rv$max_area_fit    <- da_fit            # full fit object (coef + 3 models + data)
+      rv$max_area_coef   <- da_fit$coef       # tibble (shown in DT)
+      rv$spread_da_model <- da_fit$model_q75  # recommended 75th-pct model
       rv$spread_da_data  <- da_fit$data
 
       # Build a spread rasterization grid from the calibration boundary at the
@@ -1717,6 +2714,7 @@ server <- function(input, output, session) {
         progress_fn   = function(i, n) setProgress(
           0.6 + 0.35 * (i / n), detail = sprintf("Pair %d of %d...", i, n))
       )
+      rv$spread_prob_fit     <- sp_fit           # full fit object (coef + model + samples + wind_predictor)
       rv$spread_prob_coef    <- sp_fit$coef
       rv$spread_prob_model   <- sp_fit$model
       rv$spread_prob_samples <- sp_fit$samples
@@ -1728,6 +2726,39 @@ server <- function(input, output, session) {
                           nrow(climate_joined$pairs)))
       )
     })
+  })
+
+  # Hint badge below the cell-size input showing the detected template resolution
+  output$spread_res_hint_ui <- renderUI({
+    res_m   <- rv$template_res_m
+    cur_val <- input$spread_res_m
+    if (is.null(res_m)) {
+      tags$p(class = "text-muted small mb-1",
+             icon("circle-info"), " Load a LANDIS template raster to auto-fill cell size.")
+    } else if (!is.null(cur_val) && isTRUE(abs(cur_val - res_m) < 0.5)) {
+      tags$p(class = "text-success small mb-1",
+             icon("check"),
+             sprintf(" Using LANDIS template resolution: %d m \u00d7 %d m", res_m, res_m))
+    } else {
+      tags$p(class = "text-warning small mb-1",
+             icon("triangle-exclamation"),
+             sprintf(" Template resolution is %d m — current value differs.", res_m))
+    }
+  })
+
+  # Reset button that restores the template resolution
+  output$spread_res_reset_ui <- renderUI({
+    req(rv$template_res_m)
+    cur_val <- isolate(input$spread_res_m)
+    if (!is.null(cur_val) && isTRUE(abs(cur_val - rv$template_res_m) < 0.5))
+      return(NULL)   # already at template res — no button needed
+    actionLink("reset_spread_res", label = tagList(icon("rotate-left"), " Reset"),
+               class = "small text-secondary")
+  })
+
+  observeEvent(input$reset_spread_res, {
+    req(rv$template_res_m)
+    updateNumericInput(session, "spread_res_m", value = rv$template_res_m)
   })
 
   output$spread_prob_coef_table <- renderDT({
@@ -1935,11 +2966,13 @@ server <- function(input, output, session) {
     req(rv$spread_prob_model, rv$spread_prob_samples)
     samp    <- rv$spread_prob_samples
     m       <- rv$spread_prob_model
+    # samples tibble always uses 'EffectiveWind' column (set by fit_spread_probability)
+    ews_mean <- mean(samp$EffectiveWind, na.rm = TRUE)
     fwi_seq <- seq(0, max(samp$FWI, na.rm = TRUE) * 1.05, length.out = 200)
     nd <- data.frame(
       FWI           = fwi_seq,
-      WindSpeed_kmh = mean(samp$WindSpeed_kmh, na.rm = TRUE),
-      FineFuels     = mean(samp$FineFuels,     na.rm = TRUE)
+      EffectiveWind = ews_mean,
+      FineFuels     = mean(samp$FineFuels, na.rm = TRUE)
     )
     pr  <- predict(m, nd, type = "response", se.fit = TRUE)
     nd$fit   <- pr$fit
@@ -1954,9 +2987,8 @@ server <- function(input, output, session) {
       scale_y_continuous(limits = c(0, 1),
                          labels = scales::percent_format(accuracy = 1)) +
       labs(x = "FWI", y = "P(spread to neighbor cell)",
-           subtitle = sprintf("At mean wind %.1f km/h, mean fine fuels %.2f",
-                              mean(samp$WindSpeed_kmh, na.rm = TRUE),
-                              mean(samp$FineFuels,     na.rm = TRUE))) +
+           subtitle = sprintf("At mean effective wind %.1f km/h, mean fine fuels %.2f",
+                              ews_mean, mean(samp$FineFuels, na.rm = TRUE))) +
       theme_bw(base_size = 11)
   })
 
@@ -1964,25 +2996,26 @@ server <- function(input, output, session) {
     req(rv$spread_prob_model, rv$spread_prob_samples)
     samp     <- rv$spread_prob_samples
     m        <- rv$spread_prob_model
-    wind_seq <- seq(0, max(samp$WindSpeed_kmh, na.rm = TRUE) * 1.05, length.out = 200)
+    ews_seq  <- seq(0, max(samp$EffectiveWind, na.rm = TRUE) * 1.05, length.out = 200)
     nd <- data.frame(
       FWI           = mean(samp$FWI,       na.rm = TRUE),
-      WindSpeed_kmh = wind_seq,
+      EffectiveWind = ews_seq,
       FineFuels     = mean(samp$FineFuels, na.rm = TRUE)
     )
     pr  <- predict(m, nd, type = "response", se.fit = TRUE)
     nd$fit   <- pr$fit
     nd$lower <- pmax(0, pr$fit - 1.96 * pr$se.fit)
     nd$upper <- pmin(1, pr$fit + 1.96 * pr$se.fit)
-    ggplot(nd, aes(WindSpeed_kmh, fit)) +
+    ggplot(nd, aes(EffectiveWind, fit)) +
       geom_ribbon(aes(ymin = lower, ymax = upper),
                   alpha = 0.2, fill = "#2c5f2e") +
       geom_line(color = "#2c5f2e", linewidth = 1) +
-      geom_rug(data = samp, aes(x = WindSpeed_kmh, y = NULL),
+      geom_rug(data = samp, aes(x = EffectiveWind, y = NULL),
                sides = "b", alpha = 0.04) +
       scale_y_continuous(limits = c(0, 1),
                          labels = scales::percent_format(accuracy = 1)) +
-      labs(x = "Wind Speed (km/h)", y = "P(spread to neighbor cell)",
+      labs(x = "Effective Wind Speed — Nelson (2002) (km/h)",
+           y = "P(spread to neighbor cell)",
            subtitle = sprintf("At mean FWI %.1f, mean fine fuels %.2f",
                               mean(samp$FWI,       na.rm = TRUE),
                               mean(samp$FineFuels, na.rm = TRUE))) +
@@ -2015,16 +3048,21 @@ server <- function(input, output, session) {
   output$max_area_scatter_plot <- renderPlot({
     req(rv$spread_da_model, rv$spread_da_data)
     dat <- rv$spread_da_data
-    dat$pred_ha <- expm1(predict(rv$spread_da_model, dat))
+    # Linear model — predict is already in ha (no expm1 needed)
+    dat$pred_ha <- predict(rv$spread_da_model, dat)
     ggplot(dat, aes(daily_area_ha, pred_ha, color = FWI)) +
       geom_abline(slope = 1, intercept = 0,
                   linetype = "dashed", color = "gray60") +
       geom_point(alpha = 0.7, size = 2.5) +
       scale_color_gradient(low = "#ffffb2", high = "#d7191c", name = "FWI") +
-      scale_x_log10(labels = scales::comma) +
-      scale_y_log10(labels = scales::comma) +
-      labs(x = "Observed (ha/day)", y = "Predicted (ha/day)",
-           subtitle = "Log scale \u2014 dashed = perfect fit") +
+      scale_x_continuous(labels = scales::comma, limits = c(0, NA)) +
+      scale_y_continuous(labels = scales::comma, limits = c(0, NA)) +
+      labs(x = "Observed daily area increment (ha)",
+           y = "Predicted MaxSpreadArea (ha, 75th-pct fit)",
+           subtitle = paste0(
+             "MaxSpreadArea = B0 + B1\u00d7FWI + B2\u00d7EWS  [linear; units = ha].  ",
+             "Points above dashed line = observed fire grew faster than model ceiling."
+           )) +
       theme_bw(base_size = 11)
   })
 
@@ -2051,17 +3089,25 @@ server <- function(input, output, session) {
     b0_seq <- seq(input$cand_b0_min, input$cand_b0_max, by = input$cand_b0_step)
     b1_seq <- seq(input$cand_b1_min, input$cand_b1_max, by = input$cand_b1_step)
 
-    b3_default <- if (!is.null(rv$spread_prob_coef))
-      rv$spread_prob_coef$estimate[grepl("B3", rv$spread_prob_coef$term)][1]
-    else 0.02
+    b3_default <- if (!is.null(rv$spread_prob_coef)) {
+      idx <- grep("B3_Effective", rv$spread_prob_coef$term)[1]
+      if (!is.na(idx)) rv$spread_prob_coef$estimate[idx] else 0.02
+    } else 0.02
+
+    # Pull recommended (75th pct) MaxSpreadArea coefficients from full fit object
+    ma_q75 <- if (!is.null(rv$max_area_fit)) {
+      rv$max_area_fit$coef %>%
+        filter(fit_target == "75th percentile (recommended)") %>%
+        { setNames(.$estimate, .$term) }
+    } else setNames(c(0, 10, 5), c("B0_Intercept", "B1_FWI", "B2_EffectiveWind"))
 
     grid <- expand.grid(B0 = b0_seq, B1_FWI = b1_seq) %>%
       mutate(
         B2_FineFuels   = 0,
         B3_WindSpeed   = b3_default,
-        MaxAreaB0      = if (!is.null(rv$max_area_coef)) rv$max_area_coef$estimate[1] else 0,
-        MaxAreaB1_FWI  = if (!is.null(rv$max_area_coef)) rv$max_area_coef$estimate[2] else 10,
-        MaxAreaB2_Wind = if (!is.null(rv$max_area_coef)) rv$max_area_coef$estimate[3] else 5,
+        MaxAreaB0      = coalesce(ma_q75["B0_Intercept"],    0),
+        MaxAreaB1_FWI  = coalesce(ma_q75["B1_FWI"],         10),
+        MaxAreaB2_Wind = coalesce(ma_q75["B2_EffectiveWind"], 5),
         candidate_id   = row_number()
       )
     rv$candidate_grid <- grid
@@ -2072,6 +3118,265 @@ server <- function(input, output, session) {
         datatable(options = list(pageLength = 10, scrollX = TRUE),
                   rownames = FALSE, class = "table-sm table-striped")
     })
+  })
+
+  # ---------------------------------------------------------------------------
+  # Threshold Search: reactive grid size display
+  # ---------------------------------------------------------------------------
+  output$search_grid_size_ui <- renderUI({
+    parse_vals <- function(s) {
+      v <- suppressWarnings(as.numeric(strsplit(trimws(s), "[,\\s]+")[[1]]))
+      v[is.finite(v)]
+    }
+    n_sp  <- length(parse_vals(input$search_gap_sp))
+    n_da  <- length(parse_vals(input$search_gap_da))
+    n_tol <- length(parse_vals(input$search_neg_tol))
+    n_fr  <- length(parse_vals(input$search_fail_ratio))
+    n_total <- n_sp * n_da * n_tol * n_fr
+    div(class = "alert alert-info p-2 small",
+        icon("table"), sprintf(" %d \u00d7 %d \u00d7 %d \u00d7 %d = %d combinations",
+                               n_sp, n_da, n_tol, n_fr, n_total))
+  })
+
+  # ---------------------------------------------------------------------------
+  # Threshold Search: run search
+  # ---------------------------------------------------------------------------
+  observeEvent(input$run_threshold_search, {
+    req(rv$cal_vect_proj, rv$working_crs,
+        rv$era_fwi_daily, rv$wind_daily)
+
+    parse_vals <- function(s) {
+      v <- suppressWarnings(as.numeric(strsplit(trimws(s), "[,\\s]+")[[1]]))
+      sort(unique(v[is.finite(v)]))
+    }
+
+    gap_sp_vals     <- parse_vals(input$search_gap_sp)
+    gap_da_vals     <- parse_vals(input$search_gap_da)
+    neg_tol_vals    <- parse_vals(input$search_neg_tol)
+    fail_ratio_vals <- parse_vals(input$search_fail_ratio)
+
+    if (length(gap_sp_vals) == 0 || length(gap_da_vals) == 0 ||
+        length(neg_tol_vals) == 0 || length(fail_ratio_vals) == 0) {
+      showNotification("Please enter valid comma-separated values for all search parameters.",
+                       type = "warning")
+      return()
+    }
+
+    withProgress(message = "Threshold search...", value = 0, {
+
+      # ---- Step 1: load GeoMAC if not yet loaded --------------------------------
+      geomac_v <- rv$geomac_result
+      if (is.null(geomac_v)) {
+        req(nchar(trimws(input$geomac_gdb_path)) > 0)
+        setProgress(0.05, detail = "Loading GeoMAC perimeters...")
+        geomac_v <- tryCatch(
+          load_geomac_perimeters(
+            gdb_path    = input$geomac_gdb_path,
+            cal_vect    = rv$cal_vect_proj,
+            template_r  = rv$template_r,
+            working_crs = rv$working_crs,
+            cal_start   = as.Date(sprintf("%d-01-01", input$cal_years[1])),
+            cal_end     = as.Date(sprintf("%d-12-31", input$cal_years[2]))
+          ),
+          error = function(e) {
+            showNotification(paste("GeoMAC error:", conditionMessage(e)), type = "error")
+            NULL
+          }
+        )
+        req(geomac_v)
+        rv$geomac_result <- geomac_v
+      }
+
+      # ---- Step 2: build pairs with widest thresholds ---------------------------
+      setProgress(0.1, detail = "Building pairs with widest thresholds...")
+      wide_pairs <- tryCatch(
+        bind_climate_to_pairs(
+          geomac_v            = geomac_v,
+          fwi_daily           = rv$era_fwi_daily,
+          wind_daily          = rv$wind_daily,
+          slope_r             = rv$slope_r,
+          aspect_r            = rv$aspect_r,
+          max_gap_sp          = max(gap_sp_vals),
+          max_gap_da          = max(gap_da_vals),
+          neg_tol_ha          = max(neg_tol_vals),
+          combustion_buoyancy = as.numeric(input$combustion_buoyancy)
+        ),
+        error = function(e) {
+          showNotification(paste("Pairs error:", conditionMessage(e)), type = "error")
+          NULL
+        }
+      )
+      req(wide_pairs)
+
+      # ---- Step 3: build spread raster template + fine fuels --------------------
+      setProgress(0.15, detail = "Building raster template...")
+      spread_res_m <- max(as.numeric(input$spread_res_m), 10)
+      spread_template <- rast(ext(rv$cal_vect_proj), resolution = spread_res_m,
+                               crs = rv$working_crs)
+      spread_mask <- rasterize(rv$cal_vect_proj, spread_template, field = 1, background = NA)
+      spread_mask[!is.na(spread_mask)] <- 1
+
+      ff_r <- rv$fine_fuels_r   # reuse if already loaded in spread tab
+
+      # ---- Step 4: build samples cache (rasterize once) -------------------------
+      setProgress(0.2, detail = "Building rasterization cache (one-time expensive step)...")
+      all_spread_pairs <- wide_pairs$pairs %>%
+        filter(is.finite(EffectiveWind), is.finite(FWI),
+               gap_days <= max(gap_sp_vals), delta_ha >= -max(neg_tol_vals))
+
+      per_pair_samples <- tryCatch(
+        build_spread_samples(
+          pairs_all            = all_spread_pairs,
+          geomac_v             = geomac_v,
+          template_r           = spread_template,
+          park_mask            = spread_mask,
+          fine_fuels_r         = ff_r,
+          max_cache_fail_ratio = max(fail_ratio_vals) + 2,
+          progress_fn          = function(i, n) setProgress(
+            0.2 + 0.55 * (i / n),
+            detail = sprintf("Rasterizing pair %d of %d...", i, n))
+        ),
+        error = function(e) {
+          showNotification(paste("Sample cache error:", conditionMessage(e)), type = "error")
+          NULL
+        }
+      )
+      req(per_pair_samples)
+      rv$spread_per_pair_samples <- per_pair_samples
+
+      # ---- Step 5: run grid search ----------------------------------------------
+      n_combos <- length(gap_sp_vals) * length(gap_da_vals) *
+                  length(neg_tol_vals) * length(fail_ratio_vals)
+      setProgress(0.75, detail = sprintf("Evaluating %d threshold combinations...", n_combos))
+
+      results <- tryCatch(
+        search_threshold_grid(
+          per_pair_samples = per_pair_samples,
+          pairs_all        = wide_pairs$pairs,
+          gap_sp_vals      = gap_sp_vals,
+          gap_da_vals      = gap_da_vals,
+          neg_tol_vals     = neg_tol_vals,
+          fail_ratio_vals  = fail_ratio_vals,
+          max_samples_pair = input$search_max_samples,
+          w_auc            = input$search_w_auc,
+          w_r2             = input$search_w_r2,
+          progress_fn      = function(i, n) setProgress(
+            0.75 + 0.24 * (i / n),
+            detail = sprintf("Combination %d of %d...", i, n))
+        ),
+        error = function(e) {
+          showNotification(paste("Grid search error:", conditionMessage(e)), type = "error")
+          NULL
+        }
+      )
+      req(results)
+      rv$threshold_search_results <- results
+      setProgress(1.0)
+    })
+  })
+
+  # ---------------------------------------------------------------------------
+  # Threshold Search: status + results
+  # ---------------------------------------------------------------------------
+  output$threshold_search_status_ui <- renderUI({
+    if (is.null(rv$threshold_search_results)) return(NULL)
+    best <- rv$threshold_search_results[1, ]
+    div(class = "alert alert-success p-2 small",
+        icon("check"),
+        sprintf(" Done. Best score: %.3f (AUC=%.3f, R\u00b2=%.3f)",
+                best$score,
+                coalesce(best$auc, NA_real_),
+                coalesce(best$r2_q75, NA_real_)))
+  })
+
+  output$apply_best_ui <- renderUI({
+    req(rv$threshold_search_results)
+    actionButton("apply_best_thresholds", "Apply Best Settings to Inputs",
+                 class = "btn-outline-primary w-100",
+                 icon = icon("arrow-up-from-bracket"))
+  })
+
+  observeEvent(input$apply_best_thresholds, {
+    req(rv$threshold_search_results)
+    best <- rv$threshold_search_results[1, ]
+    updateNumericInput(session, "max_gap_spread_prob", value = best$gap_sp)
+    updateNumericInput(session, "max_gap_daily_area",  value = best$gap_da)
+    updateNumericInput(session, "neg_growth_tol",      value = best$neg_tol)
+    updateNumericInput(session, "failure_sample_ratio", value = best$fail_ratio)
+    showNotification(
+      sprintf("Applied: gap_sp=%d  gap_da=%d  neg_tol=%.1f  fail_ratio=%d",
+              best$gap_sp, best$gap_da, best$neg_tol, best$fail_ratio),
+      type = "message", duration = 5
+    )
+  })
+
+  output$threshold_search_table <- renderDT({
+    req(rv$threshold_search_results)
+    rv$threshold_search_results %>%
+      mutate(
+        auc    = round(auc,    3),
+        r2_q75 = round(r2_q75, 3),
+        score  = round(score,  3)
+      ) %>%
+      rename(
+        Rank         = rank,
+        `Gap SP`     = gap_sp,
+        `Gap DA`     = gap_da,
+        `Neg Tol`    = neg_tol,
+        `Fail Ratio` = fail_ratio,
+        `N Pairs SP` = n_pairs_sp,
+        `N Pairs DA` = n_pairs_da,
+        AUC          = auc,
+        `R2 Q75`     = r2_q75,
+        Score        = score
+      ) %>%
+      datatable(
+        options   = list(pageLength = 20, scrollX = TRUE, dom = "tip"),
+        rownames  = FALSE,
+        selection = "single"
+      ) %>%
+      formatStyle(
+        "Score",
+        background = styleColorBar(
+          rv$threshold_search_results$score, "#2c5f2e"
+        ),
+        backgroundSize     = "100% 90%",
+        backgroundRepeat   = "no-repeat",
+        backgroundPosition = "center"
+      )
+  })
+
+  output$threshold_search_plot <- renderPlot({
+    req(rv$threshold_search_results)
+    df <- rv$threshold_search_results %>%
+      filter(is.finite(auc), is.finite(r2_q75)) %>%
+      mutate(
+        best  = rank == 1,
+        label = ifelse(rank <= 5, as.character(rank), NA_character_)
+      )
+
+    if (nrow(df) == 0) return(
+      ggplot() + labs(title = "No valid results to plot.") + theme_bw()
+    )
+
+    ggplot(df, aes(x = auc, y = r2_q75,
+                   colour = score,
+                   shape  = best,
+                   size   = best)) +
+      geom_point(alpha = 0.7) +
+      geom_text(data = filter(df, !is.na(label)),
+                aes(label = label), hjust = -0.3, size = 3) +
+      scale_colour_gradient(low = "#fee0d2", high = "#2c5f2e", name = "Score") +
+      scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 18), guide = "none") +
+      scale_size_manual( values = c(`FALSE` = 2,  `TRUE` = 4.5), guide = "none") +
+      labs(
+        title    = "Threshold Search: AUC vs R\u00b2(Q75)",
+        subtitle = "Each point = one threshold combination. Diamond = rank 1 (best score). Labels = top 5.",
+        x = "Spread Probability AUC",
+        y = "Max Daily Area R\u00b2 (Q75 fit)"
+      ) +
+      theme_bw(base_size = 12) +
+      theme(legend.position = "right")
   })
 
   # ---------------------------------------------------------------------------
@@ -2288,12 +3593,19 @@ server <- function(input, output, session) {
   output$dl_snippets_zip <- downloadHandler(
     filename = "scf_param_snippets.zip",
     content  = function(f) {
-      req(rv$candidate_grid)
+      req(rv$candidate_grid, rv$spread_prob_coef, rv$max_area_fit)
       snip_dir <- file.path(tempdir(), "snippets")
       dir.create(snip_dir, showWarnings = FALSE)
+      # The calibrated spread probability coefficients are fixed; only B0 (intercept)
+      # varies across candidates.  Build per-candidate coef tables on the fly.
+      base_sp_coef <- rv$spread_prob_coef
       walk(seq_len(nrow(rv$candidate_grid)), function(i) {
-        row <- rv$candidate_grid[i, ]
-        writeLines(write_scf_snippet(row),
+        row       <- rv$candidate_grid[i, ]
+        # Override B0 with the candidate's B0 value for the snippet
+        cand_coef <- base_sp_coef %>%
+          mutate(estimate = if_else(grepl("B0_Intercept", term), row$B0, estimate))
+        txt <- write_scf_snippet(cand_coef, rv$max_area_fit)
+        writeLines(c(sprintf(">> Candidate ID: %d", row$candidate_id), txt),
                    file.path(snip_dir, sprintf("candidate_%04d.txt", row$candidate_id)))
       })
       zip(f, files = list.files(snip_dir, full.names = TRUE), flags = "-j")
@@ -2589,6 +3901,694 @@ server <- function(input, output, session) {
       write_csv(rv$spp_table, f)
     }
   )
+
+  # ===========================================================================
+  # Mortality Calibration
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Mortality: Process clay
+  # ---------------------------------------------------------------------------
+  observeEvent(input$process_clay, {
+    req(rv$cal_vect_proj, rv$working_crs)
+    req(nchar(trimws(input$solus_clay_dir)) > 0)
+    req(nchar(trimws(input$sg_clay_dir)) > 0)
+    withProgress(message = "Processing clay raster...", {
+      tryCatch({
+        rv$clay_cal_r <- process_clay_raster(
+          solus_clay_dir = trimws(input$solus_clay_dir),
+          sg_clay_dir    = trimws(input$sg_clay_dir),
+          cal_vect       = rv$cal_vect_proj,
+          working_crs    = rv$working_crs,
+          progress_fn    = function(msg) setProgress(detail = msg)
+        )
+      }, error = function(e) {
+        showNotification(paste("Clay error:", conditionMessage(e)), type = "error")
+      })
+    })
+  })
+
+  output$clay_status_ui <- renderUI({
+    if (is.null(rv$clay_cal_r)) return(NULL)
+    rng <- range(values(rv$clay_cal_r, mat = FALSE), na.rm = TRUE)
+    div(class = "alert alert-success p-2 small mt-1",
+        icon("check"),
+        sprintf(" Clay loaded: range %.3f\u2013%.3f (fraction)", rng[1], rng[2]))
+  })
+
+  # ---------------------------------------------------------------------------
+  # Mortality: Auto-download MTBS dNBR rasters
+  # ---------------------------------------------------------------------------
+  observeEvent(input$download_mtbs, {
+    req(rv$cal_vect_proj, rv$working_crs)
+    out_raw <- trimws(input$mtbs_out_dir)
+    if (nchar(out_raw) == 0) {
+      showNotification("Please set an output directory for dNBR files.", type = "warning")
+      return()
+    }
+
+    withProgress(message = "Fetching MTBS burn severity from ImageServer...", value = 0, {
+      tryCatch({
+        result <- fetch_mtbs_from_imageserver(
+          cal_vect    = rv$cal_vect_proj,
+          working_crs = rv$working_crs,
+          year_start  = input$cal_years[1],
+          year_end    = input$cal_years[2],
+          out_dir     = out_raw,
+          progress_fn = function(msg) setProgress(detail = msg)
+        )
+        rv$mtbs_download_result <- result
+
+        # Auto-populate the local dir field so Load button works immediately
+        updateTextInput(session, "mtbs_dnbr_dir", value = out_raw)
+
+        n_ok  <- result$n_ok
+        n_fail <- result$n_failed
+        if (n_fail == 0) {
+          showNotification(
+            sprintf("MTBS: %d year(s) exported successfully.", n_ok),
+            type = "message"
+          )
+        } else {
+          showNotification(
+            sprintf("MTBS: %d year(s) exported; %d failed — see status panel.", n_ok, n_fail),
+            type = "warning", duration = 10
+          )
+        }
+      }, error = function(e) {
+        showNotification(paste("MTBS download error:", conditionMessage(e)), type = "error")
+      })
+    })
+  })
+
+  output$mtbs_download_status_ui <- renderUI({
+    res <- rv$mtbs_download_result
+    if (is.null(res)) return(NULL)
+
+    n_total <- nrow(res$summary)
+    n_fire  <- sum(res$summary$status %in% c("downloaded", "cached"))
+    n_none  <- sum(res$summary$status == "no_fires")
+    n_fail  <- res$n_failed
+
+    alert_class <- if (n_fail == 0) "alert-success" else "alert-warning"
+    icon_name   <- if (n_fail == 0) "check" else "exclamation-triangle"
+
+    status_badge <- div(
+      class = paste("alert p-2 small mt-1", alert_class),
+      icon(icon_name),
+      sprintf(
+        " %d/%d years exported successfully%s.",
+        n_fire, n_total,
+        if (n_none > 0) sprintf("; %d years had no fires in this region", n_none) else ""
+      )
+    )
+
+    fail_rows <- res$summary %>% filter(status == "failed")
+    if (nrow(fail_rows) == 0) return(status_badge)
+
+    tagList(
+      status_badge,
+      p(class = "small text-muted mt-1",
+        sprintf("%d year(s) failed to export from the ImageServer:", n_fail)),
+      div(style = "max-height:150px;overflow-y:auto;font-size:0.8em;",
+          tableOutput("mtbs_failed_table"))
+    )
+  })
+
+  output$mtbs_failed_table <- renderTable({
+    res <- rv$mtbs_download_result
+    if (is.null(res)) return(NULL)
+    res$summary %>%
+      filter(status == "failed") %>%
+      select(year, objectid, status)
+  }, striped = TRUE, hover = TRUE, bordered = TRUE)
+
+  # ---------------------------------------------------------------------------
+  # Mortality: Load MTBS dNBR pixels
+  # ---------------------------------------------------------------------------
+  observeEvent(input$load_mtbs_dnbr, {
+    req(rv$cal_vect_proj, rv$working_crs)
+
+    # Resolve directory: auto mode uses the out_dir field; local uses mtbs_dnbr_dir
+    dnbr_dir <- if (isTRUE(input$mtbs_source == "auto")) {
+      trimws(input$mtbs_out_dir)
+    } else {
+      trimws(input$mtbs_dnbr_dir)
+    }
+    req(nchar(dnbr_dir) > 0)
+
+    withProgress(message = "Loading MTBS dNBR pixels...", {
+      tryCatch({
+        rv$mtbs_pixels <- load_mtbs_dnbr_pixels(
+          mtbs_dnbr_dir = dnbr_dir,
+          cal_vect      = rv$cal_vect_proj,
+          working_crs   = rv$working_crs,
+          sample_frac   = input$mtbs_sample_frac,
+          progress_fn   = function(msg) setProgress(detail = msg)
+        )
+      }, error = function(e) {
+        showNotification(paste("MTBS dNBR error:", conditionMessage(e)), type = "error", duration = NULL)
+      })
+    })
+  })
+
+  output$mtbs_dnbr_status_ui <- renderUI({
+    if (is.null(rv$mtbs_pixels)) return(NULL)
+    n_fire <- length(unique(rv$mtbs_pixels$fire_id))
+    n_pix  <- nrow(rv$mtbs_pixels)
+    div(class = "alert alert-success p-2 small mt-1",
+        icon("check"),
+        sprintf(" %d fires, %s pixels loaded", n_fire, scales::comma(n_pix)))
+  })
+
+  # ---------------------------------------------------------------------------
+  # Mortality: Fetch TerraClimate ET/CWD
+  # ---------------------------------------------------------------------------
+  observeEvent(input$fetch_et_cwd, {
+    req(rv$cal_vect_proj, rv$working_crs)
+    withProgress(message = "Fetching TerraClimate ET and CWD...", {
+      tryCatch({
+        years <- seq(input$cal_years[1], input$cal_years[2])
+
+        raw_cache <- trimws(input$tc_cache_dir)
+        cache_dir <- if (nchar(raw_cache) > 0) raw_cache else
+          file.path(tempdir(), "terraclimate_cache")
+
+        result <- fetch_terraclimate_et_cwd(
+          cal_vect    = rv$cal_vect_proj,
+          working_crs = rv$working_crs,
+          years       = years,
+          cache_dir   = cache_dir,
+          progress_fn = function(msg) setProgress(detail = msg)
+        )
+        rv$et_cal_r  <- result$et_r
+        rv$cwd_cal_r <- result$cwd_r
+      }, error = function(e) {
+        showNotification(paste("TerraClimate error:", conditionMessage(e)), type = "error")
+      })
+    })
+  })
+
+  # Local ET/CWD: load when run button fires (priority 9, between ladder=10 and fit=1)
+  observeEvent(input$run_site_mortality, {
+    req(input$et_cwd_source == "local")
+    et_path  <- trimws(input$et_local_path)
+    cwd_path <- trimws(input$cwd_local_path)
+    if (nchar(et_path) == 0 && nchar(cwd_path) == 0) return()
+    tryCatch({
+      if (nchar(et_path) > 0 && file.exists(et_path)) {
+        r <- rast(et_path)
+        rv$et_cal_r <- project(crop(r, rv$cal_vect_proj, mask = TRUE), rv$working_crs)
+        message(sprintf("Local ET loaded: %d layers", nlyr(rv$et_cal_r)))
+      }
+      if (nchar(cwd_path) > 0 && file.exists(cwd_path)) {
+        r <- rast(cwd_path)
+        rv$cwd_cal_r <- project(crop(r, rv$cal_vect_proj, mask = TRUE), rv$working_crs)
+        message(sprintf("Local CWD loaded: %d layers", nlyr(rv$cwd_cal_r)))
+      }
+    }, error = function(e) {
+      showNotification(paste("Local ET/CWD load error:", conditionMessage(e)), type = "error")
+    })
+  }, priority = 9)
+
+  output$et_cwd_status_ui <- renderUI({
+    if (is.null(rv$et_cal_r)) return(NULL)
+    n_yr <- nlyr(rv$et_cal_r)
+    div(class = "alert alert-success p-2 small mt-1",
+        icon("check"),
+        sprintf(" ET/CWD loaded: %d years", n_yr))
+  })
+
+  # EWS status (auto — uses existing wind + terrain)
+  output$mort_ews_status_ui <- renderUI({
+    has_wind    <- !is.null(rv$wind_daily) && nrow(rv$wind_daily) > 0
+    has_terrain <- !is.null(rv$slope_r)
+    if (!has_wind) {
+      return(div(class = "alert alert-warning p-2 small mt-1",
+                 icon("triangle-exclamation"),
+                 " Wind not loaded \u2014 fetch GRIDMET Wind in the sidebar."))
+    }
+    if (!has_terrain) {
+      div(class = "alert alert-info p-2 small mt-1",
+          icon("info-circle"),
+          " Wind loaded. No terrain \u2014 EWS = raw wind speed. ",
+          "Run \u2018Fetch DEM & Generate Terrain Maps\u2019 in Ignition > Landscape Maps for full EWS.")
+    } else {
+      div(class = "alert alert-success p-2 small mt-1",
+          icon("check"),
+          " Wind + terrain loaded. Full Nelson (2002) EWS will be computed.")
+    }
+  })
+
+  # Fine fuels status (reuse from spread tab)
+  output$mort_ff_status_ui <- renderUI({
+    if (!is.null(rv$fine_fuels_r)) {
+      div(class = "alert alert-success p-2 small mt-1",
+          icon("check"),
+          " Fine fuels available from Spread Calibration tab.")
+    } else {
+      div(class = "alert alert-warning p-2 small mt-1",
+          icon("triangle-exclamation"),
+          " Fine fuels not loaded. Run Spread Calibration first, ",
+          "or a placeholder (1.0) will be used.")
+    }
+  })
+
+  # ---------------------------------------------------------------------------
+  # Mortality: Fetch / load ladder fuels (runs before fitting, priority = 10)
+  # ---------------------------------------------------------------------------
+  observeEvent(input$run_site_mortality, {
+    if (input$ladder_fuels_source == "landfire" && is.null(rv$ladder_fuels_r)) {
+      req(rv$cal_vect_proj, rv$working_crs)
+      withProgress(message = "Fetching LANDFIRE CBH...", {
+        tryCatch({
+          spread_tmpl <- if (!is.null(rv$template_r)) rv$template_r else {
+            rast(ext(rv$cal_vect_proj), resolution = 90, crs = rv$working_crs)
+          }
+          rv$ladder_fuels_r <- fetch_landfire_cbh(
+            cal_vect        = rv$cal_vect_proj,
+            working_crs     = rv$working_crs,
+            spread_template = spread_tmpl,
+            progress_fn     = function(msg) setProgress(detail = msg)
+          )
+        }, error = function(e) {
+          showNotification(paste("LANDFIRE CBH error:", conditionMessage(e)), type = "warning")
+          rv$ladder_fuels_r <- NULL
+        })
+      })
+    } else if (input$ladder_fuels_source == "local" &&
+               nchar(trimws(input$ladder_fuels_path)) > 0) {
+      tryCatch({
+        r <- rast(trimws(input$ladder_fuels_path))
+        rv$ladder_fuels_r <- project(r, rv$working_crs)
+      }, error = function(e) {
+        showNotification(paste("Ladder fuels load error:", conditionMessage(e)), type = "error")
+      })
+    }
+    # "none" -> leave rv$ladder_fuels_r as NULL
+  }, priority = 10)
+
+  output$ladder_status_ui <- renderUI({
+    if (is.null(rv$ladder_fuels_r)) {
+      if (!is.null(input$ladder_fuels_source) && input$ladder_fuels_source == "none") {
+        div(class = "alert alert-info p-2 small mt-1",
+            icon("info-circle"),
+            " Using placeholder (0.5 everywhere) for ladder fuels.")
+      } else {
+        NULL
+      }
+    } else {
+      rng <- range(values(rv$ladder_fuels_r, mat = FALSE), na.rm = TRUE)
+      div(class = "alert alert-success p-2 small mt-1",
+          icon("check"),
+          sprintf(" Ladder fuels loaded: range %.3f\u2013%.3f", rng[1], rng[2]))
+    }
+  })
+
+  # ---------------------------------------------------------------------------
+  # Mortality: Fit site mortality (priority = 1, runs after ladder fetch)
+  # ---------------------------------------------------------------------------
+  observeEvent(input$run_site_mortality, {
+    req(rv$mtbs_pixels, rv$clay_cal_r)
+    withProgress(message = "Fitting site mortality model...", {
+      tryCatch({
+        setProgress(0.1, detail = "Computing annual fire-season wind...")
+        wind_tbl <- if (!is.null(rv$wind_daily) && nrow(rv$wind_daily) > 0)
+          compute_annual_fire_season_wind(rv$wind_daily)
+        else NULL
+
+        setProgress(0.3, detail = "Extracting site predictors...")
+        rv$mort_pixel_df <- extract_site_predictors(
+          pixel_df        = rv$mtbs_pixels,
+          clay_r          = rv$clay_cal_r,
+          et_r            = rv$et_cal_r,
+          cwd_r           = rv$cwd_cal_r,
+          wind_annual_tbl = wind_tbl,
+          slope_r         = rv$slope_r,
+          aspect_r        = rv$aspect_r,
+          fine_fuels_r    = rv$fine_fuels_r,
+          ladder_fuels_r  = rv$ladder_fuels_r,
+          working_crs     = rv$working_crs
+        )
+
+        setProgress(0.7, detail = "Fitting Gamma GLM (inverse link)...")
+        rv$site_mort_fit <- fit_site_mortality(rv$mort_pixel_df)
+
+        setProgress(1.0, detail = "Done.")
+      }, error = function(e) {
+        showNotification(paste("Site mortality error:", conditionMessage(e)), type = "error")
+      })
+    })
+  }, priority = 1)
+
+  output$site_mort_coef_table <- renderDT({
+    req(rv$site_mort_fit)
+    rv$site_mort_fit$coef_df %>%
+      mutate(across(where(is.numeric), ~round(., 6))) %>%
+      datatable(options = list(dom = "t", pageLength = 10), rownames = FALSE)
+  })
+
+  # FTM directory status badge
+  output$ftm_status_ui <- renderUI({
+    d <- trimws(input$ftm_dir)
+    if (nchar(d) == 0) return(NULL)
+    needed <- c("FTM_fires.csv", "FTM_trees.csv", "Species_BarkThickness.csv")
+    present <- file.exists(file.path(d, needed))
+    if (all(present)) {
+      span(class = "badge bg-success",
+           icon("check"), " All 3 FTM files found")
+    } else {
+      span(class = "badge bg-danger",
+           icon("times"),
+           paste("Missing:", paste(needed[!present], collapse = ", ")))
+    }
+  })
+
+  # ---------------------------------------------------------------------------
+  # Mortality: Fit cohort mortality from FTM database
+  # ---------------------------------------------------------------------------
+  observeEvent(input$run_cohort_mortality, {
+    req(rv$cal_vect_proj, rv$working_crs)
+
+    ftm_dir <- trimws(input$ftm_dir)
+    if (nchar(ftm_dir) == 0) {
+      showNotification("Please set the FTM data directory.", type = "warning")
+      return()
+    }
+
+    # Resolve MTBS directory (same logic as load_mtbs_dnbr observer)
+    mtbs_dir <- if (isTRUE(input$mtbs_source == "auto")) {
+      trimws(input$mtbs_out_dir)
+    } else {
+      trimws(input$mtbs_dnbr_dir)
+    }
+    if (nchar(mtbs_dir) == 0 || is.null(rv$mtbs_pixels)) {
+      showNotification(
+        "Load MTBS dNBR pixels first (Step A) before fitting cohort mortality.",
+        type = "warning", duration = 8
+      )
+      return()
+    }
+
+    withProgress(message = "Fitting cohort mortality model...", {
+      tryCatch({
+        setProgress(0.2, detail = "Loading and joining FTM data...")
+        ftm_result <- load_ftm_cohort_data(
+          ftm_dir     = ftm_dir,
+          cal_vect    = rv$cal_vect_proj,
+          working_crs = rv$working_crs,
+          mtbs_dnbr_dir = mtbs_dir,
+          progress_fn = function(msg) setProgress(detail = msg)
+        )
+
+        # Store raw diagnostic data
+        rv$yr1status_counts <- ftm_result$yr1status_counts
+        rv$cohort_tree_df   <- ftm_result$tree_df
+
+        setProgress(0.85, detail = "Fitting binomial GLM...")
+        rv$cohort_mort_fit <- fit_cohort_mortality(ftm_result$tree_df)
+
+        setProgress(1.0)
+        showNotification(
+          sprintf(
+            "Cohort mortality fitted: n=%s trees (%s dead, %s alive)",
+            scales::comma(rv$cohort_mort_fit$n),
+            scales::comma(rv$cohort_mort_fit$n_dead),
+            scales::comma(rv$cohort_mort_fit$n_alive)
+          ),
+          type = "message", duration = 8
+        )
+      }, error = function(e) {
+        # Even on fit failure, preserve diagnostic data if loading succeeded
+        showNotification(
+          paste("Cohort mortality error:", conditionMessage(e)),
+          type = "error", duration = NULL
+        )
+      })
+    })
+  })
+
+  output$cohort_mort_coef_table <- renderDT({
+    req(rv$cohort_mort_fit)
+    rv$cohort_mort_fit$coef_df %>%
+      mutate(across(where(is.numeric), ~round(., 6))) %>%
+      datatable(options = list(dom = "t", pageLength = 10), rownames = FALSE)
+  })
+
+  output$site_mort_obs_pred_plot <- renderPlot({
+    req(rv$site_mort_fit)
+    plot_site_mortality_obs_pred(rv$site_mort_fit)
+  })
+
+  output$site_mort_coef_plot <- renderPlot({
+    req(rv$site_mort_fit)
+    plot_site_mortality_coef(rv$site_mort_fit)
+  })
+
+  # ---------------------------------------------------------------------------
+  # Cohort mortality diagnostic plots
+  # ---------------------------------------------------------------------------
+  output$cohort_yr1status_plot <- renderPlot({
+    req(rv$yr1status_counts)
+    plot_yr1status_distribution(rv$yr1status_counts)
+  })
+
+  output$cohort_bt_violin_plot <- renderPlot({
+    req(rv$cohort_tree_df)
+    plot_bt_by_status(rv$cohort_tree_df)
+  })
+
+  output$cohort_bt_quintile_plot <- renderPlot({
+    req(rv$cohort_tree_df)
+    plot_mortality_by_bt_quintile(rv$cohort_tree_df)
+  })
+
+  output$cohort_severity_plot <- renderPlot({
+    req(rv$cohort_tree_df)
+    plot_mortality_by_severity(rv$cohort_tree_df)
+  })
+
+  output$mort_data_summary_ui <- renderUI({
+    lines <- character(0)
+    if (!is.null(rv$mtbs_pixels)) {
+      n_fire <- length(unique(rv$mtbs_pixels$fire_id))
+      yrs    <- range(rv$mtbs_pixels$fire_year, na.rm = TRUE)
+      lines  <- c(lines, sprintf(
+        "MTBS pixels: %s total from %d fires (%d\u2013%d)",
+        scales::comma(nrow(rv$mtbs_pixels)), n_fire, yrs[1], yrs[2]
+      ))
+    }
+    if (!is.null(rv$mort_pixel_df)) {
+      lines <- c(lines, sprintf(
+        "Pixels after predictor extraction: %s",
+        scales::comma(nrow(rv$mort_pixel_df))
+      ))
+      pred_cols <- c("Clay", "ET_mm", "CWD_mm", "EWS_kmh", "FineFuels", "LadderFuels")
+      covg <- sapply(pred_cols, function(v) {
+        if (v %in% names(rv$mort_pixel_df))
+          mean(is.finite(rv$mort_pixel_df[[v]]))
+        else 0
+      })
+      lines <- c(lines, paste(names(covg), sprintf("%.0f%%", covg * 100),
+                               sep = ": ", collapse = " | "))
+    }
+    if (length(lines) == 0)
+      return(p(class = "text-muted",
+               "Run site mortality fitting to see data summary."))
+    div(lapply(lines, function(l) p(class = "text-muted small", l)))
+  })
+
+  output$mortality_snippet <- renderText({
+    req(rv$site_mort_fit)
+    write_mortality_snippet(rv$site_mort_fit, rv$cohort_mort_fit)
+  })
+
+  # ---------------------------------------------------------------------------
+  # Mortality: Download handlers
+  # ---------------------------------------------------------------------------
+  output$dl_site_mort_coef <- downloadHandler(
+    filename = "site_mortality_coefficients.csv",
+    content  = function(f) {
+      req(rv$site_mort_fit)
+      write_csv(rv$site_mort_fit$coef_df, f)
+    }
+  )
+
+  output$dl_cohort_mort_coef <- downloadHandler(
+    filename = "cohort_mortality_coefficients.csv",
+    content  = function(f) {
+      req(rv$cohort_mort_fit)
+      write_csv(rv$cohort_mort_fit$coef_df, f)
+    }
+  )
+
+  output$dl_mortality_snippet <- downloadHandler(
+    filename = "mortality_parameters.txt",
+    content  = function(f) {
+      req(rv$site_mort_fit)
+      writeLines(write_mortality_snippet(rv$site_mort_fit, rv$cohort_mort_fit), f)
+    }
+  )
+
+  # ===========================================================================
+  # Session — save / restore calibration settings
+  # ===========================================================================
+
+  # All input IDs that represent user choices (not action buttons or file inputs)
+  # Format: inputId = "type"  where type drives the correct update function.
+  SAVEABLE_INPUTS <- c(
+    # -- Landscape / ERA ---------------------------------------------------------
+    tif_path            = "text",   cal_years         = "slider",
+    shp_path            = "text",   era_fwi_path      = "text",
+    era_ffmc_path       = "text",   era_dmc_path      = "text",
+    era_dc_path         = "text",
+    # -- Ignition ----------------------------------------------------------------
+    fpa_gdb_path        = "text",   ign_distribution  = "radio",
+    kernel_bw           = "number", kernel_maxdist    = "number",
+    scale_method        = "radio",
+    # -- Spread ------------------------------------------------------------------
+    geomac_gdb_path     = "text",   spread_res_m      = "number",
+    combustion_buoyancy = "select",
+    max_samples_per_pair= "number", max_gap_spread_prob= "number",
+    max_gap_daily_area  = "number", failure_sample_ratio = "number",
+    search_gap_sp       = "number", search_gap_da     = "number",
+    search_max_samples  = "number", search_fail_ratio = "number",
+    search_neg_tol      = "number", search_w_auc      = "number",
+    search_w_r2         = "number", neg_growth_tol    = "number",
+    cand_b0_min         = "number", cand_b0_max       = "number",
+    cand_b0_step        = "number", cand_b1_min       = "number",
+    cand_b1_max         = "number", cand_b1_step      = "number",
+    scf_runs_root       = "text",   score_w_aab       = "number",
+    score_w_size        = "number", val_cell_area_ha  = "number",
+    val_events_path     = "text",   events_log_path   = "text",
+    # -- Mortality ---------------------------------------------------------------
+    solus_clay_dir      = "text",   sg_clay_dir       = "text",
+    mtbs_source         = "radio",  mtbs_out_dir      = "text",
+    mtbs_dnbr_dir       = "text",   mtbs_sample_frac  = "number",
+    et_cwd_source       = "radio",  tc_cache_dir      = "text",
+    et_local_path       = "text",   cwd_local_path    = "text",
+    fine_fuels_source   = "radio",  fine_fuels_path   = "text",
+    ladder_fuels_source = "radio",  ladder_fuels_path = "text",
+    ftm_dir             = "text",
+    # -- FIA / species -----------------------------------------------------------
+    fia_local_dir       = "text",   lookup_csv_path   = "text",
+    spp_filter_mode     = "radio",  necn_csv_path     = "text",
+    # -- Validation --------------------------------------------------------------
+    mtbs_local_path     = "text"
+  )
+
+  # Helper: collect current input values into a named list
+  collect_state <- function() {
+    settings <- lapply(names(SAVEABLE_INPUTS), function(id) {
+      val <- input[[id]]
+      if (is.null(val)) NA else val
+    })
+    names(settings) <- names(SAVEABLE_INPUTS)
+
+    list(
+      version  = "1.0",
+      app      = "SCF Fire Calibration App",
+      saved_at = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+      settings = settings
+    )
+  }
+
+  # Save: download as JSON
+  output$save_state <- downloadHandler(
+    filename = function() {
+      paste0("scf_calibration_state_",
+             format(Sys.time(), "%Y%m%d_%H%M%S"), ".json")
+    },
+    content = function(file) {
+      state <- isolate(collect_state())
+      jsonlite::write_json(state, file, auto_unbox = TRUE, pretty = TRUE, null = "null")
+    }
+  )
+
+  # Preview table: show all saveable settings with current values
+  output$session_preview_dt <- renderDT({
+    input_vals <- lapply(names(SAVEABLE_INPUTS), function(id) {
+      val <- input[[id]]
+      if (is.null(val) || (length(val) == 1 && is.na(val))) {
+        display <- ""
+      } else if (length(val) > 1) {
+        display <- paste(val, collapse = ", ")
+      } else {
+        display <- as.character(val)
+      }
+      data.frame(
+        Tab      = tab_for_input(id),
+        Input_ID = id,
+        Type     = SAVEABLE_INPUTS[[id]],
+        Value    = display,
+        stringsAsFactors = FALSE
+      )
+    })
+    df <- do.call(rbind, input_vals)
+    datatable(df, rownames = FALSE, options = list(pageLength = 25, dom = "ftp"),
+              colnames = c("Tab", "Input ID", "Type", "Current Value")) %>%
+      formatStyle("Value", fontFamily = "monospace", fontSize = "85%")
+  })
+
+  # Load: read JSON and restore all inputs
+  observeEvent(input$apply_state, {
+    req(input$load_state_file)
+    state <- tryCatch(
+      jsonlite::read_json(input$load_state_file$datapath, simplifyVector = TRUE),
+      error = function(e) {
+        showNotification(paste("Could not parse JSON:", conditionMessage(e)),
+                         type = "error", duration = NULL)
+        NULL
+      }
+    )
+    if (is.null(state)) return()
+
+    settings <- state$settings
+    n_restored <- 0L
+
+    for (id in names(settings)) {
+      val  <- settings[[id]]
+      type <- SAVEABLE_INPUTS[id]
+      if (is.na(type)) next          # unknown input — skip
+      if (is.null(val) || (length(val) == 1 && is.na(val))) next
+
+      tryCatch({
+        if (type == "text") {
+          updateTextInput(session, id, value = as.character(val))
+        } else if (type == "number") {
+          updateNumericInput(session, id, value = as.numeric(val))
+        } else if (type == "slider" && length(val) == 2) {
+          updateSliderInput(session, id, value = as.numeric(val))
+        } else if (type == "slider") {
+          updateSliderInput(session, id, value = as.numeric(val))
+        } else if (type == "radio") {
+          updateRadioButtons(session, id, selected = as.character(val))
+        } else if (type == "select") {
+          updateSelectInput(session, id, selected = as.character(val))
+        } else if (type == "checkbox") {
+          updateCheckboxInput(session, id, value = as.logical(val))
+        } else if (type == "checkboxgroup") {
+          updateCheckboxGroupInput(session, id,
+                                   selected = as.character(unlist(val)))
+        }
+        n_restored <- n_restored + 1L
+      }, error = function(e) NULL)
+    }
+
+    output$session_apply_status <- renderUI({
+      div(class = "alert alert-success mt-2",
+          icon("check"), sprintf(" %d settings restored from '%s'",
+                                 n_restored, state$saved_at))
+    })
+    showNotification(
+      sprintf("%d settings restored (saved %s). Re-run steps to rebuild computed results.",
+              n_restored, state$saved_at),
+      type = "message", duration = 10
+    )
+  })
+
+  output$session_apply_status <- renderUI(NULL)
+
 }
 
 shinyApp(ui, server)

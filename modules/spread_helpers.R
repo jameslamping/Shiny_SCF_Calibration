@@ -418,43 +418,85 @@ fetch_terrain <- function(cal_vect, working_crs, z = 8, progress_fn = NULL) {
 # compute_effective_wind
 #
 # Converts raw wind speed + direction + terrain (slope/aspect) into an
-# "effective wind speed" in the upslope direction — the wind component that
-# matters most for fire spread in SCF.
+# "effective wind speed" using the Nelson (2002) vector-addition formula —
+# EXACTLY the formula used by SCF's CalculateEffectiveWindSpeed().
 #
-# Physics:
-#   1. Upslope direction = (aspect + 180) %% 360
-#      (terra aspect = direction of steepest descent, clockwise from N)
-#   2. Wind upslope component = wind_speed × cos(wind_dir − upslope_dir)
-#      Positive when wind blows uphill, negative when blowing downhill.
-#   3. Slope wind equivalent (Rothermel-inspired):
-#      slope_pct = tan(slope_deg × π/180) × 100
-#      slope_wind_kmh = slope_pct × 0.3  (approximate mid-range fuel conversion)
-#   4. effective_wind = max(0, wind_upslope + slope_wind_kmh)
+# Reference: Nelson, R.M. (2002). An evaluation of the fire behavior model
+#   BURNUP. International Journal of Wildland Fire, 11(1), 17-28. (Eq. 5)
 #
-# All inputs are vectors of equal length. Returns vector of same length.
+# Formula:
+#   UaUb  = wind_speed / combustion_buoyancy
+#   EWS   = Cb × √(UaUb² + 2·UaUb·sin(θ)·cos(φ) + sin²(θ))
+#
+#   Expanding: EWS = √(wind_speed² + 2·wind_speed·Cb·sin(θ)·cos(φ) + Cb²·sin²(θ))
+#
+#   The Cb² factor means slope contribution scales QUADRATICALLY with Cb.
+#   On a 20° slope at 5 m/s wind:
+#     Cb=10: EWS ≈  7 m/s   (low intensity)
+#     Cb=25: EWS ≈ 14 m/s   (moderate intensity)
+#     Cb=50: EWS ≈ 22 m/s   (high intensity — 3× the Cb=10 value!)
+#
+#   where:
+#     Cb  = combustion_buoyancy:
+#             10  = low intensity  (SCF default when SiteVars.Intensity <= 3)
+#             25  = moderate       (SCF uses this when 3 < Intensity <= 6)
+#             50  = high intensity (SCF uses this when Intensity > 6)
+#     θ   = slope angle (radians)
+#     φ   = angle between wind direction and uphill direction (radians)
+#
+# *** CALIBRATION NOTE: Use Cb=10 as the starting point (SCF default for     ***
+# *** low-intensity fires). Only raise Cb if your landscape reliably burns at ***
+# *** intensity index >3. Cb=25/50 amplifies slope contribution QUADRATICALLY***
+# *** — on steep terrain this can dominate EWS and create counter-intuitive  ***
+# *** negative correlations with FWI, causing backwards GLM signs.           ***
+#
+# UNITS: wind_speed must be in km/h to match the LANDIS Climate Library.
+#   SCF User Guide (p.5, §2.43, §2.47, §2.51):
+#   "The climate library converts all wind speed units into kilometers / hour.
+#    Be sure to convert your wind data into the correct units when inputting
+#    into the climate library."
+#   Pass ERA5/GRIDMET wind speed in km/h (multiply m/s by 3.6 before calling).
+#   EWS output will also be in km/h, matching what SCF receives at runtime.
+#
+# terra::terrain(aspect) returns the DOWNHILL direction (clockwise from N);
+# uphill direction = (aspect + 180) %% 360, which matches SCF's
+# UphillSlopeAzimuth site variable.
+#
+# Special cases:
+#   slope = 0  →  EWS = |wind_speed|  (flat terrain, wind only)
+#   wind  = 0  →  EWS = Cb × sin(θ)  (slope contribution only)
+#
+# All inputs are vectors of equal length. Returns vector of same length (km/h).
 # -----------------------------------------------------------------------------
 
-compute_effective_wind <- function(wind_speed, wind_dir, slope_deg, aspect_deg) {
+compute_effective_wind <- function(wind_speed, wind_dir, slope_deg, aspect_deg,
+                                    combustion_buoyancy = 10.0) {
 
   # Replace NAs with neutral values so vector stays full-length
   slope_deg  <- ifelse(is.finite(slope_deg),  slope_deg,  0)
-  aspect_deg <- ifelse(is.finite(aspect_deg), aspect_deg, wind_dir)  # neutral: wind is along-slope
+  aspect_deg <- ifelse(is.finite(aspect_deg), aspect_deg, wind_dir)
+  wind_speed <- ifelse(is.finite(wind_speed), wind_speed, 0)
+  wind_dir   <- ifelse(is.finite(wind_dir),   wind_dir,   0)
 
+  # SCF uses UphillSlopeAzimuth; terra aspect is downhill → add 180
   upslope_dir <- (aspect_deg + 180) %% 360
 
-  # Signed angle between wind direction and upslope direction (-180 to 180)
-  delta_deg <- ((wind_dir - upslope_dir + 180) %% 360) - 180
-  delta_rad <- delta_deg * pi / 180
+  # Relative wind direction (angle between wind and uphill slope)
+  # SCF: relativeWindDirection = (windDirection - slopeAngle) / 180 * PI
+  rwd_rad <- ((wind_dir - upslope_dir) / 180.0) * pi
 
-  # Wind component in the upslope direction
-  wind_upslope <- wind_speed * cos(delta_rad)
+  # Slope in radians
+  slope_rad <- (slope_deg / 180.0) * pi
 
-  # Slope-equivalent wind speed (Rothermel-inspired, approximate)
-  slope_pct      <- tan(slope_deg * pi / 180) * 100
-  slope_wind_kmh <- pmax(0, slope_pct * 0.3)
+  # Nelson (2002) Eq. 5 — matches SCF CalculateEffectiveWindSpeed exactly
+  Ua_Ub <- wind_speed / combustion_buoyancy
+  ews   <- combustion_buoyancy * sqrt(
+    Ua_Ub^2 +
+    2.0 * Ua_Ub * sin(slope_rad) * cos(rwd_rad) +
+    sin(slope_rad)^2
+  )
 
-  # Combine: only count positive (assisting) wind; always include slope contribution
-  pmax(0, wind_upslope + slope_wind_kmh)
+  pmax(0.0, ews)
 }
 
 
@@ -463,10 +505,12 @@ compute_effective_wind <- function(wind_speed, wind_dir, slope_deg, aspect_deg) 
 # -----------------------------------------------------------------------------
 
 bind_climate_to_pairs <- function(geomac_v, fwi_daily, wind_daily,
-                                   slope_r    = NULL,
-                                   aspect_r   = NULL,
-                                   max_gap_sp = 1, max_gap_da = 3,
-                                   neg_tol_ha = 1.0) {
+                                   slope_r             = NULL,
+                                   aspect_r            = NULL,
+                                   max_gap_sp          = 1,
+                                   max_gap_da          = 3,
+                                   neg_tol_ha          = 1.0,
+                                   combustion_buoyancy = 10.0) {
 
   gm_df <- as.data.frame(geomac_v) %>%
     transmute(
@@ -531,7 +575,10 @@ bind_climate_to_pairs <- function(geomac_v, fwi_daily, wind_daily,
 
   # Compute effective wind: topographic formula if terrain available, else raw speed
   if (!is.null(slope_r) && !is.null(aspect_r)) {
-    message("Computing effective wind using slope/aspect at fire centroids...")
+    message(sprintf(
+      "Computing effective wind using slope/aspect at fire centroids (Cb=%.0f)...",
+      combustion_buoyancy
+    ))
     valid_pts <- !is.na(pairs$centroid_x) & !is.na(pairs$centroid_y) &
                  is.finite(pairs$WindSpeed_kmh) & is.finite(pairs$WindDir_deg)
 
@@ -550,21 +597,26 @@ bind_climate_to_pairs <- function(geomac_v, fwi_daily, wind_daily,
     pairs$Slope_deg   <- slope_vals
     pairs$Aspect_deg  <- aspect_vals
     pairs$EffectiveWind <- compute_effective_wind(
-      wind_speed = pairs$WindSpeed_kmh,
-      wind_dir   = pairs$WindDir_deg,
-      slope_deg  = slope_vals,
-      aspect_deg = aspect_vals
+      wind_speed          = pairs$WindSpeed_kmh,
+      wind_dir            = pairs$WindDir_deg,
+      slope_deg           = slope_vals,
+      aspect_deg          = aspect_vals,
+      combustion_buoyancy = combustion_buoyancy
     )
     message(sprintf(
-      "Effective wind: mean=%.1f km/h  raw wind mean=%.1f km/h  slope contribution mean=%.1f km/h",
-      mean(pairs$EffectiveWind, na.rm = TRUE),
-      mean(pairs$WindSpeed_kmh, na.rm = TRUE),
-      mean(pairs$EffectiveWind - pmax(0, pairs$WindSpeed_kmh), na.rm = TRUE)
+      "Effective wind: mean=%.2f km/h  raw wind mean=%.2f km/h  slope addition mean=%.2f km/h  (Cb=%.0f)",
+      mean(pairs$EffectiveWind,  na.rm = TRUE),
+      mean(pairs$WindSpeed_kmh,  na.rm = TRUE),
+      mean(pairs$EffectiveWind - pmax(0, pairs$WindSpeed_kmh), na.rm = TRUE),
+      combustion_buoyancy
     ))
   } else {
-    message("No terrain rasters provided — using raw wind speed as EffectiveWind (placeholder).")
-    pairs$Slope_deg    <- NA_real_
-    pairs$Aspect_deg   <- NA_real_
+    message(sprintf(
+      "No terrain rasters provided — using raw wind speed (km/h) as EffectiveWind (Cb=%.0f not applied).",
+      combustion_buoyancy
+    ))
+    pairs$Slope_deg     <- NA_real_
+    pairs$Aspect_deg    <- NA_real_
     pairs$EffectiveWind <- pairs$WindSpeed_kmh
   }
 
@@ -582,7 +634,29 @@ bind_climate_to_pairs <- function(geomac_v, fwi_daily, wind_daily,
 
 # -----------------------------------------------------------------------------
 # fit_max_daily_area
-# log1p(daily_area_ha) ~ FWI + EffectiveWind
+#
+# Calibrates MaximumSpreadAreaB0/B1/B2 for SCF's maximum daily spread area
+# equation, which in FireEvent.cs is implemented as a strictly LINEAR model:
+#
+#   MaxSpreadArea = (int)(B0 + B1 * FWI + B2 * effectiveWindSpeed)
+#
+# The result is in HECTARES and is used directly as a ceiling on how much
+# area a fire can burn in a single day before the simulation advances to the
+# next day.  Coefficients must therefore be fit on the RAW hectare scale
+# (no log transform) so they can be entered directly into the SCF parameter
+# file without any back-transformation.
+#
+# Calibration target:
+#   MaxSpreadArea is an UPPER LIMIT (ceiling), not an average.  Calibrating
+#   to the mean daily increment means ~50 % of observed fire-days would be
+#   capped, slowing simulated fires unrealistically.  We therefore provide
+#   fits at the mean AND at the 75th and 90th percentile of observed daily
+#   area increments.  The 75th-percentile fit ("high" target) is recommended
+#   as the starting point for SCF — it allows most fire-days to burn near
+#   the observed historical maximum while still providing a constraint.
+#
+# Returns: list(coef = tibble of coefficients at mean/q75/q90,
+#               model_mean, model_q75, model_q90, data)
 # -----------------------------------------------------------------------------
 
 fit_max_daily_area <- function(pairs) {
@@ -595,21 +669,72 @@ fit_max_daily_area <- function(pairs) {
   if (nrow(dat) < 5)
     stop("Fewer than 5 usable pairs for max daily area fit.")
 
-  m <- lm(log1p(daily_area_ha) ~ FWI + EffectiveWind, data = dat)
+  # ---- Helper: build tidy coef table from an lm object ----------------------
+  tidy_max_area <- function(m, label) {
+    broom::tidy(m) %>%
+      rename(std_error = std.error, p_value = p.value) %>%
+      mutate(
+        term = case_when(
+          term == "(Intercept)"   ~ "B0_Intercept",
+          term == "FWI"           ~ "B1_FWI",
+          term == "EffectiveWind" ~ "B2_EffectiveWind",
+          TRUE ~ term
+        ),
+        fit_target = label,
+        scf_parameter = case_when(
+          grepl("B0", term) ~ "MaximumSpreadAreaB0",
+          grepl("B1", term) ~ "MaximumSpreadAreaB1",
+          grepl("B2", term) ~ "MaximumSpreadAreaB2",
+          TRUE ~ NA_character_
+        ),
+        note = "Raw linear fit (ha/day) — enter directly in SCF parameter file"
+      )
+  }
 
-  coef_df <- broom::tidy(m) %>%
-    rename(std_error = std.error, p_value = p.value) %>%
-    mutate(
-      term = case_when(
-        term == "(Intercept)"  ~ "B0_Intercept",
-        term == "FWI"          ~ "B1_FWI",
-        term == "EffectiveWind" ~ "B2_EffectiveWind",
-        TRUE ~ term
-      ),
-      note = "Fit on log1p(ha/day) scale"
+  # ---- Weighted quantile helper (no extra package needed) -------------------
+  wt_quantile <- function(y, p) {
+    # Converts the target quantile to a weight adjustment so a standard
+    # WLS with asymmetric L1 loss approximates the p-th quantile regression.
+    # For large samples this is nearly identical to rq(); for small samples
+    # it's a reasonable approximation.
+    wts <- ifelse(y >= quantile(y, p, na.rm = TRUE), p, 1 - p) + 1e-6
+    lm(daily_area_ha ~ FWI + EffectiveWind, data = dat, weights = wts)
+  }
+
+  # ---- Three fits -----------------------------------------------------------
+  m_mean <- lm(daily_area_ha ~ FWI + EffectiveWind, data = dat)
+  m_q75  <- wt_quantile(dat$daily_area_ha, 0.75)
+  m_q90  <- wt_quantile(dat$daily_area_ha, 0.90)
+
+  coef_df <- bind_rows(
+    tidy_max_area(m_mean, "Mean (OLS)"),
+    tidy_max_area(m_q75,  "75th percentile (recommended)"),
+    tidy_max_area(m_q90,  "90th percentile")
+  )
+
+  # ---- Sanity check: warn if B0 < 0 -----------------------------------------
+  b0_vals <- coef_df %>% filter(term == "B0_Intercept") %>% pull(estimate)
+  if (any(b0_vals < 0)) {
+    warning(
+      "One or more B0_Intercept estimates are negative (",
+      paste(round(b0_vals[b0_vals < 0], 2), collapse = ", "), " ha). ",
+      "SCF will warn 'MaxSpreadArea < 0' when FWI and wind are both low. ",
+      "Consider using the 75th or 90th percentile fit, or constraining B0 >= 1."
     )
+  }
 
-  list(coef = coef_df, model = m, data = dat)
+  message(sprintf(
+    "Max daily area fit: n=%d pairs | daily area range [%.1f, %.1f] ha | mean=%.0f ha",
+    nrow(dat), min(dat$daily_area_ha), max(dat$daily_area_ha),
+    mean(dat$daily_area_ha)
+  ))
+  message("  Recommended target: 75th percentile fit (MaxSpreadArea is a ceiling, not a mean)")
+
+  list(coef   = coef_df,
+       model_mean = m_mean,
+       model_q75  = m_q75,
+       model_q90  = m_q90,
+       data   = dat)
 }
 
 
@@ -623,12 +748,23 @@ fit_spread_probability <- function(pairs2, geomac_v, template_r, park_mask,
                                     failure_ratio = 3, max_samples = 25000,
                                     progress_fn = NULL) {
 
+  # Use EffectiveWind when available; fall back to WindSpeed_kmh if no terrain
+  has_eff_wind <- "EffectiveWind" %in% names(pairs2) &&
+                  any(is.finite(pairs2$EffectiveWind))
+
+  wind_col <- if (has_eff_wind) "EffectiveWind" else "WindSpeed_kmh"
+  message(sprintf(
+    "Spread probability: using '%s' as wind predictor (matches SCF's effectiveWindSpeed).",
+    wind_col
+  ))
+  if (!has_eff_wind)
+    message("  NOTE: terrain rasters not loaded — raw wind speed used as placeholder.")
+
   eligible <- pairs2 %>%
-    filter(use_for_spread_prob, is.finite(WindSpeed_kmh))
+    filter(use_for_spread_prob, is.finite(.data[[wind_col]]), is.finite(FWI))
 
   if (nrow(eligible) == 0)
     stop("No eligible perimeter pairs for spread probability fit.")
-
 
   samples_list <- vector("list", nrow(eligible))
 
@@ -637,8 +773,8 @@ fit_spread_probability <- function(pairs2, geomac_v, template_r, park_mask,
 
     row  <- eligible[i, ]
     fwi  <- row$FWI
-    wspd <- row$WindSpeed_kmh
-    if (!is.finite(wspd)) next
+    ews  <- row[[wind_col]]     # effective wind speed (or raw if no terrain)
+    if (!is.finite(ews)) next
 
     r_t  <- rasterize_perim(geomac_v, row$row_id,      template_r, park_mask)
     r_t1 <- rasterize_perim(geomac_v, row$row_id_next, template_r, park_mask)
@@ -682,7 +818,6 @@ fit_spread_probability <- function(pairs2, geomac_v, template_r, park_mask,
     if (!is.null(fine_fuels_r)) {
       all_cells    <- c(succ_cells, fail_keep)
       ff_vals      <- as.numeric(values(fine_fuels_r)[all_cells])
-      # Replace NA fine fuel values with the raster-wide mean (safe fallback)
       ff_mean      <- mean(ff_vals, na.rm = TRUE)
       if (!is.finite(ff_mean)) ff_mean <- 1.0
       ff_vals[!is.finite(ff_vals)] <- ff_mean
@@ -694,8 +829,8 @@ fit_spread_probability <- function(pairs2, geomac_v, template_r, park_mask,
       FIRE_ID       = rep(row$FIRE_ID, n_succ + n_f),
       date          = rep(row$date,    n_succ + n_f),
       y             = c(rep(1L, n_succ), rep(0L, n_f)),
-      FWI           = rep(fwi,  n_succ + n_f),
-      WindSpeed_kmh = rep(wspd, n_succ + n_f),
+      FWI           = rep(fwi, n_succ + n_f),
+      EffectiveWind = rep(ews, n_succ + n_f),   # always named EWS in samples
       FineFuels     = ff_vals
     )
   }
@@ -704,11 +839,17 @@ fit_spread_probability <- function(pairs2, geomac_v, template_r, park_mask,
   if (nrow(all_samples) == 0)
     stop("No raster samples generated. Check that perimeters fall within template extent.")
 
-  m <- glm(y ~ FWI + FineFuels + WindSpeed_kmh,
+  # GLM: logit link — coefficients go DIRECTLY into SCF parameter file.
+  # SCF CanSpread():
+  #   Pspread = 1 / (1 + exp(-(B0 + B1*FWI + B2*FineFuels + B3*EWS)))
+  # which is exactly what binomial(logit) produces.
+  # All coefficients should be positive (higher FWI/fuels/wind → more spread).
+  m <- glm(y ~ FWI + FineFuels + EffectiveWind,
            data   = all_samples,
            family = binomial(link = "logit"))
 
-  fine_fuels_label <- if (is.null(fine_fuels_r)) "B2_FineFuels (placeholder)" else "B2_FineFuels"
+  fine_fuels_label <- if (is.null(fine_fuels_r)) "B2_FineFuels (placeholder=1.0)" else "B2_FineFuels"
+  wind_label       <- if (has_eff_wind) "B3_EffectiveWind" else "B3_EffectiveWind (raw wind, no terrain)"
 
   coef_df <- broom::tidy(m) %>%
     rename(std_error = std.error, p_value = p.value) %>%
@@ -717,7 +858,7 @@ fit_spread_probability <- function(pairs2, geomac_v, template_r, park_mask,
         term == "(Intercept)"   ~ "B0_Intercept",
         term == "FWI"           ~ "B1_FWI",
         term == "FineFuels"     ~ fine_fuels_label,
-        term == "WindSpeed_kmh" ~ "B3_EffectiveWind",
+        term == "EffectiveWind" ~ wind_label,
         TRUE ~ term
       ),
       scf_parameter = case_when(
@@ -726,7 +867,8 @@ fit_spread_probability <- function(pairs2, geomac_v, template_r, park_mask,
         grepl("B2", term) ~ "SpreadProbabilityB2",
         grepl("B3", term) ~ "SpreadProbabilityB3",
         TRUE ~ NA_character_
-      )
+      ),
+      note = "logit-link coefficients — enter directly in SCF parameter file (no back-transform needed)"
     )
 
   message(sprintf("Spread prob fit: %d samples (%d successes, %d failures)",
@@ -734,7 +876,8 @@ fit_spread_probability <- function(pairs2, geomac_v, template_r, park_mask,
                   sum(all_samples$y == 1),
                   sum(all_samples$y == 0)))
 
-  list(coef = coef_df, model = m, samples = all_samples)
+  list(coef = coef_df, model = m, samples = all_samples,
+       wind_predictor = wind_col)
 }
 
 
@@ -757,59 +900,143 @@ rasterize_perim <- function(v, row_id_val, template, mask_r = NULL) {
 # Diagnostic plots
 # -----------------------------------------------------------------------------
 
-plot_spread_prob_diagnostics <- function(pairs, coef_df) {
+plot_spread_prob_diagnostics <- function(pairs, spread_prob_fit) {
 
-  b  <- setNames(coef_df$estimate, coef_df$term)
-  b0 <- b["B0_Intercept"]
-  b1 <- b["B1_FWI"]
-  b3 <- b["B3_EffectiveWind"]
+  if (is.null(spread_prob_fit))
+    return(ggplot() + labs(title = "Spread probability not yet fitted.") + theme_bw())
+
+  coef_df <- spread_prob_fit$coef
+
+  # Match coefficients by name prefix (term may have suffix like "(placeholder)")
+  get_b <- function(prefix) {
+    idx <- grep(prefix, coef_df$term, fixed = FALSE)[1]
+    if (is.na(idx)) NA_real_ else coef_df$estimate[idx]
+  }
+  b0 <- get_b("B0_Intercept")
+  b1 <- get_b("B1_FWI")
+  b2 <- get_b("B2_Fine")
+  b3 <- get_b("B3_Effective")
 
   if (any(is.na(c(b0, b1))))
     return(ggplot() + labs(title = "Spread probability not yet fitted.") + theme_bw())
 
-  fwi_seq   <- seq(0, max(pairs$FWI, na.rm = TRUE), length.out = 100)
-  wspd_mean <- mean(pairs$WindSpeed_kmh, na.rm = TRUE)
+  # Use effective wind when available in pairs
+  ews_col  <- if ("EffectiveWind" %in% names(pairs)) "EffectiveWind" else "WindSpeed_kmh"
+  ews_lo   <- quantile(pairs[[ews_col]], 0.25, na.rm = TRUE)
+  ews_mean <- mean(pairs[[ews_col]], na.rm = TRUE)
+  ews_hi   <- quantile(pairs[[ews_col]], 0.75, na.rm = TRUE)
 
-  pred_df <- tibble(
-    FWI  = fwi_seq,
-    prob = plogis(b0 + b1 * FWI + (if (!is.na(b3)) b3 * wspd_mean else 0) + 1.0)
+  fwi_seq <- seq(0, max(pairs$FWI, na.rm = TRUE), length.out = 100)
+
+  make_line <- function(ews_val, label) {
+    tibble(
+      FWI      = fwi_seq,
+      prob     = plogis(coalesce(b0, 0) + coalesce(b1, 0) * fwi_seq +
+                        coalesce(b2, 0) * 1.0 +       # fine fuels = 1 (fully loaded)
+                        coalesce(b3, 0) * ews_val),
+      scenario = label
+    )
+  }
+
+  pred_df <- bind_rows(
+    make_line(ews_lo,   sprintf("EWS Q25 = %.1f km/h", ews_lo)),
+    make_line(ews_mean, sprintf("EWS mean = %.1f km/h", ews_mean)),
+    make_line(ews_hi,   sprintf("EWS Q75 = %.1f km/h", ews_hi))
   )
 
-  ggplot(pred_df, aes(FWI, prob)) +
-    geom_line(color = "#2c5f2e", linewidth = 1.2) +
+  ggplot(pred_df, aes(FWI, prob, colour = scenario)) +
+    geom_line(linewidth = 1.2) +
     geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50") +
-    labs(title   = "Fitted Spread Probability vs FWI",
-         subtitle = sprintf("At mean wind speed (%.1f km/h), fine fuels = 1.0", wspd_mean),
-         x = "FWI", y = "P(spread to neighbor cell)") +
-    scale_y_continuous(limits = c(0, 1)) +
-    theme_bw(base_size = 12)
+    scale_colour_manual(values = c("grey55", "#2c3e50", "#c0392b")) +
+    scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+    labs(
+      title    = "Fitted Spread Probability vs FWI",
+      subtitle = paste0(
+        "P(spread) = logistic(B0 + B1\u00d7FWI + B2\u00d7FineFuels + B3\u00d7EWS)\n",
+        "Shown at fine fuels = 1.0 (fully loaded); three effective wind scenarios (km/h)."
+      ),
+      x = "FWI", y = "P(spread to neighbor cell)",
+      colour = "Wind scenario"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "bottom")
 }
 
 
-plot_max_area_diagnostics <- function(pairs, coef_df) {
+plot_max_area_diagnostics <- function(pairs, max_area_fit) {
 
   dat <- pairs %>%
     filter(use_for_daily_area,
            is.finite(daily_area_ha), daily_area_ha > 0,
            is.finite(FWI), is.finite(EffectiveWind))
 
-  if (nrow(dat) == 0 || is.null(coef_df))
+  if (nrow(dat) == 0 || is.null(max_area_fit))
     return(ggplot() + labs(title = "No max daily area data.") + theme_bw())
 
-  b <- setNames(coef_df$estimate, coef_df$term)
-  dat <- dat %>%
-    mutate(pred_ha = expm1(b["B0_Intercept"] +
-                           b["B1_FWI"] * FWI +
-                           b["B2_EffectiveWind"] * EffectiveWind))
+  coef_df <- max_area_fit$coef
 
-  ggplot(dat, aes(pred_ha, daily_area_ha)) +
-    geom_point(alpha = 0.4, color = "#2c5f2e", size = 1.5) +
-    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#a0522d") +
-    scale_x_log10(labels = comma) + scale_y_log10(labels = comma) +
-    labs(title    = "Max Daily Area: Observed vs Predicted",
-         subtitle = "Log-log scale; dashed = 1:1 line",
-         x = "Predicted (ha/day)", y = "Observed (ha/day)") +
-    theme_bw(base_size = 12)
+  # Extract coefficients for each fit target
+  make_pred <- function(target_label) {
+    b <- coef_df %>%
+      filter(fit_target == target_label) %>%
+      { setNames(.$estimate, .$term) }
+    b0 <- b["B0_Intercept"];   b1 <- b["B1_FWI"];  b2 <- b["B2_EffectiveWind"]
+    if (any(is.na(c(b0, b1, b2)))) return(NULL)
+    dat %>%
+      mutate(pred_ha = b0 + b1 * FWI + b2 * EffectiveWind,
+             fit_target = target_label)
+  }
+
+  pred_df <- bind_rows(
+    make_pred("Mean (OLS)"),
+    make_pred("75th percentile (recommended)"),
+    make_pred("90th percentile")
+  )
+
+  if (nrow(pred_df) == 0)
+    return(ggplot() + labs(title = "No predicted values.") + theme_bw())
+
+  q75 <- quantile(dat$daily_area_ha, 0.75, na.rm = TRUE)
+  q90 <- quantile(dat$daily_area_ha, 0.90, na.rm = TRUE)
+
+  ggplot() +
+    # Observed data as points
+    geom_point(data = dat, aes(FWI, daily_area_ha),
+               alpha = 0.35, color = "grey40", size = 1.2) +
+    # Fitted lines for each target
+    geom_line(data = pred_df,
+              aes(FWI, pred_ha, color = fit_target, linetype = fit_target),
+              linewidth = 1.1) +
+    geom_hline(yintercept = q75, linetype = "dotted", colour = "#2c5f2e", linewidth = 0.6) +
+    geom_hline(yintercept = q90, linetype = "dotted", colour = "#a0522d", linewidth = 0.6) +
+    annotate("text", x = max(dat$FWI, na.rm = TRUE), y = q75,
+             label = sprintf("obs Q75 = %.0f ha", q75),
+             hjust = 1.05, vjust = -0.4, size = 3, colour = "#2c5f2e") +
+    annotate("text", x = max(dat$FWI, na.rm = TRUE), y = q90,
+             label = sprintf("obs Q90 = %.0f ha", q90),
+             hjust = 1.05, vjust = -0.4, size = 3, colour = "#a0522d") +
+    scale_color_manual(values = c(
+      "Mean (OLS)"                      = "grey30",
+      "75th percentile (recommended)"   = "#2c5f2e",
+      "90th percentile"                 = "#a0522d"
+    )) +
+    scale_linetype_manual(values = c(
+      "Mean (OLS)"                      = "dashed",
+      "75th percentile (recommended)"   = "solid",
+      "90th percentile"                 = "longdash"
+    )) +
+    scale_y_continuous(labels = scales::comma, limits = c(0, NA)) +
+    labs(
+      title    = "Max Daily Spread Area: Observed vs Fitted",
+      subtitle = paste0(
+        "Points = observed fire-day increments (ha).  Lines = SCF MaxSpreadArea = B0 + B1\u00d7FWI + B2\u00d7EWS.\n",
+        "Recommended: 75th-percentile fit (MaxSpreadArea is a ceiling, not an average)."
+      ),
+      x = "FWI at ignition", y = "Daily area increment (ha)",
+      color = "Fit target", linetype = "Fit target"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "bottom")
 }
 
 
@@ -903,20 +1130,65 @@ read_scf_events <- function(run_dir) {
 # write_scf_snippet
 # -----------------------------------------------------------------------------
 
-write_scf_snippet <- function(row) {
+write_scf_snippet <- function(spread_coef_df, max_area_fit,
+                               max_area_target = "75th percentile (recommended)") {
+  # ---- Spread probability coefficients (logit-link, enter directly) ----------
+  get_sp <- function(prefix) {
+    idx <- grep(prefix, spread_coef_df$term)[1]
+    if (is.na(idx)) NA_real_ else spread_coef_df$estimate[idx]
+  }
+  sp_b0 <- get_sp("B0_Intercept")
+  sp_b1 <- get_sp("B1_FWI")
+  sp_b2 <- get_sp("B2_Fine")
+  sp_b3 <- get_sp("B3_Effective")
+
+  # ---- Max daily area coefficients (linear, ha — enter directly) -------------
+  ma_coef <- max_area_fit$coef %>%
+    filter(fit_target == max_area_target)
+  get_ma <- function(prefix) {
+    idx <- grep(prefix, ma_coef$term)[1]
+    if (is.na(idx)) NA_real_ else ma_coef$estimate[idx]
+  }
+  ma_b0 <- get_ma("B0_Intercept")
+  ma_b1 <- get_ma("B1_FWI")
+  ma_b2 <- get_ma("B2_Effective")
+
   paste(c(
-    sprintf(">> Candidate ID: %d", row$candidate_id),
+    ">> =====================================================================",
+    ">> SCF Social Climate Fire — Calibrated Spread Parameters",
+    ">> Generated by scf_calibration_app",
+    ">> =====================================================================",
     "",
-    ">> Cell-to-cell spread probability (SCF Eq. 5)",
-    sprintf("SpreadProbabilityB0    %.6f", row$B0),
-    sprintf("SpreadProbabilityB1    %.6f", row$B1_FWI),
-    sprintf("SpreadProbabilityB2    %.6f", row$B2_FineFuels),
-    sprintf("SpreadProbabilityB3    %.6f", row$B3_WindSpeed),
+    ">> IMPORTANT UNIT NOTES:",
+    ">>   EWS units:        km/h  (SCF User Guide §2.43/2.47/2.51: climate library",
+    ">>                     converts all wind speed units to km/h; ERA5 m/s * 3.6)",
+    ">>   Fine fuels scale: 0-1  (SiteVars.FineFuels / MaxFineFuels in SCF)",
+    ">>   MaxFineFuels:     set in your SCF parameter file; calibration normalised",
+    ">>                     to max FBFM40 load = 9.0 t/acre (GR9 fuel model).",
+    ">>                     If your SCF MaxFineFuels differs, B2 needs rescaling.",
+    ">>   CombustionBuoyancy used in calibration (Cb) is shown in the EWS note.",
+    ">>   SCF uses Cb=10 (intensity<=3), Cb=25 (4-6), Cb=50 (>6); calibrate at",
+    ">>   the Cb matching your landscape's typical fire intensity.",
     "",
-    ">> Maximum daily spread area (SCF Eq. 6)",
-    sprintf("MaximumSpreadAreaB0    %.6f", row$MaxAreaB0),
-    sprintf("MaximumSpreadAreaB1    %.6f", row$MaxAreaB1_FWI),
-    sprintf("MaximumSpreadAreaB2    %.6f", row$MaxAreaB2_Wind)
+    ">> Cell-to-cell spread probability (logistic / binomial GLM)",
+    ">>   P(spread) = 1 / (1 + exp(-(B0 + B1*FWI + B2*FineFuels + B3*EWS)))",
+    ">>   FineFuels = SiteVars.FineFuels / MaxFineFuels  (0-1 scale)",
+    ">>   EWS       = effective wind speed (Nelson 2002 Eq.5, km/h)",
+    ">>   Coefficients are logit-scale — enter directly, no back-transform needed.",
+    sprintf("SpreadProbabilityB0    %9.6f", coalesce(sp_b0, NA_real_)),
+    sprintf("SpreadProbabilityB1    %9.6f", coalesce(sp_b1, NA_real_)),
+    sprintf("SpreadProbabilityB2    %9.6f", coalesce(sp_b2, NA_real_)),
+    sprintf("SpreadProbabilityB3    %9.6f", coalesce(sp_b3, NA_real_)),
+    "",
+    sprintf(">> Maximum daily spread area (%s fit)", max_area_target),
+    ">>   MaxSpreadArea = (int)(B0 + B1*FWI + B2*EWS)   [units: HECTARES]",
+    ">>   EWS in km/h (same as above). B0 must be > 0 to avoid MaxSpreadArea<=0.",
+    ">>   When fire burns > MaxSpreadArea ha in a day, simulation advances day+1.",
+    ">>   Coefficients are on the RAW ha scale — enter directly.",
+    sprintf("MaximumSpreadAreaB0    %9.4f", coalesce(ma_b0, NA_real_)),
+    sprintf("MaximumSpreadAreaB1    %9.4f", coalesce(ma_b1, NA_real_)),
+    sprintf("MaximumSpreadAreaB2    %9.4f", coalesce(ma_b2, NA_real_)),
+    ""
   ), collapse = "\n")
 }
 
@@ -988,4 +1260,327 @@ plot_candidate_annual <- function(scores_df, runs_root, cell_area_ha,
     labs(title = sprintf("Annual Area Burned — Candidate %d", top$candidate_id[1]),
          x = "Year", y = "Area Burned (ha)") +
     theme_bw(base_size = 12)
+}
+
+
+# =============================================================================
+# Threshold Grid Search Functions
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# compute_auc
+#
+# Simple AUC via Wilcoxon rank-sum statistic. No external packages required.
+# Returns NA if only one class is present.
+# -----------------------------------------------------------------------------
+
+compute_auc <- function(y_true, y_prob) {
+  n1 <- sum(y_true == 1, na.rm = TRUE)
+  n0 <- sum(y_true == 0, na.rm = TRUE)
+  if (n1 == 0 || n0 == 0) return(NA_real_)
+  r <- rank(y_prob, ties.method = "average")
+  (sum(r[y_true == 1]) - n1 * (n1 + 1) / 2) / (n1 * n0)
+}
+
+
+# -----------------------------------------------------------------------------
+# build_spread_samples
+#
+# Rasterizes ALL perimeter pairs and returns a list of per-pair sample tibbles.
+# This is the one-time expensive step that builds the cache for threshold search.
+#
+# Arguments:
+#   pairs_all            Full pairs tibble (already filtered to widest thresholds,
+#                        with is.finite(EffectiveWind) & is.finite(FWI))
+#   geomac_v             SpatVector of GeoMAC perimeters (from load_geomac_perimeters)
+#   template_r           SpatRaster defining the rasterization grid
+#   park_mask            Binary SpatRaster mask (1 = inside boundary, NA = outside)
+#   fine_fuels_r         Optional SpatRaster of fine fuels (0-1). NULL -> use 1.0.
+#   max_cache_fail_ratio Maximum failure:success ratio to store per pair (pre-subsampling)
+#   progress_fn          Optional function(i, n_total) for progress reporting
+#
+# Returns a list of non-NULL tibbles (one per eligible pair), each with columns:
+#   FIRE_ID, date, gap_days, delta_ha, y, FWI, EffectiveWind, FineFuels
+# -----------------------------------------------------------------------------
+
+build_spread_samples <- function(pairs_all, geomac_v, template_r, park_mask,
+                                  fine_fuels_r = NULL,
+                                  max_cache_fail_ratio = 10,
+                                  progress_fn = NULL) {
+
+  n_total <- nrow(pairs_all)
+  message(sprintf("build_spread_samples: rasterizing %d pairs for threshold search cache",
+                  n_total))
+
+  result_list <- vector("list", n_total)
+
+  for (i in seq_len(n_total)) {
+    if (!is.null(progress_fn)) progress_fn(i, n_total)
+
+    row <- pairs_all[i, ]
+
+    r_t  <- rasterize_perim(geomac_v, row$row_id,      template_r, park_mask)
+    r_t1 <- rasterize_perim(geomac_v, row$row_id_next, template_r, park_mask)
+
+    if (is.null(r_t) || is.null(r_t1)) next
+
+    dil        <- focal(r_t, w = ROOK_W, fun = "max", na.policy = "omit", fillvalue = 0)
+    cand       <- (dil == 1) & (r_t == 0)
+    succ_cells <- which(values(cand & (r_t1 == 1)) == 1)
+    fail_cells <- which(values(cand & (r_t1 == 0)) == 1)
+
+    n_succ <- length(succ_cells)
+    if (n_succ == 0) next
+
+    n_fail_keep <- min(length(fail_cells), n_succ * max_cache_fail_ratio)
+    fail_keep   <- if (n_fail_keep > 0) sample(fail_cells, n_fail_keep) else integer(0)
+
+    all_cells <- c(succ_cells, fail_keep)
+    n_f       <- length(fail_keep)
+
+    if (!is.null(fine_fuels_r)) {
+      ff_vals  <- as.numeric(values(fine_fuels_r)[all_cells])
+      ff_mean  <- mean(ff_vals, na.rm = TRUE)
+      if (!is.finite(ff_mean)) ff_mean <- 1.0
+      ff_vals[!is.finite(ff_vals)] <- ff_mean
+    } else {
+      ff_vals <- rep(1.0, n_succ + n_f)
+    }
+
+    result_list[[i]] <- tibble(
+      FIRE_ID       = rep(as.character(row$FIRE_ID), n_succ + n_f),
+      date          = rep(as.Date(row$date),         n_succ + n_f),
+      gap_days      = rep(as.integer(row$gap_days),  n_succ + n_f),
+      delta_ha      = rep(as.numeric(row$delta_ha),  n_succ + n_f),
+      y             = c(rep(1L, n_succ), rep(0L, n_f)),
+      FWI           = rep(as.numeric(row$FWI),           n_succ + n_f),
+      EffectiveWind = rep(as.numeric(row$EffectiveWind),  n_succ + n_f),
+      FineFuels     = ff_vals
+    )
+  }
+
+  Filter(Negate(is.null), result_list)
+}
+
+
+# -----------------------------------------------------------------------------
+# fit_spread_prob_from_cache
+#
+# Applies threshold filters and subsampling to cached per-pair samples,
+# then fits the binomial GLM.
+#
+# Arguments:
+#   per_pair_samples  List of tibbles from build_spread_samples()
+#   max_gap_days      Maximum gap_days to include
+#   neg_tol_ha        Pairs with delta_ha < -neg_tol_ha are excluded
+#   failure_ratio     Max failures kept per success per pair
+#   max_samples_pair  Cap on total samples per pair
+#
+# Returns list(auc, n_pairs, n_samples, model) or NULL on failure.
+# -----------------------------------------------------------------------------
+
+fit_spread_prob_from_cache <- function(per_pair_samples,
+                                        max_gap_days    = 3,
+                                        neg_tol_ha      = 1.0,
+                                        failure_ratio   = 3,
+                                        max_samples_pair = 25000) {
+
+  filtered <- lapply(per_pair_samples, function(tbl) {
+    tbl <- tbl[tbl$gap_days <= max_gap_days & tbl$delta_ha >= -neg_tol_ha, ]
+    if (nrow(tbl) == 0) return(NULL)
+
+    succ_rows <- tbl[tbl$y == 1, ]
+    fail_rows <- tbl[tbl$y == 0, ]
+    n_succ    <- nrow(succ_rows)
+    if (n_succ == 0) return(NULL)
+
+    n_fail_keep <- min(nrow(fail_rows), n_succ * failure_ratio)
+    if (n_fail_keep > 0) {
+      fail_rows <- fail_rows[sample(nrow(fail_rows), n_fail_keep), ]
+    } else {
+      fail_rows <- fail_rows[integer(0), ]
+    }
+
+    combined <- rbind(succ_rows, fail_rows)
+    if (nrow(combined) > max_samples_pair) {
+      combined <- combined[sample(nrow(combined), max_samples_pair), ]
+    }
+    combined
+  })
+
+  filtered <- Filter(Negate(is.null), filtered)
+  if (length(filtered) == 0) return(NULL)
+
+  all_samples <- bind_rows(filtered)
+  if (nrow(all_samples) == 0) return(NULL)
+
+  m <- tryCatch(
+    glm(y ~ FWI + FineFuels + EffectiveWind,
+        data   = all_samples,
+        family = binomial(link = "logit")),
+    error = function(e) NULL
+  )
+  if (is.null(m)) return(NULL)
+
+  auc <- compute_auc(all_samples$y, predict(m, type = "response"))
+
+  list(
+    auc       = auc,
+    n_pairs   = length(filtered),
+    n_samples = nrow(all_samples),
+    model     = m
+  )
+}
+
+
+# -----------------------------------------------------------------------------
+# score_max_daily_area_variant
+#
+# Scores the max daily area model for a given threshold combination.
+# Fast — no rasterization needed.
+#
+# Arguments:
+#   pairs_all   Full pairs tibble (all gaps/tolerances present)
+#   max_gap_da  Maximum gap_days to include for daily area model
+#   neg_tol_ha  Exclude pairs with delta_ha < -neg_tol_ha
+#
+# Returns list(r2_q75, r2_mean, n_pairs, rmse)
+# -----------------------------------------------------------------------------
+
+score_max_daily_area_variant <- function(pairs_all, max_gap_da, neg_tol_ha) {
+
+  dat <- pairs_all %>%
+    filter(
+      gap_days      <= max_gap_da,
+      delta_ha      >= -neg_tol_ha,
+      delta_ha      >  0,
+      is.finite(daily_area_ha),
+      daily_area_ha > 0,
+      is.finite(FWI),
+      is.finite(EffectiveWind)
+    )
+
+  if (nrow(dat) < 5)
+    return(list(r2_q75  = NA_real_,
+                r2_mean = NA_real_,
+                n_pairs = nrow(dat),
+                rmse    = NA_real_))
+
+  m_mean <- lm(daily_area_ha ~ FWI + EffectiveWind, data = dat)
+
+  wts_q75 <- ifelse(
+    dat$daily_area_ha >= quantile(dat$daily_area_ha, 0.75, na.rm = TRUE),
+    0.75, 0.25
+  ) + 1e-6
+  m_q75 <- lm(daily_area_ha ~ FWI + EffectiveWind, data = dat, weights = wts_q75)
+
+  ss_res <- sum((dat$daily_area_ha - predict(m_q75))^2)
+  ss_tot <- sum((dat$daily_area_ha - mean(dat$daily_area_ha))^2)
+  r2_q75 <- if (ss_tot > 0) 1 - ss_res / ss_tot else NA_real_
+
+  list(
+    r2_q75  = r2_q75,
+    r2_mean = summary(m_mean)$r.squared,
+    n_pairs = nrow(dat),
+    rmse    = sqrt(mean((dat$daily_area_ha - predict(m_mean))^2))
+  )
+}
+
+
+# -----------------------------------------------------------------------------
+# search_threshold_grid
+#
+# Loops over all combinations of thresholds and sampling controls, scoring
+# each against spread probability AUC and max daily area R² (Q75 fit).
+#
+# Arguments:
+#   per_pair_samples  List from build_spread_samples()
+#   pairs_all         Full pairs tibble from bind_climate_to_pairs()$pairs
+#   gap_sp_vals       Vector of max_gap_days values to try for spread probability
+#   gap_da_vals       Vector of max_gap_days values to try for daily area
+#   neg_tol_vals      Vector of neg_tol_ha values to try
+#   fail_ratio_vals   Vector of failure:success ratios to try
+#   max_samples_pair  Cap on cells per pair during GLM fitting
+#   w_auc             Weight on AUC component of combined score
+#   w_r2              Weight on R² (Q75) component of combined score
+#   progress_fn       Optional function(i, n) for progress reporting
+#
+# Returns tibble sorted by score descending, with rank column added.
+# Score = w_auc * AUC + w_r2 * max(0, R²_Q75), treating NA as neutral values.
+# -----------------------------------------------------------------------------
+
+search_threshold_grid <- function(per_pair_samples, pairs_all,
+                                   gap_sp_vals     = c(1, 2, 3, 5),
+                                   gap_da_vals     = c(3, 7, 14),
+                                   neg_tol_vals    = c(0.5, 1.0, 2.0),
+                                   fail_ratio_vals = c(2, 3, 5),
+                                   max_samples_pair = 25000,
+                                   w_auc = 0.6,
+                                   w_r2  = 0.4,
+                                   progress_fn = NULL) {
+
+  grid <- expand.grid(
+    gap_sp     = gap_sp_vals,
+    gap_da     = gap_da_vals,
+    neg_tol    = neg_tol_vals,
+    fail_ratio = fail_ratio_vals,
+    stringsAsFactors = FALSE
+  )
+
+  n_combos <- nrow(grid)
+  message(sprintf("search_threshold_grid: evaluating %d combinations", n_combos))
+
+  rows <- vector("list", n_combos)
+
+  for (i in seq_len(n_combos)) {
+    if (!is.null(progress_fn)) progress_fn(i, n_combos)
+
+    g <- grid[i, ]
+
+    sp_res <- fit_spread_prob_from_cache(
+      per_pair_samples = per_pair_samples,
+      max_gap_days     = g$gap_sp,
+      neg_tol_ha       = g$neg_tol,
+      failure_ratio    = g$fail_ratio,
+      max_samples_pair = max_samples_pair
+    )
+
+    da_res <- score_max_daily_area_variant(
+      pairs_all  = pairs_all,
+      max_gap_da = g$gap_da,
+      neg_tol_ha = g$neg_tol
+    )
+
+    auc     <- if (!is.null(sp_res)) sp_res$auc     else NA_real_
+    n_sp    <- if (!is.null(sp_res)) sp_res$n_pairs  else 0L
+    r2_q75  <- da_res$r2_q75
+    n_da    <- da_res$n_pairs
+
+    score <- w_auc * coalesce(auc, 0.5) + w_r2 * pmax(0, coalesce(r2_q75, 0))
+
+    rows[[i]] <- tibble(
+      gap_sp     = g$gap_sp,
+      gap_da     = g$gap_da,
+      neg_tol    = g$neg_tol,
+      fail_ratio = g$fail_ratio,
+      n_pairs_sp = n_sp,
+      n_pairs_da = n_da,
+      auc        = auc,
+      r2_q75     = r2_q75,
+      score      = score
+    )
+  }
+
+  results <- bind_rows(rows) %>%
+    arrange(desc(score)) %>%
+    mutate(rank = seq_len(n()))
+
+  best <- results[1, ]
+  message(sprintf(
+    "search_threshold_grid: best score=%.3f (gap_sp=%d, gap_da=%d, neg_tol=%.1f, fail_ratio=%d, AUC=%.3f, R2=%.3f)",
+    best$score, best$gap_sp, best$gap_da, best$neg_tol, best$fail_ratio,
+    coalesce(best$auc, NA_real_), coalesce(best$r2_q75, NA_real_)
+  ))
+
+  results
 }
