@@ -1478,7 +1478,35 @@ ui <- page_navbar(
                      class = "btn-success w-100",
                      icon  = icon("rotate-right")),
         br(), br(),
-        uiOutput("session_apply_status")
+        uiOutput("session_apply_status"),
+
+        hr(),
+
+        h6("Save computed data cache (.RData)"),
+        p(class = "text-muted small",
+          "Saves all loaded and computed results (ERA time series, MTBS pixels, ",
+          "rasters, model fits) to an .RData file. Load it next session to skip ",
+          "expensive re-processing steps. Settings (paths, parameters) are saved ",
+          "separately in the JSON above."),
+        downloadButton("save_rdata", "Save Computed Data (.RData)",
+                       class = "btn-outline-primary w-100"),
+
+        hr(),
+
+        h6("Load computed data cache (.RData)"),
+        p(class = "text-muted small",
+          "Upload an .RData cache file saved by this app to restore all computed ",
+          "results. After loading, outputs and plots will populate immediately ",
+          "without re-running any processing steps."),
+        fileInput("load_rdata_file", NULL,
+                  accept = c(".RData", ".rdata", ".rda"),
+                  buttonLabel = "Choose .RData\u2026",
+                  placeholder = "No file selected"),
+        actionButton("apply_rdata", "Load Computed Data",
+                     class = "btn-success w-100",
+                     icon  = icon("upload")),
+        br(), br(),
+        uiOutput("rdata_status_ui")
       ),
 
       # -- Right: preview -------------------------------------------------------
@@ -4492,6 +4520,115 @@ server <- function(input, output, session) {
       settings = settings
     )
   }
+
+  # ===========================================================================
+  # RData cache — save and load all computed rv fields
+  # ===========================================================================
+  # Terra SpatRaster and SpatVector objects cannot be serialized directly with
+  # save()/saveRDS().  We use terra::wrap() before saving and terra::unwrap()
+  # after loading to handle them transparently.
+  # All other rv fields (tibbles, lists, GLM objects, character) serialize fine.
+
+  wrap_for_cache <- function(x) {
+    if (is.null(x)) return(NULL)
+    if (inherits(x, c("SpatRaster", "SpatVector")))
+      return(list(.terra_class = class(x)[1], .wrapped = terra::wrap(x)))
+    x
+  }
+
+  unwrap_from_cache <- function(x) {
+    if (is.null(x)) return(NULL)
+    if (is.list(x) && identical(names(x)[1:2], c(".terra_class", ".wrapped")))
+      return(terra::unwrap(x$.wrapped))
+    x
+  }
+
+  # Save: download as .RData
+  output$save_rdata <- downloadHandler(
+    filename = function() {
+      paste0("scf_cache_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".RData")
+    },
+    content = function(file) {
+      withProgress(message = "Building .RData cache...", {
+        rv_snap   <- isolate(reactiveValuesToList(rv))
+        n_fields  <- length(rv_snap)
+        cache     <- vector("list", n_fields)
+        names(cache) <- names(rv_snap)
+
+        for (nm in names(rv_snap)) {
+          setProgress(detail = nm)
+          cache[[nm]] <- tryCatch(
+            wrap_for_cache(rv_snap[[nm]]),
+            error = function(e) {
+              message(sprintf("save_rdata: skipping '%s' (wrap error: %s)",
+                              nm, conditionMessage(e)))
+              NULL
+            }
+          )
+        }
+        cache$.saved_at <- format(Sys.time(), "%Y-%m-%d %H:%M:%S")
+        cache$.version  <- "2.0"
+
+        save(cache, file = file)
+        message(sprintf("save_rdata: wrote %d fields to %s",
+                        sum(!sapply(cache, is.null)), basename(file)))
+      })
+    }
+  )
+
+  # Load: restore from .RData
+  observeEvent(input$apply_rdata, {
+    req(input$load_rdata_file)
+    withProgress(message = "Loading .RData cache...", {
+      result <- tryCatch({
+        local_env <- new.env(parent = emptyenv())
+        load(input$load_rdata_file$datapath, envir = local_env)
+        if (!exists("cache", envir = local_env))
+          stop("File does not contain a 'cache' object — was it saved by this app?")
+        cache <- local_env$cache
+
+        n_ok  <- 0L
+        n_err <- 0L
+        for (nm in setdiff(names(cache), c(".saved_at", ".version"))) {
+          setProgress(detail = nm)
+          tryCatch({
+            val <- unwrap_from_cache(cache[[nm]])
+            rv[[nm]] <- val
+            n_ok <- n_ok + 1L
+          }, error = function(e) {
+            message(sprintf("apply_rdata: skipping '%s' (%s)", nm, conditionMessage(e)))
+            n_err <<- n_err + 1L
+          })
+        }
+
+        list(ok = n_ok, err = n_err,
+             saved_at = if (!is.null(cache$.saved_at)) cache$.saved_at else "unknown")
+      }, error = function(e) {
+        showNotification(paste("Load error:", conditionMessage(e)),
+                         type = "error", duration = NULL)
+        NULL
+      })
+
+      if (!is.null(result)) {
+        output$rdata_status_ui <- renderUI({
+          div(class = "alert alert-success mt-2",
+              icon("check"),
+              sprintf(" %d fields restored (saved %s). %s",
+                      result$ok, result$saved_at,
+                      if (result$err > 0)
+                        sprintf("%d fields skipped (see console).", result$err)
+                      else ""))
+        })
+        showNotification(
+          sprintf("Cache loaded: %d fields restored (saved %s)",
+                  result$ok, result$saved_at),
+          type = "message", duration = 8
+        )
+      }
+    })
+  })
+
+  output$rdata_status_ui <- renderUI(NULL)
 
   # Save: download as JSON
   output$save_state <- downloadHandler(

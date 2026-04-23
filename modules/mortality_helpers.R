@@ -1398,19 +1398,16 @@ write_mortality_snippet <- function(site_fit, cohort_fit = NULL) {
 #   FTM_trees.csv            -- tree records (Genus_species, DBH_cm, yr1status)
 #   Species_BarkThickness.csv -- BT_coef per species for BT = BT_coef * DBH_cm
 #
-# Mortality status coding (Cansler et al. 2020 FTM standard):
-#   yr1status 0 = not returned to (unobserved — NOT confirmed dead; dropped)
-#   yr1status 1 = alive at first post-fire survey  -> dead = 0
-#   yr1status 2 = dead at first post-fire survey   -> dead = 1
-#   Trees with NA, 0, or other yr1status values are dropped.
-#   NOTE: Some calibration regions contain only yr1status=0 and 1 (no confirmed
-#   dead trees). In that case a warning is issued and fit_cohort_mortality() will
-#   fail with a meaningful message.
+# Mortality status coding (Cansler et al. 2020 FTM metadata, RDS-2020-0001-2):
+#   yr1status 0 = alive at first post-fire survey -> dead = 0
+#   yr1status 1 = dead at first post-fire survey  -> dead = 1
+#   NA           = not assessed in that timestep (2nd edition: no longer filled-in)
+#   Trees with NA yr1status are dropped.
 #
 # Return value: list(tree_df, yr1status_counts)
 #   tree_df          — standard tibble suitable for fit_cohort_mortality()
-#   yr1status_counts — tibble(yr1status, n) of raw counts before filtering,
-#                      used by diagnostic plot functions
+#   yr1status_counts — tibble(yr1status, n) of raw counts before any status
+#                      filtering, used by diagnostic plot functions
 #
 # dNBR extraction: for each FTM fire, load the matching annual MTBS GeoTIFF
 #   from mtbs_dnbr_dir (matched by yr_fire), buffer the fire location by
@@ -1504,38 +1501,37 @@ load_ftm_cohort_data <- function(ftm_dir, cal_vect, working_crs,
     stop("No trees matched the in-area fires. Check YrFireName join key.")
 
   # ---- Determine mortality status from first post-fire year ------------------
-  # Cansler et al. (2020) FTM standard coding:
-  #   yr1status 0 = not returned to (unobserved — NOT confirmed dead)
-  #   yr1status 1 = alive   -> dead = 0
-  #   yr1status 2 = dead    -> dead = 1
+  # FTM metadata (RDS-2020-0001-2) definition for all yrXstatus columns:
+  #   0 = alive,  1 = dead,  NA = not assessed in that timestep
   if (!"yr1status" %in% names(trees_cal))
     stop("yr1status column not found in FTM_trees.csv.")
 
   # Save raw distribution BEFORE filtering for diagnostic plots
   yr1status_counts <- trees_cal %>%
-    filter(!is.na(yr1status)) %>%
-    count(yr1status, name = "n") %>%
+    count(yr1status, name = "n") %>%     # NA is its own bucket
     arrange(yr1status)
 
   message("  yr1status raw distribution (before filtering):")
   for (k in seq_len(nrow(yr1status_counts)))
-    message(sprintf("    yr1status=%d  n=%d", yr1status_counts$yr1status[k], yr1status_counts$n[k]))
+    message(sprintf("    yr1status=%s  n=%d",
+                    ifelse(is.na(yr1status_counts$yr1status[k]), "NA",
+                           as.character(yr1status_counts$yr1status[k])),
+                    yr1status_counts$n[k]))
 
-  # Filter to confirmed alive (1) or dead (2) only; drop yr1status=0 "not returned to"
+  # Keep trees with a measured status (0=alive or 1=dead); drop NA (not assessed)
   trees_cal <- trees_cal %>%
-    filter(!is.na(yr1status), yr1status %in% c(1L, 2L)) %>%
-    mutate(dead = as.integer(yr1status == 2L))
+    filter(!is.na(yr1status), yr1status %in% c(0L, 1L)) %>%
+    mutate(dead = as.integer(yr1status == 1L))
 
-  # Warn clearly if no confirmed dead trees are present in calibration region
+  # Warn if no dead trees found (unusual but possible for some regions/fires)
   n_dead_initial <- sum(trees_cal$dead)
   if (n_dead_initial == 0) {
     warning(paste0(
-      "No yr1status=2 (confirmed dead) trees found within/near cal_vect. ",
+      "No yr1status=1 (dead) trees found within/near cal_vect. ",
       "The cohort mortality GLM requires both alive AND dead trees. ",
       "Cohort mortality fitting will fail. ",
-      "Possible cause: this calibration region's FTM subset contains only ",
-      "yr1status=0 ('not returned to') and yr1status=1 ('alive') trees — ",
-      "confirmed dead trees were not re-sampled in this region."
+      "This may indicate the fires in your calibration region had very low mortality, ",
+      "or that dead trees were not re-sampled within the FTM dataset."
     ))
   }
 
@@ -1543,7 +1539,7 @@ load_ftm_cohort_data <- function(ftm_dir, cal_vect, working_crs,
   trees_cal <- trees_cal %>%
     filter(!is.na(DBH_cm), DBH_cm >= min_dbh_cm)
 
-  message(sprintf("  %d trees with yr1status 1 or 2 (dead=%d, alive=%d), DBH >= %.1f cm",
+  message(sprintf("  %d trees with yr1status 0 or 1 (dead=%d, alive=%d), DBH >= %.1f cm",
                   nrow(trees_cal), sum(trees_cal$dead), sum(trees_cal$dead == 0),
                   min_dbh_cm))
 
@@ -1731,15 +1727,16 @@ load_ftm_cohort_data <- function(ftm_dir, cal_vect, working_crs,
 
 plot_yr1status_distribution <- function(yr1status_counts) {
 
-  status_colors <- c("0" = "#aaaaaa", "1" = "#2c7bb6", "2" = "#d7191c")
+  # FTM coding: 0=alive, 1=dead, NA=not assessed
+  status_colors <- c("0" = "#2c7bb6", "1" = "#d7191c", "NA" = "#aaaaaa")
 
   df <- yr1status_counts %>%
     mutate(
-      key   = as.character(yr1status),
+      key   = ifelse(is.na(yr1status), "NA", as.character(yr1status)),
       label = dplyr::case_when(
-        key == "0" ~ "0: Not returned to\n(unobserved \u2014 NOT dead)",
-        key == "1" ~ "1: Alive",
-        key == "2" ~ "2: Dead (confirmed)",
+        key == "0"  ~ "0: Alive",
+        key == "1"  ~ "1: Dead",
+        key == "NA" ~ "NA: Not assessed\n(not measured that year)",
         TRUE        ~ paste0("Other: ", yr1status)
       )
     )
@@ -1755,8 +1752,8 @@ plot_yr1status_distribution <- function(yr1status_counts) {
                        expand = expansion(mult = c(0, 0.12))) +
     labs(
       title    = "FTM yr1status Distribution (Calibration Region)",
-      subtitle = paste0("yr1status=2 (confirmed dead) MUST be present for cohort mortality GLM.\n",
-                        "yr1status=0 ('not returned to') is NOT dead — these are excluded."),
+      subtitle = paste0("FTM coding: 0=alive, 1=dead, NA=not assessed.\n",
+                        "Both alive (0) and dead (1) trees must be present to fit cohort mortality."),
       x        = NULL,
       y        = "Number of trees"
     ) +
@@ -1783,18 +1780,19 @@ plot_bt_by_status <- function(tree_df) {
   n_alive <- sum(tree_df$dead == 0, na.rm = TRUE)
   n_dead  <- sum(tree_df$dead == 1, na.rm = TRUE)
 
+  # FTM coding: dead=0 means yr1status=0 (alive), dead=1 means yr1status=1 (dead)
   df <- tree_df %>%
     filter(is.finite(dead), is.finite(BarkThickness)) %>%
     mutate(status = factor(dead, levels = c(0L, 1L),
                            labels = c(
-                             sprintf("Alive (yr1=1)\nn=%s", scales::comma(n_alive)),
-                             sprintf("Dead (yr1=2)\nn=%s",  scales::comma(n_dead))
+                             sprintf("Alive (yr1=0)\nn=%s", scales::comma(n_alive)),
+                             sprintf("Dead (yr1=1)\nn=%s",  scales::comma(n_dead))
                            )))
 
   fill_vals <- setNames(
     c("#2c7bb6", "#d7191c"),
-    c(sprintf("Alive (yr1=1)\nn=%s", scales::comma(n_alive)),
-      sprintf("Dead (yr1=2)\nn=%s",  scales::comma(n_dead)))
+    c(sprintf("Alive (yr1=0)\nn=%s", scales::comma(n_alive)),
+      sprintf("Dead (yr1=1)\nn=%s",  scales::comma(n_dead)))
   )
 
   p <- ggplot(df, aes(x = status, y = BarkThickness, fill = status))
@@ -1811,7 +1809,7 @@ plot_bt_by_status <- function(tree_df) {
     labs(
       title    = "Bark Thickness by Survival Status",
       subtitle = if (n_dead == 0)
-        "No confirmed dead trees (yr1status=2) in calibration region \u2014 check yr1status distribution"
+        "No dead trees (yr1status=1) found in calibration region \u2014 check yr1status distribution"
       else
         "Dead trees should have THINNER bark than alive trees",
       x        = NULL,
@@ -1936,8 +1934,10 @@ plot_mortality_by_severity <- function(tree_df) {
 # SCF Eq. 8/9:
 #   P(mortality) = logistic(B0 + B1*BarkThickness + B2*dNBR)
 #   B0 -> CohortMortalityB0
-#   B1 -> CohortMortalityB1   (expect negative: thicker bark protects)
-#   B2 -> CohortMortalityB2   (expect positive: higher dNBR kills)
+#   B1 -> CohortMortalityB1   (expect NEGATIVE: thicker bark protects against mortality)
+#   B2 -> CohortMortalityB2   (expect POSITIVE: higher dNBR = more severe fire = more mortality)
+#
+# FTM dead column: 0 = alive (yr1status=0), 1 = dead (yr1status=1)
 #
 # Args:
 #   tree_df  tibble from load_ftm_cohort_data() with columns:
