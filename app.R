@@ -47,6 +47,7 @@ source("modules/species_helpers.R")
 source("modules/ui_helpers.R")
 source("modules/validation_helpers.R")
 source("modules/mortality_helpers.R")
+source("modules/tuning_helpers.R")
 options(jsonlite.named_vectors_as_objects = FALSE)
 
 # =============================================================================
@@ -790,6 +791,216 @@ ui <- page_navbar(
               column(6,
                 h6("Max Daily Spread Area: Observed vs Predicted"),
                 plotOutput("max_area_scatter_plot",  height = "280px")
+              )
+            )
+          ),
+
+          # -----------------------------------------------------------------------
+          # Parameter Tuning panel
+          # -----------------------------------------------------------------------
+          nav_panel("Parameter Tuning",
+            br(),
+            fluidRow(
+              column(12,
+                fluidRow(
+                  column(4,
+                    actionButton("load_tuning_from_cal", "← Load from Calibration",
+                                 class = "btn-outline-primary btn-sm w-100",
+                                 icon  = icon("download"))
+                  ),
+                  column(8,
+                    p(class = "text-muted small mb-0",
+                      "Adjust coefficients interactively and see the equations update in ",
+                      "real time. Click ", tags$b("← Load from Calibration"), " to seed ",
+                      "inputs from the fitted models. Use the fire simulation to sanity-check ",
+                      "fire size before running LANDIS.")
+                  )
+                )
+              )
+            ),
+            br(),
+            fluidRow(
+
+              # ---- Left: coefficient controls --------------------------------
+              column(4,
+                bslib::accordion(
+                  open   = "msa_acc",
+                  multiple = TRUE,
+
+                  # MaxSpreadArea
+                  bslib::accordion_panel(
+                    title = tagList(icon("arrows-up-down"), " Max Spread Area"),
+                    value = "msa_acc",
+                    uiOutput("tune_msa_badges"),
+                    numericInput("tune_msa_b0", "B0 — Intercept (ha)",
+                                 value = 500, step = 10),
+                    numericInput("tune_msa_b1", "B1 × FWI (ha per FWI unit)",
+                                 value = 15, step = 1),
+                    numericInput("tune_msa_b2", "B2 × EWS (ha per km/h)",
+                                 value = 3, step = 0.5),
+                    p(class = "text-muted small",
+                      "B1 and B2 must be positive. MSA is the daily spread ",
+                      "ceiling in hectares. Negative MSA is clamped to 0 by SCF.")
+                  ),
+
+                  # SpreadProbability
+                  bslib::accordion_panel(
+                    title = tagList(icon("fire"), " Spread Probability"),
+                    value = "sp_acc",
+                    uiOutput("tune_sp_badges"),
+                    numericInput("tune_sp_b0", "B0 — Intercept (logit)",
+                                 value = -3.5, step = 0.1),
+                    numericInput("tune_sp_b1", "B1 × FWI",
+                                 value = 0.07, step = 0.01),
+                    numericInput("tune_sp_b2", "B2 × FineFuels (0-1 scale)",
+                                 value = 0, step = 0.1),
+                    numericInput("tune_sp_b3", "B3 × EWS (km/h)",
+                                 value = 0.05, step = 0.01),
+                    numericInput("tune_sp_ff_preview",
+                                 "FineFuels value for surface plot",
+                                 value = 0.5, min = 0, max = 1, step = 0.1),
+                    p(class = "text-muted small",
+                      "If calibrated with FF=1 placeholder, consider setting ",
+                      "B2=0 and adjusting B0 by adding old B2×1.0.")
+                  ),
+
+                  # Site Mortality
+                  bslib::accordion_panel(
+                    title = tagList(icon("skull-crossbones"), " Site Mortality (dNBR)"),
+                    value = "sm_acc",
+                    p(class = "text-muted small",
+                      "dNBR = 1 / (B0 + B1·Clay + B2·ET + B3·EWS + B4·CWD + B5·FF + B6·LF)",
+                      br(), "Negative denominator → dNBR capped at 2000."),
+                    numericInput("tune_sm_b0", "B0 — Intercept",
+                                 value = 0.003, step = 0.0001),
+                    numericInput("tune_sm_b1", "B1 × Clay (fraction 0-1)",
+                                 value = 0.013, step = 0.001),
+                    numericInput("tune_sm_b2", "B2 × ET (mm/yr)",
+                                 value = 0, step = 0.000001),
+                    numericInput("tune_sm_b3", "B3 × EWS (km/h)",
+                                 value = -0.000024, step = 0.000001),
+                    numericInput("tune_sm_b4", "B4 × CWD (mm)",
+                                 value = 0.0000022, step = 0.0000001),
+                    numericInput("tune_sm_b5", "B5 × FineFuels (0-1)",
+                                 value = 0, step = 0.0001),
+                    numericInput("tune_sm_b6", "B6 × LadderFuels (g C/m²)",
+                                 value = 0, step = 0.0001),
+                    p(class = "text-muted small",
+                      "B6 units: LANDIS LadderFuels is biomass (g C/m²), NOT a",
+                      " normalized 0-1 index. Set to 0 if calibrated on LANDFIRE CBH.")
+                  ),
+
+                  # Cohort Mortality
+                  bslib::accordion_panel(
+                    title = tagList(icon("tree"), " Cohort Mortality"),
+                    value = "cm_acc",
+                    uiOutput("tune_cm_badges"),
+                    p(class = "text-muted small",
+                      "P(mort) = logistic(B0 + B1·BarkThickness + B2·dNBR)"),
+                    numericInput("tune_cm_b0", "B0 — Intercept (logit)",
+                                 value = -2, step = 0.1),
+                    numericInput("tune_cm_b1", "B1 × BarkThickness (cm) — should be negative",
+                                 value = -1, step = 0.1),
+                    numericInput("tune_cm_b2", "B2 × dNBR — should be positive",
+                                 value = 0.003, step = 0.001)
+                  ),
+
+                  # Context
+                  bslib::accordion_panel(
+                    title = tagList(icon("gear"), " Context / Preview Settings"),
+                    value = "ctx_acc",
+                    numericInput("tune_max_ff", "MaximumFineFuels (g C m⁻²)",
+                                 value = 500, min = 1, step = 10),
+                    p(class = "text-muted small",
+                      "SCF divides LANDIS fine fuels by this to get 0-1 for equations."),
+                    numericInput("tune_cell_area", "Cell Area (ha)",
+                                 value = 0.09, min = 0.001, step = 0.01),
+                    p(class = "text-muted small", "30 m = 0.09 ha | 90 m = 0.81 ha"),
+                    hr(),
+                    h6("Typical predictor values (for dNBR preview)"),
+                    numericInput("tune_clay",  "Clay (fraction 0-1)", value = 0.064,  min = 0, max = 1, step = 0.01),
+                    numericInput("tune_cwd",   "CWD (mm)",            value = 12,     min = 0, step = 1),
+                    numericInput("tune_et",    "ET (mm/yr)",          value = 50,     min = 0, step = 5),
+                    numericInput("tune_ff_sm", "FineFuels (0-1, for dNBR preview)", value = 0.3, min = 0, max = 1, step = 0.05)
+                  )
+                ),
+
+                hr(),
+                downloadButton("dl_tuning_snippet", "Export SCF Parameter Snippet",
+                               class = "btn-outline-secondary btn-sm w-100",
+                               icon  = icon("file-export"))
+              ),
+
+              # ---- Right: plots -----------------------------------------------
+              column(8,
+                navset_pill(
+                  id = "tuning_plot_tabs",
+
+                  nav_panel("Max Spread Area",
+                    br(),
+                    plotOutput("tune_msa_plot", height = "380px"),
+                    br(),
+                    uiOutput("tune_msa_table_ui")
+                  ),
+
+                  nav_panel("Spread Probability",
+                    br(),
+                    fluidRow(
+                      column(12,
+                        plotOutput("tune_sp_plot", height = "320px")
+                      )
+                    ),
+                    br(),
+                    fluidRow(
+                      column(12,
+                        plotOutput("tune_sp_ff_plot", height = "300px")
+                      )
+                    )
+                  ),
+
+                  nav_panel("Site Mortality",
+                    br(),
+                    plotOutput("tune_dnbr_plot", height = "340px"),
+                    br(),
+                    h6("dNBR sensitivity table"),
+                    p(class = "text-muted small",
+                      "At typical predictor values, varying LadderFuels (g C/m²)."),
+                    tableOutput("tune_dnbr_table")
+                  ),
+
+                  nav_panel("Cohort Mortality",
+                    br(),
+                    plotOutput("tune_cm_plot", height = "380px")
+                  ),
+
+                  nav_panel("Fire Simulation",
+                    br(),
+                    fluidRow(
+                      column(4,
+                        sliderInput("tune_sim_fwi", "FWI", min = 0, max = 50,
+                                    value = 20, step = 1)
+                      ),
+                      column(4,
+                        sliderInput("tune_sim_ews", "EWS (km/h)", min = 0, max = 50,
+                                    value = 15, step = 1)
+                      ),
+                      column(4,
+                        sliderInput("tune_sim_ff",  "FineFuels (0-1)", min = 0, max = 1,
+                                    value = 0.5, step = 0.05)
+                      )
+                    ),
+                    uiOutput("tune_sim_summary_ui"),
+                    br(),
+                    fluidRow(
+                      column(7,
+                        plotOutput("tune_sim_timeline_plot", height = "300px")
+                      ),
+                      column(5,
+                        plotOutput("tune_sim_map_plot", height = "300px")
+                      )
+                    )
+                  )
+                )
               )
             )
           ),
@@ -3642,6 +3853,326 @@ server <- function(input, output, session) {
   output$dl_scores <- downloadHandler(
     filename = "candidate_scores.csv",
     content  = function(f) write_csv(rv$scores_df, f))
+
+  # ===========================================================================
+  # Parameter Tuning panel
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Load from Calibration: copies fitted coefficients into tuning inputs
+  # ---------------------------------------------------------------------------
+  observeEvent(input$load_tuning_from_cal, {
+
+    # Helper: extract estimate by term name prefix from a coef tibble
+    get_est <- function(coef_df, prefix, fallback = 0) {
+      idx <- grep(prefix, coef_df$term, ignore.case = TRUE)[1]
+      if (is.na(idx) || !is.finite(coef_df$estimate[idx])) fallback
+      else coef_df$estimate[idx]
+    }
+
+    # ---- MaxSpreadArea (75th percentile fit) ----------------------------------
+    if (!is.null(rv$max_area_fit)) {
+      cf <- rv$max_area_fit$coef %>%
+        filter(fit_target == "75th percentile (recommended)")
+      if (nrow(cf) > 0) {
+        updateNumericInput(session, "tune_msa_b0", value = round(get_est(cf, "B0"),    4))
+        updateNumericInput(session, "tune_msa_b1", value = round(get_est(cf, "B1"),    4))
+        updateNumericInput(session, "tune_msa_b2", value = round(get_est(cf, "B2"),    4))
+      }
+    }
+
+    # ---- SpreadProbability ---------------------------------------------------
+    if (!is.null(rv$spread_prob_fit)) {
+      cf <- rv$spread_prob_fit$coef
+      updateNumericInput(session, "tune_sp_b0", value = round(get_est(cf, "B0"),  6))
+      updateNumericInput(session, "tune_sp_b1", value = round(get_est(cf, "B1"),  6))
+      updateNumericInput(session, "tune_sp_b2", value = round(get_est(cf, "B2"),  6))
+      updateNumericInput(session, "tune_sp_b3", value = round(get_est(cf, "B3"),  6))
+    }
+
+    # ---- Site Mortality ------------------------------------------------------
+    if (!is.null(rv$site_mort_fit)) {
+      cf <- rv$site_mort_fit$coef_df
+      updateNumericInput(session, "tune_sm_b0", value = round(get_est(cf, "B0|Intercept"), 8))
+      updateNumericInput(session, "tune_sm_b1", value = round(get_est(cf, "B1|Clay"),      8))
+      updateNumericInput(session, "tune_sm_b2", value = round(get_est(cf, "B2|ET"),        8))
+      updateNumericInput(session, "tune_sm_b3", value = round(get_est(cf, "B3|EWS|Wind"),  8))
+      updateNumericInput(session, "tune_sm_b4", value = round(get_est(cf, "B4|CWD"),       8))
+      updateNumericInput(session, "tune_sm_b5", value = round(get_est(cf, "B5|Fine"),      8))
+      updateNumericInput(session, "tune_sm_b6", value = round(get_est(cf, "B6|Ladder"),    8))
+    }
+
+    # ---- Cohort Mortality ----------------------------------------------------
+    if (!is.null(rv$cohort_mort_fit)) {
+      cf <- rv$cohort_mort_fit$coef_df
+      updateNumericInput(session, "tune_cm_b0", value = round(get_est(cf, "B0|Intercept"),  6))
+      updateNumericInput(session, "tune_cm_b1", value = round(get_est(cf, "B1|Bark"),       6))
+      updateNumericInput(session, "tune_cm_b2", value = round(get_est(cf, "B2|dNBR|Site"),  6))
+    }
+
+    # ---- Cell area from template_r -------------------------------------------
+    if (!is.null(rv$template_r)) {
+      res_m  <- mean(res(rv$template_r))
+      cell_a <- (res_m^2) / 10000   # m² -> ha
+      updateNumericInput(session, "tune_cell_area", value = round(cell_a, 4))
+    }
+  })
+
+  # ---------------------------------------------------------------------------
+  # Debounced reactive: collect all tuning inputs into one list
+  # ---------------------------------------------------------------------------
+  tuning_r <- reactive({
+    list(
+      msa_b0     = input$tune_msa_b0,
+      msa_b1     = input$tune_msa_b1,
+      msa_b2     = input$tune_msa_b2,
+      sp_b0      = input$tune_sp_b0,
+      sp_b1      = input$tune_sp_b1,
+      sp_b2      = input$tune_sp_b2,
+      sp_b3      = input$tune_sp_b3,
+      sp_ff      = input$tune_sp_ff_preview,
+      sm_b0      = input$tune_sm_b0,
+      sm_b1      = input$tune_sm_b1,
+      sm_b2      = input$tune_sm_b2,
+      sm_b3      = input$tune_sm_b3,
+      sm_b4      = input$tune_sm_b4,
+      sm_b5      = input$tune_sm_b5,
+      sm_b6      = input$tune_sm_b6,
+      cm_b0      = input$tune_cm_b0,
+      cm_b1      = input$tune_cm_b1,
+      cm_b2      = input$tune_cm_b2,
+      max_ff     = input$tune_max_ff,
+      cell_area  = input$tune_cell_area,
+      clay       = input$tune_clay,
+      cwd        = input$tune_cwd,
+      et         = input$tune_et,
+      ff_sm      = input$tune_ff_sm,
+      sim_fwi    = input$tune_sim_fwi,
+      sim_ews    = input$tune_sim_ews,
+      sim_ff     = input$tune_sim_ff
+    )
+  }) |> debounce(350)
+
+  # ---------------------------------------------------------------------------
+  # Sign check badges
+  # ---------------------------------------------------------------------------
+  output$tune_msa_badges <- renderUI({
+    p <- tuning_r()
+    req(!is.null(p$msa_b1), !is.null(p$msa_b2))
+    b1_ok <- is.finite(p$msa_b1) && p$msa_b1 > 0
+    b2_ok <- is.finite(p$msa_b2) && p$msa_b2 > 0
+    tagList(
+      span(class = paste("badge me-1", if (b1_ok) "bg-success" else "bg-danger"),
+           if (b1_ok) "✓ B1 positive" else "⚠ B1 NEGATIVE"),
+      span(class = paste("badge",      if (b2_ok) "bg-success" else "bg-danger"),
+           if (b2_ok) "✓ B2 positive" else "⚠ B2 NEGATIVE"),
+      br(), br()
+    )
+  })
+
+  output$tune_sp_badges <- renderUI({
+    p <- tuning_r()
+    req(!is.null(p$sp_b2))
+    b2_warn <- is.finite(p$sp_b2) && (p$sp_b2 < -0.5 || p$sp_b2 > 2)
+    tagList(
+      if (b2_warn)
+        span(class = "badge bg-warning text-dark",
+             "⚠ B2 may be unidentified (FF placeholder during calibration)")
+      else
+        span(class = "badge bg-success", "✓ B2 looks plausible"),
+      br(), br()
+    )
+  })
+
+  output$tune_cm_badges <- renderUI({
+    p <- tuning_r()
+    req(!is.null(p$cm_b1), !is.null(p$cm_b2))
+    b1_ok <- is.finite(p$cm_b1) && p$cm_b1 < 0
+    b2_ok <- is.finite(p$cm_b2) && p$cm_b2 > 0
+    tagList(
+      span(class = paste("badge me-1", if (b1_ok) "bg-success" else "bg-danger"),
+           if (b1_ok) "✓ B1 negative" else "⚠ B1 should be negative"),
+      span(class = paste("badge",      if (b2_ok) "bg-success" else "bg-danger"),
+           if (b2_ok) "✓ B2 positive" else "⚠ B2 should be positive"),
+      br(), br()
+    )
+  })
+
+  # ---------------------------------------------------------------------------
+  # Max Spread Area plots + table
+  # ---------------------------------------------------------------------------
+  output$tune_msa_plot <- renderPlot({
+    p <- tuning_r()
+    req(is.numeric(p$msa_b0), is.numeric(p$msa_b1), is.numeric(p$msa_b2))
+    plot_msa_surface(p$msa_b0, p$msa_b1, p$msa_b2)
+  })
+
+  output$tune_msa_table_ui <- renderUI({
+    p <- tuning_r()
+    req(is.numeric(p$msa_b0), is.numeric(p$msa_b1), is.numeric(p$msa_b2))
+    scenarios <- list(
+      c(FWI =  5, EWS = 10),
+      c(FWI = 10, EWS = 15),
+      c(FWI = 20, EWS = 20),
+      c(FWI = 30, EWS = 25),
+      c(FWI = 40, EWS = 30)
+    )
+    rows <- lapply(scenarios, function(s) {
+      msa <- p$msa_b0 + p$msa_b1 * s["FWI"] + p$msa_b2 * s["EWS"]
+      neg <- msa < 0
+      data.frame(
+        FWI      = s["FWI"],
+        EWS_kmh  = s["EWS"],
+        MSA_ha   = round(max(msa, 0), 0),
+        Status   = if (neg) "⚠ Would be 0 (SCF clamps)" else
+                   if (msa < 50)  "Low (< 50 ha)" else
+                   if (msa < 800) "Plausible" else "High (> 800 ha)"
+      )
+    })
+    df <- do.call(rbind, rows)
+    tagList(
+      tags$table(class = "table table-sm table-bordered",
+        tags$thead(tags$tr(lapply(names(df), function(n) tags$th(n)))),
+        tags$tbody(
+          lapply(seq_len(nrow(df)), function(i) {
+            row_class <- if (grepl("⚠", df$Status[i])) "table-danger" else
+                         if (df$Status[i] == "Plausible")   ""  else "table-warning"
+            tags$tr(class = row_class,
+              tags$td(df$FWI[i]),
+              tags$td(df$EWS_kmh[i]),
+              tags$td(scales::comma(df$MSA_ha[i])),
+              tags$td(df$Status[i])
+            )
+          })
+        )
+      )
+    )
+  })
+
+  # ---------------------------------------------------------------------------
+  # Spread Probability plots
+  # ---------------------------------------------------------------------------
+  output$tune_sp_plot <- renderPlot({
+    p <- tuning_r()
+    req(is.numeric(p$sp_b0))
+    plot_sp_surface(p$sp_b0, p$sp_b1, p$sp_b2, p$sp_b3,
+                    ff_val = coalesce(p$sp_ff, 0.5))
+  })
+
+  output$tune_sp_ff_plot <- renderPlot({
+    p <- tuning_r()
+    req(is.numeric(p$sp_b0))
+    plot_sp_ff_sensitivity(p$sp_b0, p$sp_b1, p$sp_b2, p$sp_b3)
+  })
+
+  # ---------------------------------------------------------------------------
+  # Site Mortality (dNBR) plots + table
+  # ---------------------------------------------------------------------------
+  output$tune_dnbr_plot <- renderPlot({
+    p <- tuning_r()
+    req(is.numeric(p$sm_b0))
+    plot_dnbr_surface(
+      p$sm_b0, p$sm_b1, p$sm_b2, p$sm_b3, p$sm_b4, p$sm_b5, p$sm_b6,
+      clay   = coalesce(p$clay,  0.064),
+      et_mm  = coalesce(p$et,    50),
+      cwd_mm = coalesce(p$cwd,   12),
+      ff     = coalesce(p$ff_sm, 0.3)
+    )
+  })
+
+  output$tune_dnbr_table <- renderTable({
+    p <- tuning_r()
+    req(is.numeric(p$sm_b0))
+    dnbr_sensitivity_table(
+      p$sm_b0, p$sm_b1, p$sm_b2, p$sm_b3, p$sm_b4, p$sm_b5, p$sm_b6,
+      clay   = coalesce(p$clay,  0.064),
+      et_mm  = coalesce(p$et,    50),
+      ews_kmh = 15,
+      cwd_mm = coalesce(p$cwd,   12),
+      ff     = coalesce(p$ff_sm, 0.3)
+    ) |>
+      dplyr::mutate(
+        Denominator = round(Denominator, 6),
+        dNBR        = round(dNBR, 0)
+      ) |>
+      dplyr::select(-Capped)
+  }, striped = TRUE, hover = TRUE, bordered = TRUE, digits = 4)
+
+  # ---------------------------------------------------------------------------
+  # Cohort Mortality plot
+  # ---------------------------------------------------------------------------
+  output$tune_cm_plot <- renderPlot({
+    p <- tuning_r()
+    req(is.numeric(p$cm_b0))
+    plot_cm_curve(p$cm_b0, p$cm_b1, p$cm_b2)
+  })
+
+  # ---------------------------------------------------------------------------
+  # Fire simulation
+  # ---------------------------------------------------------------------------
+  tune_sim_r <- reactive({
+    p <- tuning_r()
+    req(is.numeric(p$msa_b0), is.numeric(p$sp_b0),
+        is.numeric(p$sim_fwi), is.numeric(p$sim_ews),
+        is.numeric(p$cell_area), p$cell_area > 0)
+    simulate_fire_simple(
+      fwi          = p$sim_fwi,
+      ews          = p$sim_ews,
+      ff           = coalesce(p$sim_ff, 0.5),
+      msa_b0       = p$msa_b0,  msa_b1 = p$msa_b1,  msa_b2 = p$msa_b2,
+      sp_b0        = p$sp_b0,   sp_b1  = p$sp_b1,
+      sp_b2        = p$sp_b2,   sp_b3  = p$sp_b3,
+      cell_area_ha = p$cell_area
+    )
+  })
+
+  output$tune_sim_summary_ui <- renderUI({
+    sim <- tune_sim_r()
+    req(!is.null(sim))
+    grid_total_ha <- 100 * 100 * isolate(tuning_r())$cell_area
+    pct_burned    <- round(100 * sim$total_ha / grid_total_ha, 1)
+    col_class <- if (pct_burned > 75) "alert-danger" else
+                 if (pct_burned > 40) "alert-warning" else "alert-success"
+    div(class = paste("alert p-2 small mb-0", col_class),
+      sprintf(
+        "\U0001f525 Total: %.1f ha (%.1f%% of grid)  │  Days: %d  │  P(spread): %.3f  │  MaxSpreadArea: %.0f ha",
+        sim$total_ha, pct_burned, sim$days, sim$p_spread, sim$msa_ha
+      )
+    )
+  })
+
+  output$tune_sim_timeline_plot <- renderPlot({
+    sim <- tune_sim_r()
+    req(!is.null(sim))
+    plot_fire_timeline(sim, isolate(tuning_r())$cell_area)
+  })
+
+  output$tune_sim_map_plot <- renderPlot({
+    sim <- tune_sim_r()
+    req(!is.null(sim))
+    plot_fire_map(sim)
+  })
+
+  # ---------------------------------------------------------------------------
+  # Export SCF snippet
+  # ---------------------------------------------------------------------------
+  output$dl_tuning_snippet <- downloadHandler(
+    filename = function()
+      sprintf("scf_tuning_%s.txt", format(Sys.time(), "%Y%m%d_%H%M%S")),
+    content = function(f) {
+      p <- isolate(tuning_r())
+      writeLines(
+        build_scf_tuning_snippet(
+          p$msa_b0, p$msa_b1, p$msa_b2,
+          p$sp_b0,  p$sp_b1,  p$sp_b2,  p$sp_b3,
+          p$sm_b0,  p$sm_b1,  p$sm_b2,  p$sm_b3,
+          p$sm_b4,  p$sm_b5,  p$sm_b6,
+          p$cm_b0,  p$cm_b1,  p$cm_b2,
+          max_ff = coalesce(p$max_ff, 500)
+        ), f
+      )
+    }
+  )
 
   # ===========================================================================
   # Species Table tab
