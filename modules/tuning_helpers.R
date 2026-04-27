@@ -10,6 +10,8 @@
 #   plot_msa_surface()       MaxSpreadArea vs FWI at multiple EWS levels
 #   plot_sp_surface()        SpreadProbability vs FWI
 #   plot_sp_ff_sensitivity() P vs FWI at FF=0 vs FF=1 (shows mismatch risk)
+#   plot_ff_scaling()        FF_scaled vs raw g C/m² and resulting P(spread)
+#                            — shows the saturation problem when MaxFF is too low
 #   plot_dnbr_surface()      dNBR vs EWS at multiple LadderFuel levels
 #   dnbr_sensitivity_table() Denominator / dNBR tabulation across LF values
 #   plot_cm_curve()          P(cohort mort) vs BarkThickness at multiple dNBR
@@ -296,6 +298,145 @@ plot_sp_ff_sensitivity <- function(sp_b0, sp_b1, sp_b2, sp_b3,
     theme(legend.position = "bottom",
           plot.subtitle = element_text(size = 9, colour = warn_col),
           plot.caption  = element_text(size = 8, colour = warn_col))
+}
+
+
+# =============================================================================
+# Plot: MaximumFineFuels scaling — raw g C/m² → FF_scaled (0-1)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# plot_ff_scaling
+#
+# Two-panel figure showing:
+#   Top: FF_scaled = min(FF_raw / MaxFF, 1.0) as a function of raw g C/m².
+#        Vertical line at MaxFF (saturation point). Optional line at the
+#        user-reported maximum observed LANDIS output.
+#        Annotation shows what % of the landscape is already at FF_scaled=1.0
+#        if nearly all cells exceed MaxFF.
+#
+#   Bottom: P(spread) at fixed FWI and EWS across the raw g C/m² range.
+#           Shows how much spread probability actually varies given the
+#           current MaxFF setting vs. a higher setting.
+#
+# Key diagnostic:
+#   If max_ff << observed_landis_max, most cells will have FF_scaled ≈ 1.0.
+#   B2 then acts as a constant offset (same as the FF=1 calibration placeholder
+#   problem) and provides no real fuel loading signal at runtime.
+#   Recommendation: set MaxFF to the 95th-99th percentile of your LANDIS
+#   FineFuels output so the full observed range maps to 0-1.
+#
+# Arguments:
+#   max_ff           Current MaximumFineFuels setting (g C/m²)
+#   sp_b0..sp_b3     SpreadProbability coefficients
+#   observed_max     User-reported max raw LANDIS FineFuels (g C/m²); optional
+#   fwi_fixed        FWI for P(spread) bottom panel (default 20)
+#   ews_fixed        EWS for P(spread) bottom panel (default 15 km/h)
+# -----------------------------------------------------------------------------
+
+plot_ff_scaling <- function(max_ff,
+                             sp_b0, sp_b1, sp_b2, sp_b3,
+                             observed_max = NULL,
+                             fwi_fixed    = 20,
+                             ews_fixed    = 15) {
+
+  # Determine x-axis range: at least 2× MaxFF, or up to 1.1× observed max
+  x_max <- max(max_ff * 2.5,
+               if (is.numeric(observed_max) && observed_max > 0) observed_max * 1.05
+               else 0,
+               100)
+  x_seq <- seq(0, x_max, length.out = 600)
+
+  df <- data.frame(
+    FF_raw    = x_seq,
+    FF_scaled = pmin(x_seq / max_ff, 1.0),
+    P_spread  = 1 / (1 + exp(-(sp_b0 + sp_b1 * fwi_fixed +
+                                sp_b2 * pmin(x_seq / max_ff, 1.0) +
+                                sp_b3 * ews_fixed)))
+  )
+
+  # Saturation diagnosis
+  pct_saturated <- if (is.numeric(observed_max) && observed_max > 0 && max_ff < observed_max)
+    round(100 * (1 - max_ff / observed_max), 1) else 0
+
+  # P(spread) range across the raw-FF dimension
+  p_at_ff0   <- 1 / (1 + exp(-(sp_b0 + sp_b1 * fwi_fixed + sp_b2 * 0   + sp_b3 * ews_fixed)))
+  p_at_maxff <- 1 / (1 + exp(-(sp_b0 + sp_b1 * fwi_fixed + sp_b2 * 1.0 + sp_b3 * ews_fixed)))
+
+  warn_col <- if (pct_saturated > 50) "#c0392b" else
+              if (pct_saturated > 20) "#e67e22" else "grey40"
+
+  sub_top <- sprintf(
+    "MaximumFineFuels = %.0f g C/m²  |  Saturation at FF_scaled = 1.0 (FF_raw ≥ MaxFF)%s",
+    max_ff,
+    if (pct_saturated > 0)
+      sprintf("  |  ⚠ %.1f%% of LANDIS range [0–%.0f] is already saturated",
+              pct_saturated, observed_max)
+    else ""
+  )
+
+  sub_bot <- sprintf(
+    "FWI=%.0f  EWS=%.0f km/h  |  P spans %.3f (FF_raw=0) → %.3f (FF_raw=MaxFF)  |  ΔP = %.3f",
+    fwi_fixed, ews_fixed, p_at_ff0, p_at_maxff, abs(p_at_maxff - p_at_ff0)
+  )
+
+  # ---- Top panel: scaling curve -------------------------------------------
+  p_top <- ggplot(df, aes(FF_raw, FF_scaled)) +
+    geom_line(colour = "#2171b5", linewidth = 1.2) +
+    # Saturation cap line
+    geom_hline(yintercept = 1, linetype = "dashed", colour = "grey50") +
+    # MaxFF vertical line
+    geom_vline(xintercept = max_ff, linetype = "longdash",
+               colour = "#2171b5", linewidth = 0.7) +
+    annotate("text", x = max_ff, y = 0.5,
+             label = sprintf("MaxFF = %.0f", max_ff),
+             hjust = -0.08, size = 3.2, colour = "#2171b5") +
+    # Observed max line (if supplied)
+    {if (is.numeric(observed_max) && observed_max > 0)
+      list(
+        geom_vline(xintercept = observed_max, linetype = "dotted",
+                   colour = "#c0392b", linewidth = 0.7),
+        annotate("text", x = observed_max, y = 0.25,
+                 label = sprintf("LANDIS max ≈ %.0f", observed_max),
+                 hjust = 1.05, size = 3.2, colour = "#c0392b")
+      )
+    } +
+    scale_y_continuous(limits = c(0, 1.1), labels = scales::percent) +
+    scale_x_continuous(labels = scales::comma) +
+    labs(
+      title    = "Fine Fuels Scaling: Raw g C/m² → FF_scaled (0–1)",
+      subtitle = sub_top,
+      x        = "Raw LANDIS FineFuels (g C/m²)",
+      y        = "FF_scaled = min(FF / MaxFF, 1)"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(plot.subtitle = element_text(size = 9, colour = warn_col))
+
+  # ---- Bottom panel: P(spread) across the raw-FF range --------------------
+  p_bot <- ggplot(df, aes(FF_raw, P_spread)) +
+    geom_line(colour = "#d94801", linewidth = 1.2) +
+    geom_vline(xintercept = max_ff, linetype = "longdash",
+               colour = "#2171b5", linewidth = 0.7) +
+    {if (is.numeric(observed_max) && observed_max > 0)
+      geom_vline(xintercept = observed_max, linetype = "dotted",
+                 colour = "#c0392b", linewidth = 0.7)
+    } +
+    scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+    scale_x_continuous(labels = scales::comma) +
+    labs(
+      subtitle = sub_bot,
+      x        = "Raw LANDIS FineFuels (g C/m²)",
+      y        = "P(spread)"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(plot.subtitle = element_text(size = 9, colour = "grey40"))
+
+  # Stack with patchwork if available, otherwise just return top panel
+  if (requireNamespace("patchwork", quietly = TRUE)) {
+    patchwork::wrap_plots(p_top, p_bot, ncol = 1, heights = c(1.1, 1))
+  } else {
+    p_top
+  }
 }
 
 

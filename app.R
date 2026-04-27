@@ -909,10 +909,25 @@ ui <- page_navbar(
                   bslib::accordion_panel(
                     title = tagList(icon("gear"), " Context / Preview Settings"),
                     value = "ctx_acc",
+
+                    h6("Fine Fuels Scaling"),
                     numericInput("tune_max_ff", "MaximumFineFuels (g C m⁻²)",
-                                 value = 500, min = 1, step = 10),
+                                 value = 500, min = 1, step = 100),
                     p(class = "text-muted small",
-                      "SCF divides LANDIS fine fuels by this to get 0-1 for equations."),
+                      "SCF divides LANDIS FineFuels output by this value to get the",
+                      " 0-1 scale used in the spread and mortality equations.",
+                      " Cells with raw FF ≥ MaxFF are clamped to FF_scaled = 1.0.",
+                      " If your LANDIS output routinely exceeds this, B2 becomes",
+                      " a constant offset — raise MaxFF to match your actual range."),
+                    numericInput("tune_observed_max_ff",
+                                 "Observed LANDIS FineFuels max (g C/m², optional)",
+                                 value = NA, min = 0, step = 500),
+                    p(class = "text-muted small",
+                      "Paste the max value from your SCF FineFuels output layer.",
+                      " Used in the FF Scaling plot to show what fraction of your",
+                      " landscape is already at FF_scaled = 1.0 with the current MaxFF."),
+
+                    hr(),
                     numericInput("tune_cell_area", "Cell Area (ha)",
                                  value = 0.09, min = 0.001, step = 0.01),
                     p(class = "text-muted small", "30 m = 0.09 ha | 90 m = 0.81 ha"),
@@ -956,6 +971,21 @@ ui <- page_navbar(
                         plotOutput("tune_sp_ff_plot", height = "300px")
                       )
                     )
+                  ),
+
+                  nav_panel("FF Scaling",
+                    br(),
+                    p(class = "text-muted small",
+                      tags$b("What MaximumFineFuels actually does:"),
+                      " SCF computes FF_scaled = min(FineFuels / MaxFF, 1.0) before",
+                      " plugging into the spread probability and site mortality equations.",
+                      " If MaxFF is too low relative to your LANDIS outputs, most cells",
+                      " are clamped at FF_scaled = 1.0 — B2 becomes a constant shift,",
+                      " not a real fuel signal. Set MaxFF in the Context panel and",
+                      " enter your observed LANDIS maximum to see the saturation problem."),
+                    uiOutput("tune_ff_saturation_banner"),
+                    br(),
+                    plotOutput("tune_ff_scaling_plot", height = "520px")
                   ),
 
                   nav_panel("Site Mortality",
@@ -3941,8 +3971,9 @@ server <- function(input, output, session) {
       cm_b0      = input$tune_cm_b0,
       cm_b1      = input$tune_cm_b1,
       cm_b2      = input$tune_cm_b2,
-      max_ff     = input$tune_max_ff,
-      cell_area  = input$tune_cell_area,
+      max_ff           = input$tune_max_ff,
+      observed_max_ff  = input$tune_observed_max_ff,
+      cell_area        = input$tune_cell_area,
       clay       = input$tune_clay,
       cwd        = input$tune_cwd,
       et         = input$tune_et,
@@ -4063,6 +4094,71 @@ server <- function(input, output, session) {
     p <- tuning_r()
     req(is.numeric(p$sp_b0))
     plot_sp_ff_sensitivity(p$sp_b0, p$sp_b1, p$sp_b2, p$sp_b3)
+  })
+
+  # ---------------------------------------------------------------------------
+  # FF Scaling plot + saturation banner
+  # ---------------------------------------------------------------------------
+  output$tune_ff_saturation_banner <- renderUI({
+    p <- tuning_r()
+    req(is.numeric(p$max_ff), p$max_ff > 0)
+
+    obs_max  <- if (is.numeric(p$observed_max_ff) && is.finite(p$observed_max_ff) &&
+                    p$observed_max_ff > 0) p$observed_max_ff else NULL
+    pct_sat  <- if (!is.null(obs_max) && obs_max > p$max_ff)
+      round(100 * (1 - p$max_ff / obs_max), 1) else 0
+
+    # Effective FF range at typical landscape values
+    recommended_max_ff <- if (!is.null(obs_max)) round(obs_max * 0.95, -2) else NULL
+
+    if (pct_sat > 50) {
+      div(class = "alert alert-danger p-2 small",
+        icon("triangle-exclamation"), " ",
+        sprintf(
+          "%.1f%% of your LANDIS FineFuels range (0–%.0f g/m²) is already above MaxFF=%.0f.",
+          pct_sat, obs_max, p$max_ff
+        ),
+        " B2 is effectively a constant offset — FineFuels has no real signal in SCF.",
+        tags$b(sprintf(" Suggested fix: raise MaximumFineFuels to ≈%.0f g/m² (95th pct of your range).",
+                       recommended_max_ff))
+      )
+    } else if (pct_sat > 10) {
+      div(class = "alert alert-warning p-2 small",
+        icon("circle-exclamation"), " ",
+        sprintf(
+          "%.1f%% of your LANDIS range exceeds MaxFF=%.0f — some saturation present.",
+          pct_sat, p$max_ff
+        ),
+        sprintf(" Consider raising MaximumFineFuels toward %.0f g/m².", recommended_max_ff)
+      )
+    } else if (!is.null(obs_max)) {
+      div(class = "alert alert-success p-2 small",
+        icon("circle-check"), " ",
+        sprintf(
+          "MaxFF=%.0f covers %.0f%% of your observed LANDIS range (max ≈ %.0f g/m²). Good coverage.",
+          p$max_ff, min(100, round(100 * p$max_ff / obs_max)), obs_max
+        )
+      )
+    } else {
+      div(class = "alert alert-info p-2 small",
+        icon("circle-info"),
+        " Enter your observed LANDIS FineFuels maximum in the Context panel to",
+        " see how much of your landscape is saturated at the current MaxFF setting."
+      )
+    }
+  })
+
+  output$tune_ff_scaling_plot <- renderPlot({
+    p <- tuning_r()
+    req(is.numeric(p$max_ff), p$max_ff > 0, is.numeric(p$sp_b0))
+    obs_max <- if (is.numeric(p$observed_max_ff) && is.finite(p$observed_max_ff) &&
+                   p$observed_max_ff > 0) p$observed_max_ff else NULL
+    plot_ff_scaling(
+      max_ff       = p$max_ff,
+      sp_b0        = p$sp_b0, sp_b1 = p$sp_b1,
+      sp_b2        = p$sp_b2, sp_b3 = p$sp_b3,
+      observed_max = obs_max
+    )
   })
 
   # ---------------------------------------------------------------------------
