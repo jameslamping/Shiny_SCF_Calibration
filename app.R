@@ -49,6 +49,7 @@ source("modules/validation_helpers.R")
 source("modules/mortality_helpers.R")
 source("modules/tuning_helpers.R")
 options(jsonlite.named_vectors_as_objects = FALSE)
+options(shiny.maxRequestSize = 2 * 1024^3)   # 2 GB upload limit for .RData session cache
 
 # =============================================================================
 # UI
