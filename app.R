@@ -4805,7 +4805,8 @@ server <- function(input, output, session) {
 
   output$tune_ensemble_plot <- renderPlot({
     ens <- ensemble_rv()
-    # Compute FPA FOD reference quantiles if observed data is loaded
+
+    # ---- FPA FOD overall reference quantiles (blue horizontal lines) ----------
     fpa_sizes <- if (!is.null(rv$ign_df) && "FIRE_SIZE_HA" %in% names(rv$ign_df)) {
       rv$ign_df$FIRE_SIZE_HA[is.finite(rv$ign_df$FIRE_SIZE_HA)]
     } else NULL
@@ -4813,7 +4814,42 @@ server <- function(input, output, session) {
       stats::median(fpa_sizes, na.rm = TRUE) else NULL
     fpa_p90 <- if (!is.null(fpa_sizes) && length(fpa_sizes) > 0)
       stats::quantile(fpa_sizes, 0.90, na.rm = TRUE) else NULL
-    plot_fire_ensemble(ens, reference_p50 = fpa_p50, reference_p90 = fpa_p90)
+
+    # ---- Observed GeoMAC fires binned to FWI x EWS cells (navy triangles) ----
+    # Ensemble FWI bins: 5, 15, 25, 35  (boundaries at 10, 20, 30)
+    # Ensemble EWS bins: 5, 15, 25      (boundaries at 10, 20)
+    obs_fires_df <- NULL
+    if (!is.null(rv$pairs_clean) &&
+        all(c("FIRE_ID", "daily_area_ha", "FWI", "EffectiveWind") %in% names(rv$pairs_clean))) {
+      fwi_breaks <- c(-Inf, 10, 20, 30, Inf)
+      fwi_vals   <- c(5L, 15L, 25L, 35L)
+      ews_breaks <- c(-Inf, 10, 20, Inf)
+      ews_vals   <- c(5L, 15L, 25L)
+
+      obs_fires_df <- rv$pairs_clean |>
+        dplyr::filter(is.finite(daily_area_ha), daily_area_ha >= 0,
+                      is.finite(FWI), is.finite(EffectiveWind)) |>
+        dplyr::group_by(FIRE_ID) |>
+        dplyr::summarize(
+          fire_ha  = sum(daily_area_ha, na.rm = TRUE),
+          mean_FWI = mean(FWI, na.rm = TRUE),
+          mean_EWS = mean(EffectiveWind, na.rm = TRUE),
+          .groups  = "drop"
+        ) |>
+        dplyr::filter(fire_ha > 0) |>
+        dplyr::mutate(
+          FWI_bin = fwi_vals[as.integer(cut(mean_FWI, breaks = fwi_breaks))],
+          EWS_bin = ews_vals[as.integer(cut(mean_EWS, breaks = ews_breaks))]
+        ) |>
+        dplyr::filter(!is.na(FWI_bin), !is.na(EWS_bin))
+
+      if (nrow(obs_fires_df) == 0) obs_fires_df <- NULL
+    }
+
+    plot_fire_ensemble(ens,
+                       reference_p50 = fpa_p50,
+                       reference_p90 = fpa_p90,
+                       obs_fires_df  = obs_fires_df)
   })
 
   output$tune_ens_status_ui <- renderUI({

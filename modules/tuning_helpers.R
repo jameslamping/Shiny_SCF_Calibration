@@ -782,22 +782,21 @@ run_fire_ensemble <- function(fwi_vals     = c(5, 15, 25, 35),
 
 plot_fire_ensemble <- function(ensemble_df,
                                 reference_p50 = NULL,
-                                reference_p90 = NULL) {
+                                reference_p90 = NULL,
+                                obs_fires_df  = NULL) {
 
   if (is.null(ensemble_df) || nrow(ensemble_df) == 0)
     return(ggplot() + labs(title = "Click 'Run Ensemble' to generate fire size distribution.") + theme_bw())
 
-  max_possible <- 100 * 100 * ensemble_df$msa_ha[1] / ensemble_df$msa_ha[1]   # grid_dim^2 * cell_area
-  # Retrieve the actual grid cap from data
-  grid_ha <- 100 * 100 * (ensemble_df$fire_ha / (100 * 100))   # reconstruct cell_area_ha
-  # Simpler: compute from msa column and cell size not stored — just note in plot
+  fwi_vals <- sort(unique(ensemble_df$FWI))
+  ews_vals <- sort(unique(ensemble_df$EWS))
+  fwi_lvls <- paste0("FWI = ", fwi_vals)
+  ews_lvls <- paste0("EWS ", ews_vals, " km/h")
 
   df <- ensemble_df |>
     dplyr::mutate(
-      FWI_label = factor(paste0("FWI = ", FWI),
-                          levels = paste0("FWI = ", sort(unique(FWI)))),
-      EWS_label = factor(paste0("EWS ", EWS, " km/h"),
-                          levels = paste0("EWS ", sort(unique(EWS)), " km/h")),
+      FWI_label    = factor(paste0("FWI = ", FWI),   levels = fwi_lvls),
+      EWS_label    = factor(paste0("EWS ", EWS, " km/h"), levels = ews_lvls),
       fire_ha_plot = pmax(fire_ha, 0.01)   # avoid log(0)
     )
 
@@ -805,23 +804,49 @@ plot_fire_ensemble <- function(ensemble_df,
   med_ha <- round(stats::median(df$fire_ha), 1)
   p90_ha <- round(stats::quantile(df$fire_ha, 0.90), 1)
 
+  # ---- Prepare observed fires overlay (GeoMAC, binned by FWI x EWS) ----------
+  # obs_fires_df columns: fire_ha, FWI_bin, EWS_bin (numeric, snapped to ensemble values)
+  obs_plot <- NULL
+  if (!is.null(obs_fires_df) && nrow(obs_fires_df) > 0 &&
+      all(c("fire_ha", "FWI_bin", "EWS_bin") %in% names(obs_fires_df))) {
+    obs_plot <- obs_fires_df |>
+      dplyr::filter(is.finite(fire_ha), fire_ha > 0) |>
+      dplyr::mutate(
+        fire_ha_plot = pmax(fire_ha, 0.01),
+        FWI_label    = factor(paste0("FWI = ",  FWI_bin),        levels = fwi_lvls),
+        EWS_label    = factor(paste0("EWS ", EWS_bin, " km/h"),  levels = ews_lvls)
+      ) |>
+      dplyr::filter(!is.na(FWI_label), !is.na(EWS_label))
+    if (nrow(obs_plot) == 0) obs_plot <- NULL
+  }
+
+  n_obs <- if (!is.null(obs_plot)) nrow(obs_plot) else 0L
+
   p <- ggplot(df, aes(FWI_label, fire_ha_plot, fill = FWI_label)) +
     geom_violin(scale = "width", alpha = 0.55, colour = NA) +
     geom_boxplot(width = 0.18, outlier.shape = NA,
                  colour = "grey20", fill = "white", alpha = 0.8) +
-    geom_jitter(width = 0.12, alpha = 0.5, size = 1.5, colour = "grey30") +
+    geom_jitter(width = 0.12, alpha = 0.4, size = 1.4, colour = "grey50") +
+    # Observed GeoMAC fires — navy triangles, placed on correct FWI x EWS facet
+    {if (!is.null(obs_plot))
+      geom_jitter(data        = obs_plot,
+                  mapping     = aes(x = FWI_label, y = fire_ha_plot),
+                  inherit.aes = FALSE,
+                  shape = 17, colour = "#08306b", alpha = 0.75,
+                  size  = 2.2, width = 0.15)
+    } +
     facet_wrap(~ EWS_label, nrow = 1) +
     scale_y_log10(
       labels = scales::comma,
       breaks = c(0.1, 1, 10, 100, 1000, 10000)
     ) +
     scale_fill_brewer(palette = "YlOrRd", guide = "none") +
-    # Plausible size reference bands
+    # Plausible size reference band
     annotate("rect", xmin = -Inf, xmax = Inf, ymin = 10, ymax = 5000,
              fill = "#2c5f2e", alpha = 0.07) +
-    annotate("text", x = 0.6, y = 50, label = "Plausible\n10–5000 ha",
+    annotate("text", x = 0.6, y = 50, label = "Plausible\n10-5000 ha",
              size = 3, colour = "#2c5f2e", hjust = 0) +
-    # Optional observed reference lines
+    # Optional FPA FOD reference lines (overall P50 / P90, not faceted)
     {if (!is.null(reference_p50))
       geom_hline(yintercept = reference_p50, linetype = "dashed",
                  colour = "#2171b5", linewidth = 0.7)
@@ -833,15 +858,16 @@ plot_fire_ensemble <- function(ensemble_df,
     labs(
       title    = "Fire Size Distribution — Simulation Ensemble",
       subtitle = sprintf(
-        "Each scenario: %d runs, 100×100 cell grid.  Median = %.1f ha  |  90th pct = %.1f ha",
-        dplyr::n_distinct(df$rep), med_ha, p90_ha
+        "Each scenario: %d runs, 100x100 cell grid.  Sim median = %.1f ha  |  Sim P90 = %.1f ha%s",
+        dplyr::n_distinct(df$rep), med_ha, p90_ha,
+        if (n_obs > 0) sprintf("  |  %d observed GeoMAC fires (triangles)", n_obs) else ""
       ),
       x        = NULL,
       y        = "Fire size (ha, log scale)",
       caption  = paste0(
-        "Facets = effective wind speed scenarios. ",
-        if (!is.null(reference_p50)) sprintf("Blue dashed = observed P50 (%.0f ha). ", reference_p50) else "",
-        "Green band = plausible Cascades range."
+        "Grey = simulated fires; navy triangles = observed GeoMAC fires binned to nearest FWI/EWS scenario. ",
+        if (!is.null(reference_p50)) sprintf("Blue dashed = FPA P50 (%.0f ha). ", reference_p50) else "",
+        "Green band = plausible range."
       )
     ) +
     theme_bw(base_size = 12) +
