@@ -641,6 +641,221 @@ plot_fire_map <- function(sim) {
 
 
 # =============================================================================
+# SpreadProbability response-surface heatmap (FWI × EWS)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# plot_sp_heatmap
+#
+# 2-D heatmap of P(spread) across the full FWI × EWS space. White contour
+# lines mark the 10 / 25 / 50 / 75 % probability levels. The shaded region
+# marks the "plausible Cascades operating window" (FWI 10-40, EWS 5-35 km/h).
+# More informative than line plots because it shows the joint response and
+# makes it immediately visible if P is already near 1 across the whole space.
+# -----------------------------------------------------------------------------
+
+plot_sp_heatmap <- function(sp_b0, sp_b1, sp_b2, sp_b3, ff_val = 0.5) {
+
+  df <- expand.grid(FWI = seq(0, 50, 0.5), EWS = seq(0, 50, 0.5)) |>
+    dplyr::mutate(
+      Pspread = 1 / (1 + exp(-(sp_b0 + sp_b1 * FWI + sp_b2 * ff_val + sp_b3 * EWS)))
+    )
+
+  # P(spread) at the center of the plausible operating window
+  p_center <- 1 / (1 + exp(-(sp_b0 + sp_b1 * 25 + sp_b2 * ff_val + sp_b3 * 20)))
+  sub_txt  <- sprintf(
+    "B0=%.3f  B1=%.4f  B2=%.4f  B3=%.4f  FF=%.2f  |  P at FWI=25,EWS=20: %.2f",
+    sp_b0, sp_b1, sp_b2, sp_b3, ff_val, p_center
+  )
+
+  ggplot(df, aes(FWI, EWS, fill = Pspread)) +
+    geom_tile() +
+    # Operating window outline
+    annotate("rect", xmin = 10, xmax = 40, ymin = 5, ymax = 35,
+             fill = NA, colour = "white", linewidth = 0.8, linetype = "dashed") +
+    annotate("text", x = 10.5, y = 34.5,
+             label = "Typical\noperating\nwindow",
+             hjust = 0, vjust = 1, size = 3, colour = "white") +
+    # Contour lines at key probabilities
+    geom_contour(aes(z = Pspread), breaks = c(0.10, 0.25, 0.50, 0.75),
+                 colour = "white", linewidth = 0.5, linetype = "solid") +
+    geom_contour(aes(z = Pspread), breaks = 0.50,
+                 colour = "white", linewidth = 1.2) +
+    scale_fill_gradientn(
+      name   = "P(spread)",
+      colours = c("#fff7bc", "#fec44f", "#fe9929", "#d95f0e", "#993404"),
+      limits  = c(0, 1),
+      labels  = scales::percent,
+      guide   = guide_colorbar(barwidth = 12, barheight = 0.8,
+                               title.position = "top", title.hjust = 0.5)
+    ) +
+    labs(
+      title    = "Spread Probability — FWI × EWS Response Surface",
+      subtitle = sub_txt,
+      x        = "FWI (fire weather index)",
+      y        = "Effective Wind Speed (km/h)",
+      caption  = sprintf(
+        "White contours at P = 10%%, 25%%, 50%% (bold), 75%%.  FineFuels fixed at %.2f.",
+        ff_val
+      )
+    ) +
+    coord_cartesian(expand = FALSE) +
+    theme_bw(base_size = 12) +
+    theme(
+      legend.position  = "bottom",
+      plot.subtitle    = element_text(size = 9, colour = "grey40"),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank()
+    )
+}
+
+
+# =============================================================================
+# Fire size distribution — simulation ensemble
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# run_fire_ensemble
+#
+# Runs the cellular-automaton fire simulation across a grid of FWI × EWS
+# conditions, with multiple random seeds per cell, to build a fire size
+# distribution under the current parameter set.
+#
+# Returns a data.frame with columns:
+#   FWI, EWS, rep, fire_ha, days, p_spread, msa_ha
+# -----------------------------------------------------------------------------
+
+run_fire_ensemble <- function(fwi_vals     = c(5, 15, 25, 35),
+                               ews_vals     = c(5, 15, 25),
+                               ff_val       = 0.5,
+                               n_reps       = 12,
+                               msa_b0, msa_b1, msa_b2,
+                               sp_b0, sp_b1, sp_b2, sp_b3,
+                               cell_area_ha = 0.09,
+                               progress_fn  = NULL) {
+
+  scenarios <- expand.grid(FWI = fwi_vals, EWS = ews_vals,
+                            stringsAsFactors = FALSE)
+  n_total   <- nrow(scenarios) * n_reps
+  results   <- vector("list", n_total)
+  k <- 0L
+
+  for (i in seq_len(nrow(scenarios))) {
+    fwi <- scenarios$FWI[i]
+    ews <- scenarios$EWS[i]
+    for (rep in seq_len(n_reps)) {
+      k <- k + 1L
+      if (!is.null(progress_fn)) progress_fn(k, n_total)
+      sim <- simulate_fire_simple(
+        fwi          = fwi,
+        ews          = ews,
+        ff           = ff_val,
+        seed         = rep * 997L + i,   # deterministic but varied seeds
+        msa_b0       = msa_b0, msa_b1 = msa_b1, msa_b2 = msa_b2,
+        sp_b0        = sp_b0,  sp_b1  = sp_b1,
+        sp_b2        = sp_b2,  sp_b3  = sp_b3,
+        cell_area_ha = cell_area_ha,
+        max_days     = 90
+      )
+      results[[k]] <- data.frame(
+        FWI      = fwi,
+        EWS      = ews,
+        rep      = rep,
+        fire_ha  = sim$total_ha,
+        days     = sim$days,
+        p_spread = sim$p_spread,
+        msa_ha   = sim$msa_ha
+      )
+    }
+  }
+  do.call(rbind, results)
+}
+
+
+# -----------------------------------------------------------------------------
+# plot_fire_ensemble
+#
+# Violin + box + jitter plot of fire sizes from run_fire_ensemble(), faceted
+# by EWS level. Plausible size reference lines are shown in green.
+# Optional reference_p50 / reference_p90 draw observed FPA FOD quantiles.
+# -----------------------------------------------------------------------------
+
+plot_fire_ensemble <- function(ensemble_df,
+                                reference_p50 = NULL,
+                                reference_p90 = NULL) {
+
+  if (is.null(ensemble_df) || nrow(ensemble_df) == 0)
+    return(ggplot() + labs(title = "Click 'Run Ensemble' to generate fire size distribution.") + theme_bw())
+
+  max_possible <- 100 * 100 * ensemble_df$msa_ha[1] / ensemble_df$msa_ha[1]   # grid_dim^2 * cell_area
+  # Retrieve the actual grid cap from data
+  grid_ha <- 100 * 100 * (ensemble_df$fire_ha / (100 * 100))   # reconstruct cell_area_ha
+  # Simpler: compute from msa column and cell size not stored — just note in plot
+
+  df <- ensemble_df |>
+    dplyr::mutate(
+      FWI_label = factor(paste0("FWI = ", FWI),
+                          levels = paste0("FWI = ", sort(unique(FWI)))),
+      EWS_label = factor(paste0("EWS ", EWS, " km/h"),
+                          levels = paste0("EWS ", sort(unique(EWS)), " km/h")),
+      fire_ha_plot = pmax(fire_ha, 0.01)   # avoid log(0)
+    )
+
+  # Compute median and 90th pct for subtitle
+  med_ha <- round(stats::median(df$fire_ha), 1)
+  p90_ha <- round(stats::quantile(df$fire_ha, 0.90), 1)
+
+  p <- ggplot(df, aes(FWI_label, fire_ha_plot, fill = FWI_label)) +
+    geom_violin(scale = "width", alpha = 0.55, colour = NA) +
+    geom_boxplot(width = 0.18, outlier.shape = NA,
+                 colour = "grey20", fill = "white", alpha = 0.8) +
+    geom_jitter(width = 0.12, alpha = 0.5, size = 1.5, colour = "grey30") +
+    facet_wrap(~ EWS_label, nrow = 1) +
+    scale_y_log10(
+      labels = scales::comma,
+      breaks = c(0.1, 1, 10, 100, 1000, 10000)
+    ) +
+    scale_fill_brewer(palette = "YlOrRd", guide = "none") +
+    # Plausible size reference bands
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = 10, ymax = 5000,
+             fill = "#2c5f2e", alpha = 0.07) +
+    annotate("text", x = 0.6, y = 50, label = "Plausible\n10–5000 ha",
+             size = 3, colour = "#2c5f2e", hjust = 0) +
+    # Optional observed reference lines
+    {if (!is.null(reference_p50))
+      geom_hline(yintercept = reference_p50, linetype = "dashed",
+                 colour = "#2171b5", linewidth = 0.7)
+    } +
+    {if (!is.null(reference_p90))
+      geom_hline(yintercept = reference_p90, linetype = "dotted",
+                 colour = "#2171b5", linewidth = 0.7)
+    } +
+    labs(
+      title    = "Fire Size Distribution — Simulation Ensemble",
+      subtitle = sprintf(
+        "Each scenario: %d runs, 100×100 cell grid.  Median = %.1f ha  |  90th pct = %.1f ha",
+        dplyr::n_distinct(df$rep), med_ha, p90_ha
+      ),
+      x        = NULL,
+      y        = "Fire size (ha, log scale)",
+      caption  = paste0(
+        "Facets = effective wind speed scenarios. ",
+        if (!is.null(reference_p50)) sprintf("Blue dashed = observed P50 (%.0f ha). ", reference_p50) else "",
+        "Green band = plausible Cascades range."
+      )
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      legend.position   = "none",
+      axis.text.x       = element_text(angle = 30, hjust = 1, size = 9),
+      strip.background  = element_rect(fill = "#f0f0f0"),
+      plot.subtitle     = element_text(size = 9, colour = "grey40")
+    )
+  p
+}
+
+
+# =============================================================================
 # SCF snippet builder
 # =============================================================================
 

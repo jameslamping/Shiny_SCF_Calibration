@@ -795,246 +795,6 @@ ui <- page_navbar(
             )
           ),
 
-          # -----------------------------------------------------------------------
-          # Parameter Tuning panel
-          # -----------------------------------------------------------------------
-          nav_panel("Parameter Tuning",
-            br(),
-            fluidRow(
-              column(12,
-                fluidRow(
-                  column(4,
-                    actionButton("load_tuning_from_cal", "← Load from Calibration",
-                                 class = "btn-outline-primary btn-sm w-100",
-                                 icon  = icon("download"))
-                  ),
-                  column(8,
-                    p(class = "text-muted small mb-0",
-                      "Adjust coefficients interactively and see the equations update in ",
-                      "real time. Click ", tags$b("← Load from Calibration"), " to seed ",
-                      "inputs from the fitted models. Use the fire simulation to sanity-check ",
-                      "fire size before running LANDIS.")
-                  )
-                )
-              )
-            ),
-            br(),
-            fluidRow(
-
-              # ---- Left: coefficient controls --------------------------------
-              column(4,
-                bslib::accordion(
-                  open   = "msa_acc",
-                  multiple = TRUE,
-
-                  # MaxSpreadArea
-                  bslib::accordion_panel(
-                    title = tagList(icon("arrows-up-down"), " Max Spread Area"),
-                    value = "msa_acc",
-                    uiOutput("tune_msa_badges"),
-                    numericInput("tune_msa_b0", "B0 — Intercept (ha)",
-                                 value = 500, step = 10),
-                    numericInput("tune_msa_b1", "B1 × FWI (ha per FWI unit)",
-                                 value = 15, step = 1),
-                    numericInput("tune_msa_b2", "B2 × EWS (ha per km/h)",
-                                 value = 3, step = 0.5),
-                    p(class = "text-muted small",
-                      "B1 and B2 must be positive. MSA is the daily spread ",
-                      "ceiling in hectares. Negative MSA is clamped to 0 by SCF.")
-                  ),
-
-                  # SpreadProbability
-                  bslib::accordion_panel(
-                    title = tagList(icon("fire"), " Spread Probability"),
-                    value = "sp_acc",
-                    uiOutput("tune_sp_badges"),
-                    numericInput("tune_sp_b0", "B0 — Intercept (logit)",
-                                 value = -3.5, step = 0.1),
-                    numericInput("tune_sp_b1", "B1 × FWI",
-                                 value = 0.07, step = 0.01),
-                    numericInput("tune_sp_b2", "B2 × FineFuels (0-1 scale)",
-                                 value = 0, step = 0.1),
-                    numericInput("tune_sp_b3", "B3 × EWS (km/h)",
-                                 value = 0.05, step = 0.01),
-                    numericInput("tune_sp_ff_preview",
-                                 "FineFuels value for surface plot",
-                                 value = 0.5, min = 0, max = 1, step = 0.1),
-                    p(class = "text-muted small",
-                      "If calibrated with FF=1 placeholder, consider setting ",
-                      "B2=0 and adjusting B0 by adding old B2×1.0.")
-                  ),
-
-                  # Site Mortality
-                  bslib::accordion_panel(
-                    title = tagList(icon("skull-crossbones"), " Site Mortality (dNBR)"),
-                    value = "sm_acc",
-                    p(class = "text-muted small",
-                      "dNBR = 1 / (B0 + B1·Clay + B2·ET + B3·EWS + B4·CWD + B5·FF + B6·LF)",
-                      br(), "Negative denominator → dNBR capped at 2000."),
-                    numericInput("tune_sm_b0", "B0 — Intercept",
-                                 value = 0.003, step = 0.0001),
-                    numericInput("tune_sm_b1", "B1 × Clay (fraction 0-1)",
-                                 value = 0.013, step = 0.001),
-                    numericInput("tune_sm_b2", "B2 × ET (mm/yr)",
-                                 value = 0, step = 0.000001),
-                    numericInput("tune_sm_b3", "B3 × EWS (km/h)",
-                                 value = -0.000024, step = 0.000001),
-                    numericInput("tune_sm_b4", "B4 × CWD (mm)",
-                                 value = 0.0000022, step = 0.0000001),
-                    numericInput("tune_sm_b5", "B5 × FineFuels (0-1)",
-                                 value = 0, step = 0.0001),
-                    numericInput("tune_sm_b6", "B6 × LadderFuels (g C/m²)",
-                                 value = 0, step = 0.0001),
-                    p(class = "text-muted small",
-                      "B6 units: LANDIS LadderFuels is biomass (g C/m²), NOT a",
-                      " normalized 0-1 index. Set to 0 if calibrated on LANDFIRE CBH.")
-                  ),
-
-                  # Cohort Mortality
-                  bslib::accordion_panel(
-                    title = tagList(icon("tree"), " Cohort Mortality"),
-                    value = "cm_acc",
-                    uiOutput("tune_cm_badges"),
-                    p(class = "text-muted small",
-                      "P(mort) = logistic(B0 + B1·BarkThickness + B2·dNBR)"),
-                    numericInput("tune_cm_b0", "B0 — Intercept (logit)",
-                                 value = -2, step = 0.1),
-                    numericInput("tune_cm_b1", "B1 × BarkThickness (cm) — should be negative",
-                                 value = -1, step = 0.1),
-                    numericInput("tune_cm_b2", "B2 × dNBR — should be positive",
-                                 value = 0.003, step = 0.001)
-                  ),
-
-                  # Context
-                  bslib::accordion_panel(
-                    title = tagList(icon("gear"), " Context / Preview Settings"),
-                    value = "ctx_acc",
-
-                    h6("Fine Fuels Scaling"),
-                    numericInput("tune_max_ff", "MaximumFineFuels (g C m⁻²)",
-                                 value = 500, min = 1, step = 100),
-                    p(class = "text-muted small",
-                      "SCF divides LANDIS FineFuels output by this value to get the",
-                      " 0-1 scale used in the spread and mortality equations.",
-                      " Cells with raw FF ≥ MaxFF are clamped to FF_scaled = 1.0.",
-                      " If your LANDIS output routinely exceeds this, B2 becomes",
-                      " a constant offset — raise MaxFF to match your actual range."),
-                    numericInput("tune_observed_max_ff",
-                                 "Observed LANDIS FineFuels max (g C/m², optional)",
-                                 value = NA, min = 0, step = 500),
-                    p(class = "text-muted small",
-                      "Paste the max value from your SCF FineFuels output layer.",
-                      " Used in the FF Scaling plot to show what fraction of your",
-                      " landscape is already at FF_scaled = 1.0 with the current MaxFF."),
-
-                    hr(),
-                    numericInput("tune_cell_area", "Cell Area (ha)",
-                                 value = 0.09, min = 0.001, step = 0.01),
-                    p(class = "text-muted small", "30 m = 0.09 ha | 90 m = 0.81 ha"),
-                    hr(),
-                    h6("Typical predictor values (for dNBR preview)"),
-                    numericInput("tune_clay",  "Clay (fraction 0-1)", value = 0.064,  min = 0, max = 1, step = 0.01),
-                    numericInput("tune_cwd",   "CWD (mm)",            value = 12,     min = 0, step = 1),
-                    numericInput("tune_et",    "ET (mm/yr)",          value = 50,     min = 0, step = 5),
-                    numericInput("tune_ff_sm", "FineFuels (0-1, for dNBR preview)", value = 0.3, min = 0, max = 1, step = 0.05)
-                  )
-                ),
-
-                hr(),
-                downloadButton("dl_tuning_snippet", "Export SCF Parameter Snippet",
-                               class = "btn-outline-secondary btn-sm w-100",
-                               icon  = icon("file-export"))
-              ),
-
-              # ---- Right: plots -----------------------------------------------
-              column(8,
-                navset_pill(
-                  id = "tuning_plot_tabs",
-
-                  nav_panel("Max Spread Area",
-                    br(),
-                    plotOutput("tune_msa_plot", height = "380px"),
-                    br(),
-                    uiOutput("tune_msa_table_ui")
-                  ),
-
-                  nav_panel("Spread Probability",
-                    br(),
-                    fluidRow(
-                      column(12,
-                        plotOutput("tune_sp_plot", height = "320px")
-                      )
-                    ),
-                    br(),
-                    fluidRow(
-                      column(12,
-                        plotOutput("tune_sp_ff_plot", height = "300px")
-                      )
-                    )
-                  ),
-
-                  nav_panel("FF Scaling",
-                    br(),
-                    p(class = "text-muted small",
-                      tags$b("What MaximumFineFuels actually does:"),
-                      " SCF computes FF_scaled = min(FineFuels / MaxFF, 1.0) before",
-                      " plugging into the spread probability and site mortality equations.",
-                      " If MaxFF is too low relative to your LANDIS outputs, most cells",
-                      " are clamped at FF_scaled = 1.0 — B2 becomes a constant shift,",
-                      " not a real fuel signal. Set MaxFF in the Context panel and",
-                      " enter your observed LANDIS maximum to see the saturation problem."),
-                    uiOutput("tune_ff_saturation_banner"),
-                    br(),
-                    plotOutput("tune_ff_scaling_plot", height = "520px")
-                  ),
-
-                  nav_panel("Site Mortality",
-                    br(),
-                    plotOutput("tune_dnbr_plot", height = "340px"),
-                    br(),
-                    h6("dNBR sensitivity table"),
-                    p(class = "text-muted small",
-                      "At typical predictor values, varying LadderFuels (g C/m²)."),
-                    tableOutput("tune_dnbr_table")
-                  ),
-
-                  nav_panel("Cohort Mortality",
-                    br(),
-                    plotOutput("tune_cm_plot", height = "380px")
-                  ),
-
-                  nav_panel("Fire Simulation",
-                    br(),
-                    fluidRow(
-                      column(4,
-                        sliderInput("tune_sim_fwi", "FWI", min = 0, max = 50,
-                                    value = 20, step = 1)
-                      ),
-                      column(4,
-                        sliderInput("tune_sim_ews", "EWS (km/h)", min = 0, max = 50,
-                                    value = 15, step = 1)
-                      ),
-                      column(4,
-                        sliderInput("tune_sim_ff",  "FineFuels (0-1)", min = 0, max = 1,
-                                    value = 0.5, step = 0.05)
-                      )
-                    ),
-                    uiOutput("tune_sim_summary_ui"),
-                    br(),
-                    fluidRow(
-                      column(7,
-                        plotOutput("tune_sim_timeline_plot", height = "300px")
-                      ),
-                      column(5,
-                        plotOutput("tune_sim_map_plot", height = "300px")
-                      )
-                    )
-                  )
-                )
-              )
-            )
-          ),
-
           nav_panel("Terrain",
             br(),
             p(class = "text-muted small",
@@ -1675,6 +1435,309 @@ ui <- page_navbar(
             br(),
             downloadButton("dl_val_duration", "Download PNG (300 dpi)",
                            class = "btn-sm btn-outline-secondary")
+          )
+        )
+      )
+    )
+  ),
+
+  # ===========================================================================
+  # Parameter Tuning — interactive equation explorer
+  # ===========================================================================
+  nav_panel(
+    title = "Parameter Tuning",
+    icon  = icon("sliders"),
+
+    layout_columns(
+      col_widths = c(3, 9),
+
+      # ---- Left: coefficient inputs -----------------------------------------
+      card(
+        card_header(tagList(icon("sliders"), " Parameters")),
+        actionButton("load_tuning_from_cal", "← Load from Calibration",
+                     class = "btn-outline-primary btn-sm w-100",
+                     icon  = icon("download")),
+        p(class = "text-muted small mt-2 mb-0",
+          "Defaults are a working starting point. Click above to overwrite",
+          " with your current calibration fits."),
+        hr(),
+
+        bslib::accordion(
+          open     = "msa_acc",
+          multiple = TRUE,
+
+          # -- MaxSpreadArea
+          bslib::accordion_panel(
+            title = tagList(icon("arrows-up-down"), " Max Spread Area"),
+            value = "msa_acc",
+            uiOutput("tune_msa_badges"),
+            numericInput("tune_msa_b0", "B0 — Intercept (ha)",
+                         value = 300, step = 10),
+            numericInput("tune_msa_b1", "B1 × FWI (ha per unit)",
+                         value = 10, step = 1),
+            numericInput("tune_msa_b2", "B2 × EWS (ha per km/h)",
+                         value = 6, step = 0.5),
+            p(class = "text-muted small",
+              "B1 and B2 must be positive. Daily spread ceiling in hectares.",
+              " Negative MSA is clamped to 0 by SCF.")
+          ),
+
+          # -- SpreadProbability
+          bslib::accordion_panel(
+            title = tagList(icon("fire"), " Spread Probability"),
+            value = "sp_acc",
+            uiOutput("tune_sp_badges"),
+            numericInput("tune_sp_b0", "B0 — Intercept (logit)",
+                         value = -23, step = 0.5),
+            numericInput("tune_sp_b1", "B1 × FWI",
+                         value = 0.5, step = 0.01),
+            numericInput("tune_sp_b2", "B2 × FineFuels (0-1 scale)",
+                         value = 0.7, step = 0.1),
+            numericInput("tune_sp_b3", "B3 × EWS (km/h)",
+                         value = 0.3, step = 0.01),
+            numericInput("tune_sp_ff_preview",
+                         "FineFuels for surface plots (0-1)",
+                         value = 0.5, min = 0, max = 1, step = 0.1),
+            p(class = "text-muted small",
+              "If calibrated with FF=1 placeholder, set B2=0",
+              " and add old B2×1.0 to B0.")
+          ),
+
+          # -- Site Mortality
+          bslib::accordion_panel(
+            title = tagList(icon("skull-crossbones"), " Site Mortality (dNBR)"),
+            value = "sm_acc",
+            p(class = "text-muted small",
+              "dNBR = 1 / (B0 + B1·Clay + B2·ET + B3·EWS + B4·CWD + B5·FF + B6·LF)",
+              br(), "Negative denominator → dNBR capped at 2000."),
+            numericInput("tune_sm_b0", "B0 — Intercept",
+                         value = 0.009, step = 0.001),
+            numericInput("tune_sm_b1", "B1 × Clay (0-1)",
+                         value = 0.0005, step = 0.0001),
+            numericInput("tune_sm_b2", "B2 × ET (mm/yr)",
+                         value = -0.00001, step = 0.000001),
+            numericInput("tune_sm_b3", "B3 × EWS (km/h)",
+                         value = -0.0002, step = 0.00001),
+            numericInput("tune_sm_b4", "B4 × CWD (mm)",
+                         value = -0.000001, step = 0.0000001),
+            numericInput("tune_sm_b5", "B5 × FineFuels (0-1)",
+                         value = 0.00005, step = 0.00001),
+            numericInput("tune_sm_b6", "B6 × LadderFuels (g C/m²)",
+                         value = -0.000002, step = 0.0000001),
+            p(class = "text-muted small",
+              "B6 units: LANDIS LadderFuels is raw biomass (g C/m²).",
+              " Set to 0 if calibrated on a normalized 0-1 index.")
+          ),
+
+          # -- Cohort Mortality
+          bslib::accordion_panel(
+            title = tagList(icon("tree"), " Cohort Mortality"),
+            value = "cm_acc",
+            uiOutput("tune_cm_badges"),
+            p(class = "text-muted small",
+              "P(mort) = logistic(B0 + B1·BarkThickness + B2·dNBR)"),
+            numericInput("tune_cm_b0", "B0 — Intercept (logit)",
+                         value = 0.205, step = 0.1),
+            numericInput("tune_cm_b1", "B1 × BarkThickness (cm)",
+                         value = -0.954, step = 0.1),
+            numericInput("tune_cm_b2", "B2 × dNBR",
+                         value = 0.003, step = 0.001)
+          ),
+
+          # -- Context / Settings
+          bslib::accordion_panel(
+            title = tagList(icon("gear"), " Context / Settings"),
+            value = "ctx_acc",
+
+            h6("Fine Fuels Scaling"),
+            numericInput("tune_max_ff", "MaximumFineFuels (g C m⁻²)",
+                         value = 18000, min = 1, step = 500),
+            p(class = "text-muted small",
+              "SCF computes FF_scaled = min(FF_raw / MaxFF, 1.0).",
+              " Setting MaxFF too low saturates B2 — see the",
+              tags$b(" Fine Fuels tab"), " for the scaling diagnostic."),
+            numericInput("tune_observed_max_ff",
+                         "Observed LANDIS FineFuels max (g C/m², optional)",
+                         value = NA, min = 0, step = 500),
+            hr(),
+            numericInput("tune_cell_area", "Cell Area (ha)",
+                         value = 0.81, min = 0.001, step = 0.01),
+            p(class = "text-muted small",
+              "30 m = 0.09 ha  |  90 m = 0.81 ha"),
+            hr(),
+            h6("Typical predictor values (dNBR preview)"),
+            numericInput("tune_clay",  "Clay (fraction 0-1)",
+                         value = 0.064, min = 0, max = 1, step = 0.01),
+            numericInput("tune_cwd",   "CWD (mm)",
+                         value = 12, min = 0, step = 1),
+            numericInput("tune_et",    "ET (mm/yr)",
+                         value = 50, min = 0, step = 5),
+            numericInput("tune_ff_sm", "FineFuels for dNBR preview (0-1)",
+                         value = 0.3, min = 0, max = 1, step = 0.05)
+          )
+        ),
+
+        hr(),
+        downloadButton("dl_tuning_snippet",
+                       "Export SCF Parameter Snippet",
+                       class = "btn-outline-secondary btn-sm w-100",
+                       icon  = icon("file-export"))
+      ),
+
+      # ---- Right: output tabs -----------------------------------------------
+      card(
+        full_screen = TRUE,
+        card_header(tagList(icon("chart-line"), " Equation Diagnostics")),
+
+        navset_tab(
+          id = "tuning_plot_tabs",
+
+          # ---- Overview dashboard -------------------------------------------
+          nav_panel("Overview",
+            br(),
+            uiOutput("tune_overview_badges_ui"),
+            br(),
+            fluidRow(
+              column(6,
+                h6("Key outputs at typical Cascades conditions"),
+                tableOutput("tune_overview_table")
+              ),
+              column(6,
+                h6("Sign guide — what each coefficient should be"),
+                tags$table(class = "table table-sm table-bordered small",
+                  tags$thead(tags$tr(
+                    tags$th("Parameter"), tags$th("Sign"), tags$th("Reason")
+                  )),
+                  tags$tbody(
+                    tags$tr(tags$td("MSA B1 (FWI)"),    tags$td(tags$span(class="text-success","+")), tags$td("Higher FWI → larger daily burn ceiling")),
+                    tags$tr(tags$td("MSA B2 (EWS)"),    tags$td(tags$span(class="text-success","+")), tags$td("Stronger wind → larger daily burn ceiling")),
+                    tags$tr(tags$td("SP B1 (FWI)"),     tags$td(tags$span(class="text-success","+")), tags$td("Drier fuel → more likely to spread")),
+                    tags$tr(tags$td("SP B2 (FF)"),      tags$td(tags$span(class="text-success","+")), tags$td("More fuel → more likely to spread")),
+                    tags$tr(tags$td("SP B3 (EWS)"),     tags$td(tags$span(class="text-success","+")), tags$td("Stronger wind → more likely to spread")),
+                    tags$tr(tags$td("SM B0 (intercept)"), tags$td(tags$span(class="text-success","+")), tags$td("Must be positive or dNBR is always capped")),
+                    tags$tr(tags$td("SM B3 (EWS)"),     tags$td(tags$span(class="text-danger","−")),  tags$td("More wind → higher severity (inverse link)")),
+                    tags$tr(tags$td("CM B1 (BT)"),      tags$td(tags$span(class="text-danger","−")),  tags$td("Thicker bark protects from mortality")),
+                    tags$tr(tags$td("CM B2 (dNBR)"),    tags$td(tags$span(class="text-success","+")), tags$td("Higher severity kills more cohorts"))
+                  )
+                )
+              )
+            )
+          ),
+
+          # ---- Max Spread Area ----------------------------------------------
+          nav_panel("Max Spread Area",
+            br(),
+            plotOutput("tune_msa_plot", height = "360px"),
+            br(),
+            h6("Scenario table (ha/day)"),
+            uiOutput("tune_msa_table_ui")
+          ),
+
+          # ---- Spread Probability -------------------------------------------
+          nav_panel("Spread Probability",
+            br(),
+            fluidRow(
+              column(6,
+                h6("P(spread) vs FWI — line plot"),
+                plotOutput("tune_sp_plot", height = "280px")
+              ),
+              column(6,
+                h6("P(spread) — FWI × EWS response surface"),
+                plotOutput("tune_sp_heatmap", height = "280px")
+              )
+            ),
+            br(),
+            h6("FineFuels sensitivity (FF = 0 → 1)"),
+            plotOutput("tune_sp_ff_plot", height = "260px")
+          ),
+
+          # ---- Fine Fuels scaling -------------------------------------------
+          nav_panel("Fine Fuels",
+            br(),
+            p(class = "text-muted small",
+              tags$b("What MaximumFineFuels actually does: "),
+              "SCF computes FF_scaled = min(FF_raw / MaxFF, 1.0) before using FineFuels ",
+              "in the spread probability and site mortality equations. If MaxFF is set ",
+              "below your typical LANDIS FineFuels output, most cells will be clamped ",
+              "at FF_scaled = 1.0 and B2 becomes a constant offset — indistinguishable ",
+              "from the FF = 1.0 calibration placeholder problem. Enter your observed ",
+              "LANDIS maximum in the Context panel to see the saturation level."),
+            uiOutput("tune_ff_saturation_banner"),
+            br(),
+            plotOutput("tune_ff_scaling_plot", height = "500px")
+          ),
+
+          # ---- Site Mortality -----------------------------------------------
+          nav_panel("Site Mortality",
+            br(),
+            plotOutput("tune_dnbr_plot", height = "320px"),
+            br(),
+            h6("dNBR sensitivity — varying LadderFuels at EWS = 15 km/h"),
+            tableOutput("tune_dnbr_table")
+          ),
+
+          # ---- Cohort Mortality ---------------------------------------------
+          nav_panel("Cohort Mortality",
+            br(),
+            plotOutput("tune_cm_plot", height = "400px")
+          ),
+
+          # ---- Single fire simulation ---------------------------------------
+          nav_panel("Fire Simulation",
+            br(),
+            p(class = "text-muted small",
+              "Single fire on a 100×100 cell grid starting from the centre.",
+              " Updates live as you move any coefficient slider.",
+              " FineFuels slider is on the 0-1 scale (FF_raw / MaxFF)."),
+            fluidRow(
+              column(4,
+                sliderInput("tune_sim_fwi", "FWI",
+                            min = 0, max = 50, value = 20, step = 1)
+              ),
+              column(4,
+                sliderInput("tune_sim_ews", "EWS (km/h)",
+                            min = 0, max = 50, value = 15, step = 1)
+              ),
+              column(4,
+                sliderInput("tune_sim_ff", "FineFuels (0-1 scaled)",
+                            min = 0, max = 1, value = 0.5, step = 0.05)
+              )
+            ),
+            uiOutput("tune_sim_summary_ui"),
+            br(),
+            fluidRow(
+              column(7, plotOutput("tune_sim_timeline_plot", height = "280px")),
+              column(5, plotOutput("tune_sim_map_plot",      height = "280px"))
+            )
+          ),
+
+          # ---- Fire size distribution (ensemble) ----------------------------
+          nav_panel("Fire Size Distribution",
+            br(),
+            p(class = "text-muted small",
+              "Runs the spread simulation repeatedly across a grid of FWI and",
+              " EWS conditions. Reveals the full fire size distribution, not just",
+              " a single scenario — useful for checking whether the parameter set",
+              " produces realistic fire sizes across the range of fire-weather conditions."),
+            fluidRow(
+              column(3,
+                numericInput("tune_ens_reps", "Runs per scenario",
+                             value = 12, min = 5, max = 50, step = 1),
+                p(class = "text-muted small",
+                  "More runs = smoother distributions but slower (~1s per 10 runs)."),
+                sliderInput("tune_ens_ff", "FineFuels (0-1 scaled)",
+                            min = 0, max = 1, value = 0.5, step = 0.05),
+                br(),
+                actionButton("run_ensemble", "Run Ensemble",
+                             class = "btn-success w-100",
+                             icon  = icon("play")),
+                br(), br(),
+                uiOutput("tune_ens_status_ui")
+              ),
+              column(9,
+                plotOutput("tune_ensemble_plot", height = "420px")
+              )
+            )
           )
         )
       )
@@ -4247,6 +4310,133 @@ server <- function(input, output, session) {
     sim <- tune_sim_r()
     req(!is.null(sim))
     plot_fire_map(sim)
+  })
+
+  # ---------------------------------------------------------------------------
+  # Overview tab: sign-check badges + summary table
+  # ---------------------------------------------------------------------------
+  output$tune_overview_badges_ui <- renderUI({
+    p <- tuning_r()
+
+    badge <- function(label, ok, ok_msg = "✓", bad_msg = "⚠") {
+      cls <- if (ok) "bg-success" else "bg-danger"
+      txt <- if (ok) ok_msg       else bad_msg
+      tags$span(class = paste("badge me-1 mb-1", cls),
+                style = "font-size:0.85rem;",
+                paste(label, "—", txt))
+    }
+
+    tagList(
+      badge("MSA B1 (FWI)",      is.finite(p$msa_b1) && p$msa_b1 >= 0,
+            "positive ✓", "NEGATIVE ⚠ (wrong)"),
+      badge("MSA B2 (EWS)",      is.finite(p$msa_b2) && p$msa_b2 >= 0,
+            "positive ✓", "NEGATIVE ⚠ (wrong)"),
+      badge("SP B1 (FWI)",       is.finite(p$sp_b1)  && p$sp_b1  >= 0,
+            "positive ✓", "negative ⚠"),
+      badge("SP B2 (FineFuels)", is.finite(p$sp_b2)  && p$sp_b2  >= 0,
+            "positive ✓", "negative ⚠ (may be unidentified)"),
+      badge("SP B3 (EWS)",       is.finite(p$sp_b3)  && p$sp_b3  >= 0,
+            "positive ✓", "negative ⚠"),
+      badge("SM B0 > 0",         is.finite(p$sm_b0)  && p$sm_b0  > 0,
+            "positive ✓", "≤ 0 ⚠ (dNBR always capped at 2000)"),
+      badge("SM B3 (EWS)",       is.finite(p$sm_b3)  && p$sm_b3  < 0,
+            "negative ✓ (inverse link)", "positive ⚠"),
+      badge("CM B1 (BT)",        is.finite(p$cm_b1)  && p$cm_b1  < 0,
+            "negative ✓ (bark protects)", "positive ⚠ (wrong sign)"),
+      badge("CM B2 (dNBR)",      is.finite(p$cm_b2)  && p$cm_b2  > 0,
+            "positive ✓", "negative ⚠ (wrong sign)")
+    )
+  })
+
+  output$tune_overview_table <- renderTable({
+    p <- tuning_r()
+    scenarios <- list(
+      c(FWI = 15, EWS = 10, FF = 0.5),
+      c(FWI = 25, EWS = 20, FF = 0.5),
+      c(FWI = 35, EWS = 30, FF = 0.5)
+    )
+    rows <- lapply(scenarios, function(s) {
+      msa  <- max(0, p$msa_b0 + p$msa_b1 * s["FWI"] + p$msa_b2 * s["EWS"])
+      psp  <- 1 / (1 + exp(-(p$sp_b0 + p$sp_b1 * s["FWI"] +
+                               p$sp_b2 * s["FF"]  + p$sp_b3 * s["EWS"])))
+      # Site mortality at typical site: clay=0.30, ET=300mm, CWD=200mm, LF=50
+      eta  <- tryCatch(
+        p$sm_b0 + p$sm_b1 * 0.30 + p$sm_b2 * 300  +
+        p$sm_b3 * s["EWS"] + p$sm_b4 * 200 +
+        p$sm_b5 * s["FF"]  + p$sm_b6 * 50,
+        error = function(e) NA_real_
+      )
+      dnbr <- if (is.na(eta) || eta <= 0) 2000 else min(1 / eta, 2000)
+      # Cohort mortality for a thin-barked species (BT = 1 cm) at that dNBR
+      pmort <- 1 / (1 + exp(-(p$cm_b0 + p$cm_b1 * 1.0 + p$cm_b2 * dnbr)))
+      data.frame(
+        Scenario       = sprintf("FWI=%d  EWS=%d  FF=%.2f", s["FWI"], s["EWS"], s["FF"]),
+        `MSA (ha/day)` = round(msa, 0),
+        `P(spread)`    = sprintf("%.1f%%", psp * 100),
+        `dNBR`         = round(dnbr, 0),
+        `P(mort BT=1)` = sprintf("%.1f%%", pmort * 100),
+        check.names    = FALSE
+      )
+    })
+    do.call(rbind, rows)
+  }, striped = TRUE, hover = TRUE, bordered = TRUE, spacing = "s", digits = 1)
+
+  # ---------------------------------------------------------------------------
+  # Spread Probability heatmap (FWI × EWS surface)
+  # ---------------------------------------------------------------------------
+  output$tune_sp_heatmap <- renderPlot({
+    p <- tuning_r()
+    plot_sp_heatmap(p$sp_b0, p$sp_b1, p$sp_b2, p$sp_b3, ff_val = p$sp_ff)
+  })
+
+  # ---------------------------------------------------------------------------
+  # Fire size distribution — ensemble
+  # ---------------------------------------------------------------------------
+  ensemble_rv <- reactiveVal(NULL)
+
+  observeEvent(input$run_ensemble, {
+    p      <- isolate(tuning_r())
+    n_reps <- max(5L, min(50L, as.integer(input$tune_ens_reps %||% 12L)))
+    ff_val <- input$tune_ens_ff %||% 0.5
+
+    withProgress(message = "Running fire ensemble…", value = 0, {
+      ens <- run_fire_ensemble(
+        fwi_vals     = c(5, 15, 25, 35),
+        ews_vals     = c(5, 15, 25),
+        ff_val       = ff_val,
+        n_reps       = n_reps,
+        msa_b0       = p$msa_b0, msa_b1 = p$msa_b1, msa_b2 = p$msa_b2,
+        sp_b0        = p$sp_b0,  sp_b1  = p$sp_b1,
+        sp_b2        = p$sp_b2,  sp_b3  = p$sp_b3,
+        cell_area_ha = p$cell_area,
+        progress_fn  = function(k, n) setProgress(k / n)
+      )
+      ensemble_rv(ens)
+    })
+  })
+
+  output$tune_ensemble_plot <- renderPlot({
+    ens <- ensemble_rv()
+    plot_fire_ensemble(ens)
+  })
+
+  output$tune_ens_status_ui <- renderUI({
+    ens <- ensemble_rv()
+    if (is.null(ens)) {
+      tags$p(class = "text-muted small",
+             "Click 'Run Ensemble' to generate fire size distributions.")
+    } else {
+      med_ha <- round(stats::median(ens$fire_ha), 1)
+      p90_ha <- round(stats::quantile(ens$fire_ha, 0.90), 1)
+      n_runs <- nrow(ens)
+      tags$div(
+        class = "alert alert-info p-2 mt-2",
+        style = "font-size:0.82rem;",
+        tags$b(icon("circle-check"), sprintf(" %d runs complete", n_runs)),
+        tags$br(),
+        sprintf("Median: %.1f ha  |  P90: %.1f ha", med_ha, p90_ha)
+      )
+    }
   })
 
   # ---------------------------------------------------------------------------
