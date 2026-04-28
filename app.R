@@ -1595,6 +1595,33 @@ ui <- page_navbar(
         navset_tab(
           id = "tuning_plot_tabs",
 
+          # ---- Observed Targets dashboard -----------------------------------
+          nav_panel("Observed Targets",
+            br(),
+            uiOutput("tune_obs_data_status_ui"),
+            br(),
+            fluidRow(
+              column(6,
+                h6(icon("fire"), " Fire Size Targets (FPA FOD)"),
+                p(class = "text-muted small",
+                  "ECDF of observed fire sizes. The ensemble simulation (Fire Size ",
+                  "Distribution tab) should produce a similar distribution."),
+                plotOutput("tune_obs_fpa_plot", height = "300px"),
+                br(),
+                tableOutput("tune_obs_fpa_table")
+              ),
+              column(6,
+                h6(icon("satellite"), " Burn Severity Targets (MTBS)"),
+                p(class = "text-muted small",
+                  "Observed mean dNBR per fire. The Site Mortality coefficients ",
+                  "should produce dNBR values matching this distribution."),
+                plotOutput("tune_obs_mtbs_plot", height = "300px"),
+                br(),
+                tableOutput("tune_obs_mtbs_table")
+              )
+            )
+          ),
+
           # ---- Overview dashboard -------------------------------------------
           nav_panel("Overview",
             br(),
@@ -1673,7 +1700,20 @@ ui <- page_navbar(
           # ---- Site Mortality -----------------------------------------------
           nav_panel("Site Mortality",
             br(),
-            plotOutput("tune_dnbr_plot", height = "320px"),
+            fluidRow(
+              column(6,
+                h6("Predicted dNBR — equation output"),
+                plotOutput("tune_dnbr_plot", height = "320px")
+              ),
+              column(6,
+                h6(icon("satellite"), " Observed dNBR target — MTBS"),
+                p(class = "text-muted small",
+                  "Histogram of MTBS observed mean dNBR per fire. Tune Site ",
+                  "Mortality coefficients until the predicted dNBR range ",
+                  "overlaps this distribution."),
+                plotOutput("tune_obs_dnbr_plot", height = "320px")
+              )
+            ),
             br(),
             h6("dNBR sensitivity — varying LadderFuels at EWS = 15 km/h"),
             tableOutput("tune_dnbr_table")
@@ -1682,7 +1722,19 @@ ui <- page_navbar(
           # ---- Cohort Mortality ---------------------------------------------
           nav_panel("Cohort Mortality",
             br(),
-            plotOutput("tune_cm_plot", height = "400px")
+            fluidRow(
+              column(7,
+                plotOutput("tune_cm_plot", height = "400px")
+              ),
+              column(5,
+                h6(icon("satellite"), " MTBS severity class breakdown"),
+                p(class = "text-muted small",
+                  "Severity classes from observed MTBS fires — the cohort ",
+                  "mortality curve should produce realistic kill rates at ",
+                  "these dNBR levels."),
+                uiOutput("tune_obs_sev_breakdown_ui")
+              )
+            )
           ),
 
           # ---- Single fire simulation ---------------------------------------
@@ -1721,7 +1773,9 @@ ui <- page_navbar(
               "Runs the spread simulation repeatedly across a grid of FWI and",
               " EWS conditions. Reveals the full fire size distribution, not just",
               " a single scenario — useful for checking whether the parameter set",
-              " produces realistic fire sizes across the range of fire-weather conditions."),
+              " produces realistic fire sizes across the range of fire-weather conditions.",
+              " If FPA FOD data is loaded (Ignition tab), blue reference lines show the",
+              " observed P50 and P90 fire sizes as calibration targets."),
             fluidRow(
               column(3,
                 numericInput("tune_ens_reps", "Runs per scenario",
@@ -4435,6 +4489,218 @@ server <- function(input, output, session) {
   })
 
   # ---------------------------------------------------------------------------
+  # Observed Targets tab
+  # ---------------------------------------------------------------------------
+
+  output$tune_obs_data_status_ui <- renderUI({
+    has_fpa  <- !is.null(rv$ign_df) && "FIRE_SIZE_HA" %in% names(rv$ign_df)
+    has_mtbs <- !is.null(rv$mtbs_fires) &&
+                "MeanDNBR_obs" %in% names(rv$mtbs_fires) &&
+                any(is.finite(rv$mtbs_fires$MeanDNBR_obs))
+
+    badge <- function(label, ok, ok_msg, bad_msg) {
+      cls <- if (ok) "bg-success" else "bg-secondary"
+      txt <- if (ok) ok_msg else bad_msg
+      tags$span(class = paste("badge me-2", cls), paste(label, "—", txt))
+    }
+
+    tagList(
+      badge("FPA FOD fire sizes", has_fpa,
+            sprintf("loaded (%s fires)", scales::comma(sum(is.finite(rv$ign_df$FIRE_SIZE_HA)))),
+            "not loaded — run Ignition tab first"),
+      badge("MTBS burn severity", has_mtbs,
+            sprintf("loaded (%s fires)", scales::comma(sum(is.finite(rv$mtbs_fires$MeanDNBR_obs)))),
+            "not loaded — fetch MTBS in Model Validation tab"),
+      if (!has_fpa || !has_mtbs)
+        tags$p(class = "text-muted small mt-2",
+               icon("circle-info"), " ",
+               "Load FPA FOD via the Ignition tab and MTBS data via the Model Validation tab ",
+               "to populate these reference plots.")
+    )
+  })
+
+  output$tune_obs_fpa_plot <- renderPlot({
+    req(rv$ign_df, "FIRE_SIZE_HA" %in% names(rv$ign_df))
+    sizes <- rv$ign_df$FIRE_SIZE_HA[is.finite(rv$ign_df$FIRE_SIZE_HA) &
+                                     rv$ign_df$FIRE_SIZE_HA >= 0.4]
+    if (length(sizes) == 0) return(NULL)
+
+    p50 <- median(sizes);  p75 <- quantile(sizes, 0.75)
+    p90 <- quantile(sizes, 0.90); p95 <- quantile(sizes, 0.95)
+
+    ggplot(data.frame(x = sizes), aes(x)) +
+      stat_ecdf(linewidth = 1.1, colour = "#2c3e50") +
+      geom_vline(xintercept = c(p50, p75, p90),
+                 linetype = c("solid","dashed","dotted"),
+                 colour = "#2171b5", linewidth = 0.8) +
+      annotate("text", x = c(p50, p75, p90) * 1.12,
+               y    = c(0.50, 0.75, 0.90),
+               label = sprintf(c("P50\n%.0f ha","P75\n%.0f ha","P90\n%.0f ha"),
+                               p50, p75, p90),
+               hjust = 0, size = 3, colour = "#2171b5") +
+      scale_x_log10(labels = scales::comma,
+                    breaks = 10^(0:6)) +
+      labs(title    = "FPA FOD Fire Size Distribution (ECDF)",
+           subtitle = sprintf("%s fires ≥ 0.4 ha in calibration boundary",
+                              scales::comma(length(sizes))),
+           x = "Fire size (ha, log scale)", y = "Cumulative proportion",
+           caption  = "Source: FPA FOD (Short 2022)") +
+      theme_bw(base_size = 11)
+  })
+
+  output$tune_obs_fpa_table <- renderTable({
+    req(rv$ign_df, "FIRE_SIZE_HA" %in% names(rv$ign_df))
+    sizes <- rv$ign_df$FIRE_SIZE_HA[is.finite(rv$ign_df$FIRE_SIZE_HA) &
+                                     rv$ign_df$FIRE_SIZE_HA >= 0.4]
+    if (length(sizes) == 0) return(NULL)
+    data.frame(
+      Statistic = c("n fires", "Median", "P75", "P90", "P95", "Max"),
+      Value     = c(scales::comma(length(sizes)),
+                    paste(round(median(sizes)),    "ha"),
+                    paste(round(quantile(sizes, .75)), "ha"),
+                    paste(round(quantile(sizes, .90)), "ha"),
+                    paste(round(quantile(sizes, .95)), "ha"),
+                    paste(round(max(sizes)),        "ha"))
+    )
+  }, striped = TRUE, hover = TRUE, bordered = TRUE, spacing = "xs")
+
+  output$tune_obs_mtbs_plot <- renderPlot({
+    req(rv$mtbs_fires, "MeanDNBR_obs" %in% names(rv$mtbs_fires))
+    dnbr_obs <- rv$mtbs_fires$MeanDNBR_obs[is.finite(rv$mtbs_fires$MeanDNBR_obs) &
+                                             rv$mtbs_fires$MeanDNBR_obs > 0]
+    if (length(dnbr_obs) == 0) return(NULL)
+
+    # Severity class shading (Miller & Thode 2007)
+    thresh <- data.frame(
+      xmin  = c(-Inf, 100, 270, 440, 660),
+      xmax  = c(100,  270, 440, 660, Inf),
+      label = c("Unburned/VL", "Low", "Moderate", "High", "Very High"),
+      fill  = c("#ffffcc", "#c2e699", "#78c679", "#31a354", "#006837")
+    )
+    med_obs <- median(dnbr_obs)
+
+    ggplot(data.frame(dNBR = dnbr_obs), aes(dNBR)) +
+      geom_rect(data = thresh,
+                aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = fill),
+                alpha = 0.15, inherit.aes = FALSE) +
+      scale_fill_identity() +
+      geom_histogram(bins = 40, fill = "#2c3e50", colour = "white",
+                     alpha = 0.80, linewidth = 0.3) +
+      geom_vline(xintercept = c(100, 270, 440, 660),
+                 linetype = "dashed", colour = "grey55", linewidth = 0.4) +
+      geom_vline(xintercept = med_obs, colour = "#2c3e50", linewidth = 1.1) +
+      annotate("text", x = med_obs + 15, y = Inf, vjust = 2.2,
+               label = sprintf("Median\n%.0f", med_obs),
+               size = 3, colour = "#2c3e50", hjust = 0) +
+      annotate("text", x = c(50, 185, 355, 550, 730), y = Inf, vjust = 1.6,
+               label = thresh$label, size = 2.6, colour = "grey30") +
+      scale_x_continuous(limits = c(NA, 1300), labels = scales::comma) +
+      labs(title    = "MTBS Observed Mean dNBR per Fire",
+           subtitle = sprintf("%s MTBS fires in calibration boundary",
+                              scales::comma(length(dnbr_obs))),
+           x = "Mean dNBR per fire (MTBS dnbr_val)",
+           y = "Number of fires",
+           caption = "Source: MTBS (Eidenshink et al. 2007); thresholds: Miller & Thode (2007)") +
+      theme_bw(base_size = 11) +
+      theme(panel.grid.minor = element_blank())
+  })
+
+  output$tune_obs_mtbs_table <- renderTable({
+    req(rv$mtbs_fires, "MeanDNBR_obs" %in% names(rv$mtbs_fires))
+    dnbr_obs <- rv$mtbs_fires$MeanDNBR_obs[is.finite(rv$mtbs_fires$MeanDNBR_obs) &
+                                             rv$mtbs_fires$MeanDNBR_obs > 0]
+    if (length(dnbr_obs) == 0) return(NULL)
+    cuts  <- cut(dnbr_obs, breaks = c(-Inf, 100, 270, 440, 660, Inf),
+                 labels = c("Unburned/VL (<100)", "Low (100-270)",
+                            "Moderate (270-440)", "High (440-660)",
+                            "Very High (>660)"),
+                 right = FALSE)
+    tbl <- as.data.frame(table(Class = cuts), stringsAsFactors = FALSE)
+    tbl$Pct <- sprintf("%.1f%%", tbl$Freq / sum(tbl$Freq) * 100)
+    names(tbl)[2] <- "n fires"
+    tbl
+  }, striped = TRUE, hover = TRUE, bordered = TRUE, spacing = "xs")
+
+  # Compact severity breakdown for Cohort Mortality tab sidebar
+  output$tune_obs_sev_breakdown_ui <- renderUI({
+    has_mtbs <- !is.null(rv$mtbs_fires) &&
+                "MeanDNBR_obs" %in% names(rv$mtbs_fires) &&
+                any(is.finite(rv$mtbs_fires$MeanDNBR_obs))
+    if (!has_mtbs) {
+      return(tags$p(class = "text-muted small",
+                    icon("circle-info"), " Load MTBS data in the Model Validation tab."))
+    }
+    dnbr_obs <- rv$mtbs_fires$MeanDNBR_obs[is.finite(rv$mtbs_fires$MeanDNBR_obs) &
+                                             rv$mtbs_fires$MeanDNBR_obs > 0]
+    breaks <- c(-Inf, 100, 270, 440, 660, Inf)
+    labels <- c("Unburned/VL", "Low", "Moderate", "High", "Very High")
+    cols   <- c("#ffffcc", "#c2e699", "#78c679", "#31a354", "#006837")
+    cuts   <- cut(dnbr_obs, breaks = breaks, labels = labels, right = FALSE)
+    pcts   <- prop.table(table(cuts)) * 100
+
+    med_dnbr <- round(median(dnbr_obs))
+
+    bar_rows <- lapply(seq_along(labels), function(i) {
+      pct <- round(pcts[labels[i]], 1)
+      if (is.na(pct)) pct <- 0
+      tags$div(style = "margin-bottom:4px;",
+        tags$span(style = paste0("display:inline-block;width:12px;height:12px;",
+                                 "background:", cols[i], ";border:1px solid #aaa;",
+                                 "margin-right:5px;vertical-align:middle;")),
+        tags$small(sprintf("%s: %.1f%%", labels[i], pct))
+      )
+    })
+
+    tagList(
+      tags$p(class = "small mb-1",
+             tags$b(sprintf("Median MTBS dNBR: %d", med_dnbr)),
+             tags$br(),
+             tags$span(class = "text-muted",
+                       sprintf("n = %s fires", scales::comma(length(dnbr_obs))))),
+      bar_rows
+    )
+  })
+
+  # MTBS dNBR histogram for Site Mortality tab (standalone, no sim events needed)
+  output$tune_obs_dnbr_plot <- renderPlot({
+    has_mtbs <- !is.null(rv$mtbs_fires) &&
+                "MeanDNBR_obs" %in% names(rv$mtbs_fires) &&
+                any(is.finite(rv$mtbs_fires$MeanDNBR_obs))
+    if (!has_mtbs) {
+      return(ggplot() +
+        annotate("text", x = 0.5, y = 0.5, size = 4, hjust = 0.5, colour = "grey50",
+                 label = "Load MTBS data in the Model Validation tab\nto see the observed severity target.") +
+        theme_void())
+    }
+    dnbr_obs <- rv$mtbs_fires$MeanDNBR_obs[is.finite(rv$mtbs_fires$MeanDNBR_obs) &
+                                             rv$mtbs_fires$MeanDNBR_obs > 0]
+    thresh <- data.frame(
+      xmin = c(-Inf,100,270,440,660), xmax = c(100,270,440,660,Inf),
+      label = c("Unburned/VL","Low","Moderate","High","Very High"),
+      fill  = c("#ffffcc","#c2e699","#78c679","#31a354","#006837")
+    )
+    ggplot(data.frame(dNBR = dnbr_obs), aes(dNBR)) +
+      geom_rect(data = thresh,
+                aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = fill),
+                alpha = 0.15, inherit.aes = FALSE) +
+      scale_fill_identity() +
+      geom_histogram(bins = 35, fill = "#2c3e50", colour = "white",
+                     alpha = 0.8, linewidth = 0.3) +
+      geom_vline(xintercept = c(100,270,440,660),
+                 linetype = "dashed", colour = "grey55", linewidth = 0.4) +
+      geom_vline(xintercept = median(dnbr_obs), colour = "#2c3e50", linewidth = 1.1) +
+      annotate("text", x = c(50,185,355,550,730), y = Inf, vjust = 1.6,
+               label = thresh$label, size = 2.6, colour = "grey30") +
+      scale_x_continuous(limits = c(NA, 1300), labels = scales::comma) +
+      labs(title    = "MTBS Observed Severity",
+           subtitle = sprintf("Median dNBR = %.0f  |  n = %s fires",
+                              median(dnbr_obs), scales::comma(length(dnbr_obs))),
+           x = "Mean dNBR per fire", y = "Count",
+           caption  = "Source: MTBS (Eidenshink et al. 2007)") +
+      theme_bw(base_size = 11)
+  })
+
+  # ---------------------------------------------------------------------------
   # Overview tab: sign-check badges + summary table
   # ---------------------------------------------------------------------------
   output$tune_overview_badges_ui <- renderUI({
@@ -4539,7 +4805,15 @@ server <- function(input, output, session) {
 
   output$tune_ensemble_plot <- renderPlot({
     ens <- ensemble_rv()
-    plot_fire_ensemble(ens)
+    # Compute FPA FOD reference quantiles if observed data is loaded
+    fpa_sizes <- if (!is.null(rv$ign_df) && "FIRE_SIZE_HA" %in% names(rv$ign_df)) {
+      rv$ign_df$FIRE_SIZE_HA[is.finite(rv$ign_df$FIRE_SIZE_HA)]
+    } else NULL
+    fpa_p50 <- if (!is.null(fpa_sizes) && length(fpa_sizes) > 0)
+      stats::median(fpa_sizes, na.rm = TRUE) else NULL
+    fpa_p90 <- if (!is.null(fpa_sizes) && length(fpa_sizes) > 0)
+      stats::quantile(fpa_sizes, 0.90, na.rm = TRUE) else NULL
+    plot_fire_ensemble(ens, reference_p50 = fpa_p50, reference_p90 = fpa_p90)
   })
 
   output$tune_ens_status_ui <- renderUI({
