@@ -12,14 +12,35 @@ if (!require("pacman", quietly = TRUE)) install.packages("pacman")
 pacman::p_load(terra, dplyr, readr, ggplot2, tidyr, purrr, stringr,
                lubridate, glue, broom, scales, httr, elevatr)
 
-# nnls is optional — used for constrained MaxSpreadArea regression.
-# If not installed, fit_max_daily_area() falls back to OLS with a warning.
-if (!requireNamespace("nnls", quietly = TRUE)) {
-  message(paste0(
-    "Optional package 'nnls' not found. Install it for constrained MaxSpreadArea ",
-    "regression that forces B1_FWI >= 0 and B2_EWS >= 0 (prevents collinearity artifacts). ",
-    "Run: install.packages('nnls')"
-  ))
+# quantreg is the primary constrained fitter for MaxSpreadArea.
+# nnls is the first fallback; plain OLS with clamping is the last resort.
+for (.pkg in c("quantreg", "nnls")) {
+  if (!requireNamespace(.pkg, quietly = TRUE))
+    message(sprintf(paste0(
+      "Optional package '%s' not found. Install it for better constrained ",
+      "MaxSpreadArea regression: install.packages('%s')"), .pkg, .pkg))
+}
+rm(.pkg)
+
+
+# =============================================================================
+# Collinearity helpers (used by both fit_* functions)
+# =============================================================================
+
+# compute_vif: variance inflation factors for predictor columns (no intercept)
+compute_vif <- function(X_pred) {
+  if (ncol(X_pred) < 2)
+    return(setNames(rep(NA_real_, ncol(X_pred)), colnames(X_pred)))
+  tryCatch(
+    diag(solve(cor(X_pred))),
+    error = function(e) setNames(rep(NA_real_, ncol(X_pred)), colnames(X_pred))
+  )
+}
+
+# condition_number: ratio of largest to smallest singular value of design matrix
+condition_number <- function(X) {
+  sv <- svd(X)$d
+  max(sv) / min(sv[sv > .Machine$double.eps * max(sv)])
 }
 
 ROOK_W <- matrix(c(0,1,0, 1,1,1, 0,1,0), nrow = 3, byrow = TRUE)
@@ -679,127 +700,156 @@ fit_max_daily_area <- function(pairs) {
   if (nrow(dat) < 5)
     stop("Fewer than 5 usable pairs for max daily area fit.")
 
+  X <- model.matrix(~ FWI + EffectiveWind, data = dat)
   y <- dat$daily_area_ha
 
-  # ---- Weighted quantile helper ---------------------------------------------
-  # Asymmetric L1 weights approximate the p-th quantile OLS regression.
-  make_wts <- function(p) ifelse(y >= quantile(y, p, na.rm = TRUE), p, 1 - p) + 1e-6
+  # ---- Collinearity diagnostics ----------------------------------------------
+  X_pred   <- X[, -1, drop = FALSE]
+  vif_vals <- compute_vif(X_pred)
+  kappa    <- condition_number(X)
+  r_fwi_ews <- cor(dat$FWI, dat$EffectiveWind, use = "complete.obs")
 
-  # ---- Constrained single fit -----------------------------------------------
-  # 1. Tries standard OLS (or WLS).
-  # 2. If B1_FWI < 0 or B2_EWS < 0, re-fits with nnls to enforce >= 0.
-  #    (collinearity between FWI and EWS in GeoMAC data often produces
-  #     negative B1 when high-EWS events cluster at low FWI)
-  # Returns list(coef = named numeric[3], constrained = logical, model = lm)
-  constrained_fit <- function(weights = NULL) {
-    fit_df <- dat  # closure over dat
-    m_ols  <- if (is.null(weights))
-      lm(daily_area_ha ~ FWI + EffectiveWind, data = fit_df)
-    else
-      lm(daily_area_ha ~ FWI + EffectiveWind, data = fit_df, weights = weights)
+  if (kappa > 100 || any(vif_vals > 10, na.rm = TRUE)) {
+    message(sprintf(paste0(
+      "⚠ MaxSpreadArea design matrix: condition number = %.1f, VIF = [FWI:%.1f, EWS:%.1f], ",
+      "FWI/EWS correlation = %.3f. Constrained quantile regression enforces ",
+      "B0 ≥ 50 ha, B1 ≥ 0, B2 ≥ 0 to prevent collinearity artifacts."
+    ), kappa, vif_vals[1], vif_vals[2], r_fwi_ews))
+  }
 
-    coefs_ols        <- coef(m_ols)
-    names(coefs_ols) <- c("B0_Intercept", "B1_FWI", "B2_EffectiveWind")
+  # ---- Constrained quantile regression helper --------------------------------
+  # Priority order:
+  #   1. quantreg::rq() with explicit inequality constraints (B0>=B0_MIN, B1>=0, B2>=0)
+  #   2. nnls with reparameterization to enforce B0>=B0_MIN and B1,B2>=0
+  #   3. OLS with clamping (last resort — SEs are unreliable when clamped)
+  #
+  # B0_MIN prevents SCF "MaxSpreadArea < 0" warnings at low FWI/EWS.
+  B0_MIN <- 50.0  # ha
 
-    b1_neg <- !is.na(coefs_ols["B1_FWI"])          && coefs_ols["B1_FWI"]          < 0
-    b2_neg <- !is.na(coefs_ols["B2_EffectiveWind"]) && coefs_ols["B2_EffectiveWind"] < 0
+  constrained_qr <- function(tau) {
 
-    # If OLS gives non-negative B1 and B2, we're done.
-    if (!b1_neg && !b2_neg)
-      return(list(coef = coefs_ols, constrained = FALSE, model = m_ols))
+    # ---- Path 1: quantreg with inequality constraints ----------------------
+    if (requireNamespace("quantreg", quietly = TRUE)) {
+      # R %*% coef >= r  →  identity matrix, floors [B0_MIN, 0, 0]
+      R_mat <- diag(3L)
+      r_vec <- c(B0_MIN, 0.0, 0.0)
 
-    # Constrained path: nnls (non-negative least squares on all 3 parameters)
-    if (requireNamespace("nnls", quietly = TRUE)) {
-      X_mat <- model.matrix(~ FWI + EffectiveWind, data = fit_df)   # [1, FWI, EWS]
-      y_vec <- fit_df$daily_area_ha
-      if (!is.null(weights)) {
-        sw    <- sqrt(weights)
-        X_mat <- X_mat * sw
-        y_vec <- y_vec * sw
+      rq_fit <- tryCatch(
+        quantreg::rq(daily_area_ha ~ FWI + EffectiveWind, tau = tau,
+                     data = dat, method = "br", R = R_mat, r = r_vec),
+        error = function(e) NULL
+      )
+      if (!is.null(rq_fit)) {
+        coefs    <- setNames(coef(rq_fit),
+                             c("B0_Intercept", "B1_FWI", "B2_EffectiveWind"))
+        sum_rq   <- tryCatch(summary(rq_fit, se = "nid"), error = function(e) NULL)
+        se_vals  <- if (!is.null(sum_rq)) sum_rq$coefficients[, 2] else rep(NA_real_, 3)
+        pval_vals <- if (!is.null(sum_rq)) sum_rq$coefficients[, 4] else rep(NA_real_, 3)
+        return(list(coef  = coefs,
+                    se    = setNames(se_vals,   names(coefs)),
+                    pval  = setNames(pval_vals, names(coefs)),
+                    method = "constrained_qr"))
       }
-      fit_c <- nnls::nnls(X_mat, y_vec)
-      coefs_c        <- fit_c$x
-      names(coefs_c) <- c("B0_Intercept", "B1_FWI", "B2_EffectiveWind")
-      return(list(coef = coefs_c, constrained = TRUE, model = m_ols))
     }
 
-    # No nnls available: warn and return OLS
-    warning(
-      "B1_FWI or B2_EffectiveWind is negative (collinearity artifact). ",
-      "Install 'nnls' to enforce non-negativity: install.packages('nnls'). ",
-      "Using unconstrained OLS — enter SCF parameter file with caution."
-    )
-    list(coef = coefs_ols, constrained = FALSE, model = m_ols)
+    # ---- Path 2: nnls with reparameterization ------------------------------
+    # Reparameterise: β = α + [B0_MIN, 0, 0], α ≥ 0.
+    # Minimise ||X α - (y - B0_MIN)||² with α ≥ 0.
+    if (requireNamespace("nnls", quietly = TRUE)) {
+      y_adj <- y - B0_MIN                       # remove the floor offset from y
+      q_tgt <- quantile(y, tau, na.rm = TRUE)
+      wts   <- sqrt(ifelse(y >= q_tgt, tau, 1 - tau) + 1e-6)
+      fit_nn <- tryCatch(nnls::nnls(X * wts, y_adj * wts), error = function(e) NULL)
+      if (!is.null(fit_nn)) {
+        alpha <- fit_nn$x
+        coefs <- setNames(alpha + c(B0_MIN, 0, 0),
+                          c("B0_Intercept", "B1_FWI", "B2_EffectiveWind"))
+        return(list(coef  = coefs,
+                    se    = rep(NA_real_, 3),
+                    pval  = rep(NA_real_, 3),
+                    method = "constrained_nnls"))
+      }
+    }
+
+    # ---- Path 3: weighted OLS with post-hoc clamping (last resort) ---------
+    q_tgt <- quantile(y, tau, na.rm = TRUE)
+    wts   <- ifelse(y >= q_tgt, tau, 1 - tau) + 1e-6
+    m_ols <- lm(daily_area_ha ~ FWI + EffectiveWind, data = dat, weights = wts)
+    coefs <- setNames(coef(m_ols), c("B0_Intercept", "B1_FWI", "B2_EffectiveWind"))
+
+    any_clamped <- coefs["B1_FWI"] < 0 || coefs["B2_EffectiveWind"] < 0 ||
+                   coefs["B0_Intercept"] < B0_MIN
+    if (any_clamped) {
+      warning(paste0(
+        "MaxSpreadArea: OLS produced constraint violations (B0<", B0_MIN,
+        " or B1<0 or B2<0). Clamping to constraints. ",
+        "Install 'quantreg' (install.packages('quantreg')) for proper constrained fitting."
+      ))
+      coefs["B0_Intercept"]     <- max(B0_MIN, coefs["B0_Intercept"])
+      coefs["B1_FWI"]           <- max(0.0,    coefs["B1_FWI"])
+      coefs["B2_EffectiveWind"] <- max(0.0,    coefs["B2_EffectiveWind"])
+    }
+    ols_t <- broom::tidy(m_ols) %>% rename(std_error = std.error, p_value = p.value)
+    return(list(coef  = coefs,
+                se    = ols_t$std_error,
+                pval  = ols_t$p_value,
+                method = if (any_clamped) "ols_clamped" else "ols"))
   }
 
-  # ---- Three fits -----------------------------------------------------------
-  fit_mean <- constrained_fit()
-  fit_q75  <- constrained_fit(weights = make_wts(0.75))
-  fit_q90  <- constrained_fit(weights = make_wts(0.90))
+  # ---- Three quantile fits --------------------------------------------------
+  fit_med <- constrained_qr(0.50)
+  fit_q75 <- constrained_qr(0.75)
+  fit_q90 <- constrained_qr(0.90)
 
-  any_constrained <- fit_mean$constrained || fit_q75$constrained || fit_q90$constrained
-  if (any_constrained) {
-    message(paste0(
-      "⚠ MaxSpreadArea: negative B1_FWI or B2_EWS detected in OLS ",
-      "(likely FWI/EWS collinearity in GeoMAC data — high-EWS events ",
-      "often cluster at low FWI). Constrained nnls fit applied. ",
-      "Check plot: B1 and B2 should both be positive."
-    ))
-  }
+  method_used <- fit_q75$method
+  message(sprintf(
+    "MaxSpreadArea fit: n=%d pairs | range [%.1f, %.1f] ha | mean=%.0f ha | method=%s | cond=%.1f | VIF: FWI=%.2f EWS=%.2f | cor(FWI,EWS)=%.3f",
+    nrow(dat), min(y), max(y), mean(y),
+    method_used, kappa, vif_vals[1], vif_vals[2], r_fwi_ews
+  ))
+  message("  Recommended target: 75th percentile fit (MaxSpreadArea is a ceiling, not a mean)")
 
   # ---- Build tidy coefficient table -----------------------------------------
-  # OLS SE / p-values are kept for reference even when constrained coefs differ.
+  method_note <- function(m) switch(m,
+    constrained_qr   = "Constrained quantile regression (quantreg, B0≥50 ha, B1≥0, B2≥0).",
+    constrained_nnls = "Constrained nnls (B0≥50 ha, B1≥0, B2≥0); SE not available.",
+    ols_clamped      = "OLS with clamping (install quantreg for proper constrained QR); SE from OLS before clamping.",
+    "OLS."
+  )
+
   build_coef_row <- function(fit_result, label) {
-    ols_tidy <- broom::tidy(fit_result$model) %>%
-      rename(std_error = std.error, p_value = p.value)
     tibble(
       term          = c("B0_Intercept", "B1_FWI", "B2_EffectiveWind"),
       estimate      = as.numeric(fit_result$coef),
-      std_error     = ols_tidy$std_error,   # from OLS (approx if constrained)
-      p_value       = ols_tidy$p_value,
+      std_error     = as.numeric(fit_result$se),
+      statistic     = as.numeric(fit_result$coef /
+                        pmax(abs(fit_result$se), .Machine$double.eps)),
+      p_value       = as.numeric(fit_result$pval),
       fit_target    = label,
-      constrained   = fit_result$constrained,
-      scf_parameter = c("MaximumSpreadAreaB0", "MaximumSpreadAreaB1", "MaximumSpreadAreaB2"),
-      note          = paste0(
-        if (fit_result$constrained)
-          "Constrained nnls (B0,B1,B2≥0); SE/p from unconstrained OLS. "
-        else "OLS. ",
-        "Raw linear (ha/day) — enter directly in SCF parameter file."
-      )
+      constrained   = fit_result$method %in% c("constrained_qr", "constrained_nnls",
+                                                "ols_clamped"),
+      method        = fit_result$method,
+      scf_parameter = c("MaximumSpreadAreaB0", "MaximumSpreadAreaB1",
+                        "MaximumSpreadAreaB2"),
+      note          = paste0(method_note(fit_result$method),
+                             " Raw linear (ha/day) — enter directly in SCF parameter file.")
     )
   }
 
   coef_df <- bind_rows(
-    build_coef_row(fit_mean, "Mean (OLS)"),
-    build_coef_row(fit_q75,  "75th percentile (recommended)"),
-    build_coef_row(fit_q90,  "90th percentile")
+    build_coef_row(fit_med, "Median (QR)"),
+    build_coef_row(fit_q75, "75th percentile (recommended)"),
+    build_coef_row(fit_q90, "90th percentile")
   )
 
-  # ---- Sanity check: B0 < 0 -------------------------------------------------
-  b0_vals <- coef_df %>% filter(term == "B0_Intercept") %>% pull(estimate)
-  if (any(b0_vals < 0)) {
-    warning(
-      "One or more B0_Intercept estimates are negative (",
-      paste(round(b0_vals[b0_vals < 0], 2), collapse = ", "), " ha). ",
-      "SCF will warn 'MaxSpreadArea < 0' when FWI and wind are both low. ",
-      "Consider using the 75th or 90th percentile fit, or constraining B0 >= 1."
-    )
-  }
-
-  message(sprintf(
-    "Max daily area fit: n=%d pairs | daily area range [%.1f, %.1f] ha | mean=%.0f ha",
-    nrow(dat), min(dat$daily_area_ha), max(dat$daily_area_ha),
-    mean(dat$daily_area_ha)
-  ))
-  message("  Recommended target: 75th percentile fit (MaxSpreadArea is a ceiling, not a mean)")
-  if (any_constrained)
-    message("  NOTE: constrained (nnls) coefficients used — SE/p-values are from unconstrained OLS.")
-
   list(coef       = coef_df,
-       model_mean = fit_mean$model,
-       model_q75  = fit_q75$model,
-       model_q90  = fit_q90$model,
-       data       = dat)
+       model_mean = NULL,
+       model_q75  = NULL,
+       model_q90  = NULL,
+       data       = dat,
+       cond_num   = kappa,
+       vif        = vif_vals,
+       fwi_ews_cor = r_fwi_ews)
 }
 
 
@@ -911,62 +961,121 @@ fit_spread_probability <- function(pairs2, geomac_v, template_r, park_mask,
   if (nrow(all_samples) == 0)
     stop("No raster samples generated. Check that perimeters fall within template extent.")
 
-  # GLM: logit link — coefficients go DIRECTLY into SCF parameter file.
-  # SCF CanSpread():
-  #   Pspread = 1 / (1 + exp(-(B0 + B1*FWI + B2*FineFuels + B3*EWS)))
-  # which is exactly what binomial(logit) produces.
-  # All coefficients should be positive (higher FWI/fuels/wind → more spread).
-  m <- glm(y ~ FWI + FineFuels + EffectiveWind,
-           data   = all_samples,
-           family = binomial(link = "logit"))
+  # ---- Fine fuels variance check --------------------------------------------
+  # B2_FineFuels is only identifiable when FF varies across the sample.
+  # When fine_fuels_r is NULL, FF=1.0 everywhere → zero variance → B2 unidentified.
+  # When FF has real spatial variation, check whether that variation is meaningful.
+  ff_var  <- var(all_samples$FineFuels, na.rm = TRUE)
+  drop_b2 <- is.null(fine_fuels_r) || ff_var < 0.001
 
-  fine_fuels_label <- if (is.null(fine_fuels_r)) "B2_FineFuels (placeholder=1.0)" else "B2_FineFuels"
-  wind_label       <- if (has_eff_wind) "B3_EffectiveWind" else "B3_EffectiveWind (raw wind, no terrain)"
-
-  coef_df <- broom::tidy(m) %>%
-    rename(std_error = std.error, p_value = p.value) %>%
-    mutate(
-      term = case_when(
-        term == "(Intercept)"   ~ "B0_Intercept",
-        term == "FWI"           ~ "B1_FWI",
-        term == "FineFuels"     ~ fine_fuels_label,
-        term == "EffectiveWind" ~ wind_label,
-        TRUE ~ term
-      ),
-      scf_parameter = case_when(
-        grepl("B0", term) ~ "SpreadProbabilityB0",
-        grepl("B1", term) ~ "SpreadProbabilityB1",
-        grepl("B2", term) ~ "SpreadProbabilityB2",
-        grepl("B3", term) ~ "SpreadProbabilityB3",
-        TRUE ~ NA_character_
-      ),
-      note = "logit-link coefficients — enter directly in SCF parameter file (no back-transform needed)"
-    )
-
-  message(sprintf("Spread prob fit: %d samples (%d successes, %d failures)",
-                  nrow(all_samples),
-                  sum(all_samples$y == 1),
-                  sum(all_samples$y == 0)))
-
-  # Warn if B2 was fit on FF=1.0 placeholder
-  if (is.null(fine_fuels_r)) {
-    b2_idx <- grep("B2_Fine", coef_df$term)[1]
-    b2_est <- if (!is.na(b2_idx)) coef_df$estimate[b2_idx] else NA_real_
-    b0_idx <- grep("B0_Intercept", coef_df$term)[1]
-    b0_est <- if (!is.na(b0_idx)) coef_df$estimate[b0_idx] else NA_real_
+  if (drop_b2) {
+    reason <- if (is.null(fine_fuels_r))
+      "FineFuels placeholder (1.0 everywhere) — FF has zero variance"
+    else
+      sprintf("FineFuels variance = %.6f across samples (< 0.001 threshold)", ff_var)
     message(sprintf(paste0(
-      "⚠ SpreadProbability: FineFuels=1.0 placeholder used — B2=%.4f is unidentified ",
-      "(FF never varied during calibration). When LANDIS runs with FF≈0 (early ",
-      "timesteps), effective B0 shifts to %.4f → P(spread) increases dramatically. ",
-      "Recommended fix: set SpreadProbabilityB2=0 and SpreadProbabilityB0=%.4f ",
-      "(= B0 + B2×1.0) in the SCF parameter file, then re-calibrate B2 after a ",
-      "LANDIS warm-up run provides real fine fuels data."
-    ), b2_est, b0_est - b2_est, b0_est - b2_est))
+      "⚠ SpreadProbability: %s. ",
+      "B2_FineFuels is unidentifiable — dropping from model and setting B2=0. ",
+      "B0 from the reduced model (no FF) already absorbs the mean FF effect, ",
+      "so it is the correct value to enter as SpreadProbabilityB0."
+    ), reason))
   }
 
-  list(coef = coef_df, model = m, samples = all_samples,
+  # ---- VIF for spread probability predictors --------------------------------
+  sp_pred_cols <- c("FWI", if (!drop_b2) "FineFuels", "EffectiveWind")
+  sp_pred_cols <- sp_pred_cols[sp_pred_cols %in% names(all_samples)]
+  X_sp  <- as.matrix(all_samples[, sp_pred_cols])
+  vif_sp <- compute_vif(X_sp)
+
+  # ---- GLM fit --------------------------------------------------------------
+  # When drop_b2: fit without FineFuels; B0 is the "B0+B2*mean(FF)" combined intercept.
+  # When !drop_b2: full model with FineFuels as predictor.
+  # Logit-link coefficients go DIRECTLY into the SCF parameter file.
+  # SCF CanSpread(): Pspread = 1/(1+exp(-(B0 + B1*FWI + B2*FF + B3*EWS)))
+  if (drop_b2) {
+    m <- glm(y ~ FWI + EffectiveWind,
+             data   = all_samples,
+             family = binomial(link = "logit"))
+  } else {
+    m <- glm(y ~ FWI + FineFuels + EffectiveWind,
+             data   = all_samples,
+             family = binomial(link = "logit"))
+  }
+
+  wind_label <- if (has_eff_wind) "B3_EffectiveWind" else "B3_EffectiveWind (raw wind, no terrain)"
+
+  coef_df_raw <- broom::tidy(m) %>%
+    rename(std_error = std.error, p_value = p.value)
+
+  # Build full 4-row output (B0-B3) even when B2 was dropped
+  if (drop_b2) {
+    b0_est <- coef_df_raw$estimate[coef_df_raw$term == "(Intercept)"]
+    b1_est <- coef_df_raw$estimate[coef_df_raw$term == "FWI"]
+    b3_est <- coef_df_raw$estimate[coef_df_raw$term == "EffectiveWind"]
+    b0_se  <- coef_df_raw$std_error[coef_df_raw$term == "(Intercept)"]
+    b1_se  <- coef_df_raw$std_error[coef_df_raw$term == "FWI"]
+    b3_se  <- coef_df_raw$std_error[coef_df_raw$term == "EffectiveWind"]
+    b0_p   <- coef_df_raw$p_value[coef_df_raw$term == "(Intercept)"]
+    b1_p   <- coef_df_raw$p_value[coef_df_raw$term == "FWI"]
+    b3_p   <- coef_df_raw$p_value[coef_df_raw$term == "EffectiveWind"]
+
+    b2_note <- paste0(
+      "B2 set to 0: FF variance = ", round(ff_var, 6),
+      " (too low to identify). B0 already absorbs mean FF effect. ",
+      "Re-calibrate B2 after a LANDIS warm-up run provides real fine-fuels data."
+    )
+    coef_df <- tibble(
+      term          = c("B0_Intercept", "B1_FWI",
+                        "B2_FineFuels (dropped — FF unidentified)", wind_label),
+      estimate      = c(b0_est, b1_est, 0.0, b3_est),
+      std_error     = c(b0_se,  b1_se,  NA_real_, b3_se),
+      statistic     = c(b0_est/b0_se, b1_est/b1_se, NA_real_, b3_est/b3_se),
+      p_value       = c(b0_p,  b1_p,  NA_real_, b3_p),
+      scf_parameter = c("SpreadProbabilityB0", "SpreadProbabilityB1",
+                        "SpreadProbabilityB2", "SpreadProbabilityB3"),
+      note          = c(
+        "logit-link; enter directly in SCF parameter file (no back-transform needed)",
+        "logit-link; enter directly in SCF parameter file (no back-transform needed)",
+        b2_note,
+        "logit-link; enter directly in SCF parameter file (no back-transform needed)"
+      )
+    )
+  } else {
+    coef_df <- coef_df_raw %>%
+      mutate(
+        term = case_when(
+          term == "(Intercept)"   ~ "B0_Intercept",
+          term == "FWI"           ~ "B1_FWI",
+          term == "FineFuels"     ~ "B2_FineFuels",
+          term == "EffectiveWind" ~ wind_label,
+          TRUE ~ term
+        ),
+        scf_parameter = case_when(
+          grepl("B0", term) ~ "SpreadProbabilityB0",
+          grepl("B1", term) ~ "SpreadProbabilityB1",
+          grepl("B2", term) ~ "SpreadProbabilityB2",
+          grepl("B3", term) ~ "SpreadProbabilityB3",
+          TRUE ~ NA_character_
+        ),
+        note = "logit-link coefficients — enter directly in SCF parameter file (no back-transform needed)"
+      )
+  }
+
+  message(sprintf(
+    "Spread prob fit: %d samples (%d successes, %d failures) | drop_b2=%s | FF var=%.6f | VIF: %s",
+    nrow(all_samples), sum(all_samples$y == 1), sum(all_samples$y == 0),
+    drop_b2, ff_var,
+    paste(names(vif_sp), round(vif_sp, 2), sep = "=", collapse = ", ")
+  ))
+
+  list(coef           = coef_df,
+       model          = m,
+       samples        = all_samples,
        wind_predictor = wind_col,
-       ff_placeholder = is.null(fine_fuels_r))
+       ff_placeholder = is.null(fine_fuels_r),
+       ff_var         = ff_var,
+       drop_b2        = drop_b2,
+       vif            = vif_sp)
 }
 
 
@@ -1503,10 +1612,19 @@ fit_spread_prob_from_cache <- function(per_pair_samples,
   all_samples <- bind_rows(filtered)
   if (nrow(all_samples) == 0) return(NULL)
 
+  # Drop B2 when FF has no meaningful variance (same logic as fit_spread_probability)
+  ff_var  <- var(all_samples$FineFuels, na.rm = TRUE)
+  drop_b2 <- ff_var < 0.001
+
   m <- tryCatch(
-    glm(y ~ FWI + FineFuels + EffectiveWind,
-        data   = all_samples,
-        family = binomial(link = "logit")),
+    if (drop_b2)
+      glm(y ~ FWI + EffectiveWind,
+          data   = all_samples,
+          family = binomial(link = "logit"))
+    else
+      glm(y ~ FWI + FineFuels + EffectiveWind,
+          data   = all_samples,
+          family = binomial(link = "logit")),
     error = function(e) NULL
   )
   if (is.null(m)) return(NULL)
@@ -1517,7 +1635,8 @@ fit_spread_prob_from_cache <- function(per_pair_samples,
     auc       = auc,
     n_pairs   = length(filtered),
     n_samples = nrow(all_samples),
-    model     = m
+    model     = m,
+    drop_b2   = drop_b2
   )
 }
 

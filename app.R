@@ -737,6 +737,7 @@ ui <- page_navbar(
 
           nav_panel("Fit Coefficients",
             br(),
+            uiOutput("spread_cal_health_ui"),
             h5("Cell-to-Cell Spread Probability (Logistic)"),
             p(class = "text-muted small",
               "Maps to SpreadProbabilityB0-B3 in SCF parameter file."),
@@ -744,7 +745,8 @@ ui <- page_navbar(
             br(),
             h5("Maximum Daily Spread Area (Linear)"),
             p(class = "text-muted small",
-              "Maps to MaximumSpreadAreaB0-B2 in SCF parameter file."),
+              "Maps to MaximumSpreadAreaB0-B2 in SCF parameter file.",
+              " All three quantile targets shown; 75th percentile is recommended."),
             DTOutput("max_area_coef_table"),
             br(),
             downloadButton("dl_spread_coef", "Download All Spread Coefficients CSV",
@@ -3096,17 +3098,136 @@ server <- function(input, output, session) {
   output$spread_prob_coef_table <- renderDT({
     req(rv$spread_prob_coef)
     rv$spread_prob_coef %>%
+      select(any_of(c("term", "estimate", "std_error", "statistic",
+                       "p_value", "scf_parameter", "note"))) %>%
       mutate(across(where(is.numeric), ~ round(.x, 6))) %>%
-      datatable(options = list(dom = "t", paging = FALSE),
+      datatable(options = list(dom = "t", paging = FALSE, scrollX = TRUE),
                 rownames = FALSE, class = "table-sm table-striped")
   })
 
   output$max_area_coef_table <- renderDT({
     req(rv$max_area_coef)
     rv$max_area_coef %>%
+      select(any_of(c("term", "estimate", "std_error", "p_value",
+                       "fit_target", "method", "scf_parameter", "note"))) %>%
       mutate(across(where(is.numeric), ~ round(.x, 6))) %>%
-      datatable(options = list(dom = "t", paging = FALSE),
+      datatable(options = list(dom = "t", paging = FALSE, scrollX = TRUE),
                 rownames = FALSE, class = "table-sm table-striped")
+  })
+
+  # ---------------------------------------------------------------------------
+  # Calibration Health panel (shown above the coefficient tables)
+  # ---------------------------------------------------------------------------
+  output$spread_cal_health_ui <- renderUI({
+
+    msa_fit <- rv$max_area_fit
+    sp_fit  <- rv$spread_prob_fit
+
+    if (is.null(msa_fit) && is.null(sp_fit)) return(NULL)
+
+    badge <- function(label, ok, ok_msg, bad_msg, warn = FALSE) {
+      cls <- if (ok) "bg-success" else if (warn) "bg-warning text-dark" else "bg-danger"
+      txt <- if (ok) ok_msg else bad_msg
+      tags$span(class = paste("badge me-1 mb-1", cls),
+                style = "font-size:0.82rem;",
+                paste(label, "—", txt))
+    }
+
+    items <- tagList()
+
+    # ---- MSA diagnostics ---------------------------------------------------
+    if (!is.null(msa_fit)) {
+      kappa  <- msa_fit$cond_num
+      vif    <- msa_fit$vif
+      r_cor  <- msa_fit$fwi_ews_cor
+      coef75 <- msa_fit$coef %>%
+        filter(fit_target == "75th percentile (recommended)") %>%
+        { setNames(.$estimate, .$term) }
+
+      b1_ok <- !is.na(coef75["B1_FWI"])          && coef75["B1_FWI"]          >= 0
+      b2_ok <- !is.na(coef75["B2_EffectiveWind"]) && coef75["B2_EffectiveWind"] >= 0
+      b0_ok <- !is.na(coef75["B0_Intercept"])     && coef75["B0_Intercept"]    >= 50
+
+      items <- tagList(items,
+        h6(class = "mt-1 mb-1 text-muted", "Max Spread Area"),
+        badge("B1 (FWI)", b1_ok,
+              sprintf("positive ✓ (%.1f ha/unit)", coalesce(coef75["B1_FWI"], NA_real_)),
+              sprintf("0 or negative ⚠ (%.1f)", coalesce(coef75["B1_FWI"], NA_real_))),
+        badge("B2 (EWS)", b2_ok,
+              sprintf("positive ✓ (%.1f ha/km/h)", coalesce(coef75["B2_EffectiveWind"], NA_real_)),
+              sprintf("0 or negative ⚠ (%.1f)", coalesce(coef75["B2_EffectiveWind"], NA_real_))),
+        badge("B0 ≥ 50 ha", b0_ok,
+              sprintf("✓ (%.0f ha)", coalesce(coef75["B0_Intercept"], NA_real_)),
+              sprintf("⚠ low (%.0f ha)", coalesce(coef75["B0_Intercept"], NA_real_))),
+        if (!is.null(kappa))
+          badge("Condition #", kappa < 100,
+                sprintf("OK (%.0f)", kappa),
+                sprintf("high (%.0f) — collinearity present", kappa),
+                warn = kappa < 1000),
+        if (!is.null(vif) && length(vif) >= 2)
+          badge("VIF",
+                all(vif < 10, na.rm = TRUE),
+                sprintf("OK (FWI=%.1f, EWS=%.1f)", vif[1], vif[2]),
+                sprintf("high ⚠ (FWI=%.1f, EWS=%.1f)", vif[1], vif[2]),
+                warn = all(vif < 30, na.rm = TRUE)),
+        if (!is.null(r_cor))
+          badge("cor(FWI,EWS)", abs(r_cor) < 0.5,
+                sprintf("%.2f (low)", r_cor),
+                sprintf("%.2f — strong collinearity source", r_cor),
+                warn = abs(r_cor) < 0.8),
+        br()
+      )
+    }
+
+    # ---- Spread Probability diagnostics ------------------------------------
+    if (!is.null(sp_fit)) {
+      vif_sp  <- sp_fit$vif
+      drop_b2 <- isTRUE(sp_fit$drop_b2)
+      ff_var  <- sp_fit$ff_var
+      sp_coef <- sp_fit$coef
+      b1_ok   <- !is.na(sp_coef$estimate[grepl("B1_FWI", sp_coef$term)][1]) &&
+                  sp_coef$estimate[grepl("B1_FWI", sp_coef$term)][1] > 0
+      b3_ok   <- !is.na(sp_coef$estimate[grepl("B3_Eff", sp_coef$term)][1]) &&
+                  sp_coef$estimate[grepl("B3_Eff", sp_coef$term)][1] > 0
+
+      items <- tagList(items,
+        h6(class = "mt-2 mb-1 text-muted", "Spread Probability"),
+        badge("B1 (FWI)", b1_ok, "positive ✓", "negative ⚠"),
+        badge("B2 (FF)", !drop_b2,
+              sprintf("identified (FF var=%.4f) ✓", coalesce(ff_var, 0)),
+              sprintf("DROPPED — FF unidentified (var=%.6f) ▶ B2=0", coalesce(ff_var, 0)),
+              warn = drop_b2),
+        badge("B3 (EWS)", b3_ok, "positive ✓", "negative ⚠"),
+        if (!is.null(vif_sp) && length(vif_sp) > 0)
+          badge("VIF (SP)",
+                all(vif_sp < 10, na.rm = TRUE),
+                paste("OK:", paste(round(vif_sp, 1), collapse = "/")),
+                paste("high ⚠:", paste(round(vif_sp, 1), collapse = "/")),
+                warn = all(vif_sp < 30, na.rm = TRUE)),
+        if (drop_b2)
+          tags$div(
+            class = "alert alert-warning p-2 mt-2 mb-2",
+            style = "font-size:0.82rem;",
+            tags$b(icon("triangle-exclamation"), " B2 (FineFuels) dropped from SpreadProbability model."),
+            tags$br(),
+            "Fine fuels had no variance during calibration (FF=1.0 placeholder or ",
+            "constant raster). B2 is set to 0 in the coefficient table. ",
+            "The B0 estimate already absorbs the mean FF effect and is correct to ",
+            "enter directly as SpreadProbabilityB0. ",
+            tags$b("Re-calibrate B2 after a LANDIS warm-up run provides real fine-fuels output.")
+          ),
+        br()
+      )
+    }
+
+    tagList(
+      tags$div(
+        class = "border rounded p-2 mb-3 bg-light",
+        tags$b(icon("stethoscope"), " Calibration Health"),
+        br(), br(),
+        items
+      )
+    )
   })
 
   # ---------------------------------------------------------------------------
