@@ -4872,22 +4872,26 @@ server <- function(input, output, session) {
   })
 
   output$tune_ensemble_plot <- renderPlot({
-    ens <- ensemble_rv()
+    ens      <- ensemble_rv()
+    MIN_HA   <- 4   # landscape-scale threshold — 86% of FOD fires are below this
 
-    # ---- FPA FOD overall reference quantiles (blue horizontal lines) ----------
+    # ---- FPA FOD reference quantiles — filtered to landscape-scale fires ------
+    # The unfiltered FOD median is ~0.3 ha (tiny escaped ignitions); filtering
+    # to >= 4 ha gives the distribution SCF would realistically model.
     fpa_sizes <- if (!is.null(rv$ign_df) && "FIRE_SIZE_HA" %in% names(rv$ign_df)) {
-      rv$ign_df$FIRE_SIZE_HA[is.finite(rv$ign_df$FIRE_SIZE_HA)]
+      x <- rv$ign_df$FIRE_SIZE_HA[is.finite(rv$ign_df$FIRE_SIZE_HA)]
+      x[x >= MIN_HA]
     } else NULL
     fpa_p50 <- if (!is.null(fpa_sizes) && length(fpa_sizes) > 0)
       stats::median(fpa_sizes, na.rm = TRUE) else NULL
     fpa_p90 <- if (!is.null(fpa_sizes) && length(fpa_sizes) > 0)
       stats::quantile(fpa_sizes, 0.90, na.rm = TRUE) else NULL
 
-    # ---- Observed FPA FOD fires binned to FWI x EWS cells (navy triangles) ----
+    # ---- Observed FPA FOD fires binned to FWI x EWS cells -------------------
     # FWI from ERA-Interim joined by discovery date.
-    # EWS from ERA5 wind joined by date (WindSpeed_kmh as flat-terrain proxy);
-    # falls back to the middle bin (15 km/h) when wind data is not loaded.
-    # Ensemble bins: FWI 5/15/25/35 (boundaries 10/20/30); EWS 5/15/25 (10/20).
+    # EWS from ERA5 WindSpeed_kmh as flat-terrain proxy (defaults to 15 km/h
+    # if wind data not loaded). Size filter (>= MIN_HA) applied inside
+    # plot_fire_ensemble() so the same threshold is used everywhere.
     obs_fires_df <- NULL
     if (!is.null(rv$ign_df) && "FIRE_SIZE_HA" %in% names(rv$ign_df) &&
         "date" %in% names(rv$ign_df) && !is.null(rv$era_fwi_daily)) {
@@ -4899,19 +4903,14 @@ server <- function(input, output, session) {
 
       fpa <- rv$ign_df |>
         dplyr::filter(is.finite(FIRE_SIZE_HA), FIRE_SIZE_HA > 0, !is.na(date)) |>
-        dplyr::left_join(
-          rv$era_fwi_daily |> dplyr::rename(FWI = value),
-          by = "date"
-        ) |>
+        dplyr::left_join(rv$era_fwi_daily |> dplyr::rename(FWI = value),
+                         by = "date") |>
         dplyr::filter(is.finite(FWI))
 
-      # Optionally join ERA5 wind speed for EWS proxy
       if (!is.null(rv$wind_daily) && "WindSpeed_kmh" %in% names(rv$wind_daily)) {
         fpa <- fpa |>
-          dplyr::left_join(
-            rv$wind_daily |> dplyr::select(date, WindSpeed_kmh),
-            by = "date"
-          )
+          dplyr::left_join(rv$wind_daily |> dplyr::select(date, WindSpeed_kmh),
+                           by = "date")
       } else {
         fpa$WindSpeed_kmh <- NA_real_
       }
@@ -4920,7 +4919,6 @@ server <- function(input, output, session) {
         obs_fires_df <- fpa |>
           dplyr::mutate(
             fire_ha = FIRE_SIZE_HA,
-            # Use wind speed as flat-terrain EWS proxy; default to 15 km/h if missing
             ews_val = dplyr::coalesce(WindSpeed_kmh, 15.0),
             FWI_bin = fwi_vals[as.integer(cut(FWI,     breaks = fwi_breaks))],
             EWS_bin = ews_vals[as.integer(cut(ews_val, breaks = ews_breaks))]
@@ -4935,7 +4933,8 @@ server <- function(input, output, session) {
     plot_fire_ensemble(ens,
                        reference_p50 = fpa_p50,
                        reference_p90 = fpa_p90,
-                       obs_fires_df  = obs_fires_df)
+                       obs_fires_df  = obs_fires_df,
+                       min_obs_ha    = MIN_HA)
   })
 
   output$tune_ens_status_ui <- renderUI({

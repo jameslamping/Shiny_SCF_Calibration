@@ -787,7 +787,8 @@ run_fire_ensemble <- function(fwi_vals     = c(5, 15, 25, 35),
 plot_fire_ensemble <- function(ensemble_df,
                                 reference_p50 = NULL,
                                 reference_p90 = NULL,
-                                obs_fires_df  = NULL) {
+                                obs_fires_df  = NULL,
+                                min_obs_ha    = 4) {
 
   if (is.null(ensemble_df) || nrow(ensemble_df) == 0)
     return(ggplot() + labs(title = "Click 'Run Ensemble' to generate fire size distribution.") + theme_bw())
@@ -800,28 +801,30 @@ plot_fire_ensemble <- function(ensemble_df,
   # Grid size (stored per row; grab from first row)
   gd <- if ("grid_dim" %in% names(ensemble_df)) ensemble_df$grid_dim[1] else 100L
 
-  df <- ensemble_df |>
+  sim_df <- ensemble_df |>
     dplyr::mutate(
-      FWI_label    = factor(paste0("FWI = ", FWI),   levels = fwi_lvls),
+      FWI_label    = factor(paste0("FWI = ", FWI),        levels = fwi_lvls),
       EWS_label    = factor(paste0("EWS ", EWS, " km/h"), levels = ews_lvls),
-      fire_ha_plot = pmax(fire_ha, 0.01)   # avoid log(0)
+      fire_ha_plot = pmax(fire_ha, 0.01),
+      source       = "Simulated"
     )
 
-  # Compute median and 90th pct for subtitle
-  med_ha <- round(stats::median(df$fire_ha), 1)
-  p90_ha <- round(stats::quantile(df$fire_ha, 0.90), 1)
+  med_ha <- round(stats::median(sim_df$fire_ha), 1)
+  p90_ha <- round(stats::quantile(sim_df$fire_ha, 0.90), 1)
 
-  # ---- Prepare observed fires overlay (GeoMAC, binned by FWI x EWS) ----------
-  # obs_fires_df columns: fire_ha, FWI_bin, EWS_bin (numeric, snapped to ensemble values)
+  # ---- Prepare observed (FPA FOD) — filter to landscape-scale fires ----------
+  # obs_fires_df columns: fire_ha, FWI_bin, EWS_bin (numeric, binned to ensemble values)
+  # Filter to >= min_obs_ha to exclude tiny escaped ignitions (86% of FOD < 4 ha)
   obs_plot <- NULL
   if (!is.null(obs_fires_df) && nrow(obs_fires_df) > 0 &&
       all(c("fire_ha", "FWI_bin", "EWS_bin") %in% names(obs_fires_df))) {
     obs_plot <- obs_fires_df |>
-      dplyr::filter(is.finite(fire_ha), fire_ha > 0) |>
+      dplyr::filter(is.finite(fire_ha), fire_ha >= min_obs_ha) |>
       dplyr::mutate(
         fire_ha_plot = pmax(fire_ha, 0.01),
-        FWI_label    = factor(paste0("FWI = ",  FWI_bin),        levels = fwi_lvls),
-        EWS_label    = factor(paste0("EWS ", EWS_bin, " km/h"),  levels = ews_lvls)
+        FWI_label    = factor(paste0("FWI = ",  FWI_bin),       levels = fwi_lvls),
+        EWS_label    = factor(paste0("EWS ", EWS_bin, " km/h"), levels = ews_lvls),
+        source       = "Observed (FPA FOD)"
       ) |>
       dplyr::filter(!is.na(FWI_label), !is.na(EWS_label))
     if (nrow(obs_plot) == 0) obs_plot <- NULL
@@ -829,63 +832,123 @@ plot_fire_ensemble <- function(ensemble_df,
 
   n_obs <- if (!is.null(obs_plot)) nrow(obs_plot) else 0L
 
-  p <- ggplot(df, aes(FWI_label, fire_ha_plot, fill = FWI_label)) +
-    geom_violin(scale = "width", alpha = 0.55, colour = NA) +
-    geom_boxplot(width = 0.18, outlier.shape = NA,
-                 colour = "grey20", fill = "white", alpha = 0.8) +
-    geom_jitter(width = 0.12, alpha = 0.4, size = 1.4, colour = "grey50") +
-    # Observed GeoMAC fires — navy triangles, placed on correct FWI x EWS facet
-    {if (!is.null(obs_plot))
-      geom_jitter(data        = obs_plot,
-                  mapping     = aes(x = FWI_label, y = fire_ha_plot),
-                  inherit.aes = FALSE,
-                  shape = 17, colour = "#08306b", alpha = 0.75,
-                  size  = 2.2, width = 0.15)
-    } +
-    facet_wrap(~ EWS_label, nrow = 1) +
-    scale_y_log10(
-      labels = scales::comma,
-      breaks = c(0.1, 1, 10, 100, 1000, 10000, 100000),
-      limits = c(0.01, 200000)
-    ) +
-    scale_fill_brewer(palette = "YlOrRd", guide = "none") +
-    # Plausible size reference band
+  # Shared layers used in both modes
+  y_scale <- scale_y_log10(
+    labels = scales::comma,
+    breaks = c(0.1, 1, 10, 100, 1000, 10000, 100000),
+    limits = c(0.01, 200000)
+  )
+  ref_band <- list(
     annotate("rect", xmin = -Inf, xmax = Inf, ymin = 10, ymax = 5000,
-             fill = "#2c5f2e", alpha = 0.07) +
+             fill = "#2c5f2e", alpha = 0.07),
     annotate("text", x = 0.6, y = 50, label = "Plausible\n10-5000 ha",
-             size = 3, colour = "#2c5f2e", hjust = 0) +
-    # Optional FPA FOD reference lines (overall P50 / P90, not faceted)
-    {if (!is.null(reference_p50))
+             size = 2.8, colour = "#2c5f2e", hjust = 0)
+  )
+  ref_lines <- list(
+    if (!is.null(reference_p50))
       geom_hline(yintercept = reference_p50, linetype = "dashed",
-                 colour = "#2171b5", linewidth = 0.7)
-    } +
-    {if (!is.null(reference_p90))
+                 colour = "#2171b5", linewidth = 0.7) else NULL,
+    if (!is.null(reference_p90))
       geom_hline(yintercept = reference_p90, linetype = "dotted",
-                 colour = "#2171b5", linewidth = 0.7)
-    } +
-    labs(
-      title    = "Fire Size Distribution — Simulation Ensemble",
-      subtitle = sprintf(
-        "Each scenario: %d runs, %dx%d cell grid.  Sim median = %.1f ha  |  Sim P90 = %.1f ha%s",
-        dplyr::n_distinct(df$rep), gd, gd,
-        med_ha, p90_ha,
-        if (n_obs > 0) sprintf("  |  %d observed FPA FOD fires (triangles)", n_obs) else ""
-      ),
-      x        = NULL,
-      y        = "Fire size (ha, log scale)",
-      caption  = paste0(
-        "Grey = simulated fires; navy triangles = observed FPA FOD fires binned to nearest FWI/EWS scenario. ",
-        if (!is.null(reference_p50)) sprintf("Blue dashed = FPA P50 (%.0f ha). ", reference_p50) else "",
-        "Green band = plausible range."
-      )
-    ) +
-    theme_bw(base_size = 12) +
+                 colour = "#2171b5", linewidth = 0.7) else NULL
+  )
+  base_theme <- list(
+    theme_bw(base_size = 12),
     theme(
-      legend.position   = "none",
-      axis.text.x       = element_text(angle = 30, hjust = 1, size = 9),
-      strip.background  = element_rect(fill = "#f0f0f0"),
-      plot.subtitle     = element_text(size = 9, colour = "grey40")
+      axis.text.x      = element_text(angle = 30, hjust = 1, size = 9),
+      strip.background = element_rect(fill = "#f0f0f0"),
+      plot.subtitle    = element_text(size = 9, colour = "grey40")
     )
+  )
+
+  # ============================================================
+  # MODE A: observed data present — dodged boxplot comparison
+  # ============================================================
+  if (!is.null(obs_plot) && nrow(obs_plot) >= 3) {
+
+    # Colours: navy = observed, orange = simulated
+    col_obs <- "#2c4f8f"
+    col_sim <- "#e07b54"
+
+    all_df <- dplyr::bind_rows(
+      sim_df |> dplyr::select(FWI_label, EWS_label, fire_ha_plot, source),
+      obs_plot |> dplyr::select(FWI_label, EWS_label, fire_ha_plot, source)
+    ) |>
+      dplyr::mutate(source = factor(source,
+                                     levels = c("Observed (FPA FOD)", "Simulated")))
+
+    obs_med <- round(stats::median(obs_plot$fire_ha), 1)
+    obs_p90 <- round(stats::quantile(obs_plot$fire_ha, 0.90), 1)
+
+    p <- ggplot(all_df, aes(x = FWI_label, y = fire_ha_plot, fill = source)) +
+      geom_boxplot(
+        position      = position_dodge(0.7),
+        outlier.shape = 21, outlier.size = 1.0, outlier.alpha = 0.45,
+        alpha = 0.75, width = 0.55
+      ) +
+      facet_wrap(~ EWS_label, nrow = 1) +
+      y_scale +
+      scale_fill_manual(
+        values = c("Observed (FPA FOD)" = col_obs, "Simulated" = col_sim),
+        name   = NULL
+      ) +
+      ref_band +
+      ref_lines +
+      labs(
+        title   = "Fire Size Distribution — Simulation Ensemble vs Observed (FPA FOD)",
+        subtitle = sprintf(
+          paste0("%dx%d grid, %d runs/scenario.  ",
+                 "Obs (>=%.0f ha): median=%.0f ha, P90=%.0f ha  |  ",
+                 "Sim: median=%.1f ha, P90=%.1f ha  |  n_obs=%d"),
+          gd, gd, dplyr::n_distinct(sim_df$rep),
+          min_obs_ha, obs_med, obs_p90,
+          med_ha, p90_ha, n_obs
+        ),
+        x       = NULL,
+        y       = "Fire size (ha, log scale)",
+        caption = paste0(
+          "FPA FOD fires binned to nearest FWI/EWS scenario (wind speed on discovery date as EWS proxy). ",
+          sprintf("Min size: %.0f ha.  ", min_obs_ha),
+          if (!is.null(reference_p50)) sprintf("Blue dashed = FPA P50 (%.0f ha, >=%.0f ha fires). ", reference_p50, min_obs_ha) else "",
+          "Green band = plausible range."
+        )
+      ) +
+      base_theme +
+      theme(legend.position = "bottom")
+
+  # ============================================================
+  # MODE B: no observed data — violin + boxplot + jitter (simulated only)
+  # ============================================================
+  } else {
+
+    p <- ggplot(sim_df, aes(FWI_label, fire_ha_plot, fill = FWI_label)) +
+      geom_violin(scale = "width", alpha = 0.55, colour = NA) +
+      geom_boxplot(width = 0.18, outlier.shape = NA,
+                   colour = "grey20", fill = "white", alpha = 0.8) +
+      geom_jitter(width = 0.12, alpha = 0.4, size = 1.4, colour = "grey50") +
+      facet_wrap(~ EWS_label, nrow = 1) +
+      y_scale +
+      scale_fill_brewer(palette = "YlOrRd", guide = "none") +
+      ref_band +
+      ref_lines +
+      labs(
+        title    = "Fire Size Distribution — Simulation Ensemble",
+        subtitle = sprintf(
+          "Each scenario: %d runs, %dx%d cell grid.  Sim median = %.1f ha  |  Sim P90 = %.1f ha",
+          dplyr::n_distinct(sim_df$rep), gd, gd, med_ha, p90_ha
+        ),
+        x       = NULL,
+        y       = "Fire size (ha, log scale)",
+        caption = paste0(
+          "Load FPA FOD ignition data to overlay observed fire size distribution. ",
+          if (!is.null(reference_p50)) sprintf("Blue dashed = FPA P50 (%.0f ha). ", reference_p50) else "",
+          "Green band = plausible range."
+        )
+      ) +
+      base_theme +
+      theme(legend.position = "none")
+  }
+
   p
 }
 
