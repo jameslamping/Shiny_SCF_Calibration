@@ -270,13 +270,12 @@ plot_val_size_ecdf <- function(fpa_sizes_ha, sim_events_df,
 # -----------------------------------------------------------------------------
 
 plot_val_annual_area <- function(fpa_df, sim_events_df,
-                                  park_fpa_df = NULL,
+                                  obs_label   = "Observed \u2014 FPA FOD",
+                                  plot_title  = "Annual Area Burned",
                                   year_min = 1992, year_max = 2018) {
 
   if (is.null(sim_events_df)) return(NULL)
   if (!"fire_size_ha" %in% names(sim_events_df)) return(NULL)
-
-  .COL_PARK <- "#2980b9"   # LANDIS landscape observed
 
   # SCF annual totals (always available)
   sim_annual <- sim_events_df %>%
@@ -292,7 +291,7 @@ plot_val_annual_area <- function(fpa_df, sim_events_df,
   obs_note  <- if (is.null(fpa_df))
     "\nRun Ignition Calibration to add observed FPA FOD comparison." else ""
 
-  # Add calibration-boundary observed if available
+  # Add observed series (label is caller-supplied for context)
   if (!is.null(fpa_df) && "FIRE_YEAR" %in% names(fpa_df) &&
       "FIRE_SIZE_HA" %in% names(fpa_df)) {
     obs_annual <- fpa_df %>%
@@ -300,42 +299,19 @@ plot_val_annual_area <- function(fpa_df, sim_events_df,
              is.finite(FIRE_SIZE_HA)) %>%
       group_by(year = FIRE_YEAR) %>%
       summarise(area_ha = sum(FIRE_SIZE_HA, na.rm = TRUE), .groups = "drop") %>%
-      mutate(source = "Observed \u2014 Calibration boundary")
+      mutate(source = obs_label)
     obs_med   <- median(obs_annual$area_ha, na.rm = TRUE)
     plot_df   <- bind_rows(obs_annual, sim_annual)
-    fill_vals <- c(fill_vals, setNames(.COL_OBS, "Observed \u2014 Calibration boundary"))
+    fill_vals <- c(fill_vals, setNames(.COL_OBS, obs_label))
     subtitle  <- sprintf(
-      "Obs (cal boundary) median: %s ha  |  Simulated median: %s ha  |  Ratio: %.2f\u00d7",
+      "Observed median: %s ha  |  Simulated median: %s ha  |  Ratio: %.2f\u00d7",
       scales::comma(round(obs_med)), scales::comma(round(sim_med)),
       sim_med / obs_med
     )
     obs_note <- ""
   }
 
-  # Add LANDIS landscape observed if available
-  if (!is.null(park_fpa_df) && "FIRE_YEAR" %in% names(park_fpa_df) &&
-      "FIRE_SIZE_HA" %in% names(park_fpa_df)) {
-    park_annual <- park_fpa_df %>%
-      filter(FIRE_YEAR >= year_min, FIRE_YEAR <= year_max,
-             is.finite(FIRE_SIZE_HA)) %>%
-      group_by(year = FIRE_YEAR) %>%
-      summarise(area_ha = sum(FIRE_SIZE_HA, na.rm = TRUE), .groups = "drop") %>%
-      mutate(source = "Observed \u2014 LANDIS landscape")
-    park_med  <- median(park_annual$area_ha, na.rm = TRUE)
-    plot_df   <- bind_rows(plot_df, park_annual)
-    fill_vals <- c(fill_vals, setNames(.COL_PARK, "Observed \u2014 LANDIS landscape"))
-    subtitle  <- paste0(subtitle,
-                        sprintf("  |  LANDIS obs median: %s ha",
-                                scales::comma(round(park_med))))
-  }
-
-  # Set factor order: cal obs -> LANDIS obs -> simulated
-  src_order <- intersect(
-    c("Observed \u2014 Calibration boundary",
-      "Observed \u2014 LANDIS landscape",
-      "Simulated \u2014 SCF"),
-    unique(plot_df$source)
-  )
+  src_order <- intersect(c(obs_label, "Simulated \u2014 SCF"), unique(plot_df$source))
   plot_df$source <- factor(plot_df$source, levels = src_order)
 
   ggplot(plot_df, aes(x = source, y = area_ha, fill = source)) +
@@ -345,11 +321,11 @@ plot_val_annual_area <- function(fpa_df, sim_events_df,
     scale_fill_manual(values = fill_vals) +
     scale_y_continuous(labels = scales::label_comma()) +
     labs(
-      title    = "Annual Area Burned",
+      title    = plot_title,
       subtitle = paste0(subtitle, obs_note),
       x = NULL, y = "Area burned (ha)",
       caption = sprintf(
-        "FPA FOD %d\u2013%d: calibration boundary (all fires) and LANDIS landscape (fires within template extent).  Simulated: all SCF events.",
+        "Observed: FPA FOD %d\u2013%d.  Simulated: all SCF events.",
         year_min, year_max
       )
     ) +

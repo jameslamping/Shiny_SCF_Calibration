@@ -1339,13 +1339,18 @@ ui <- page_navbar(
           nav_panel("Annual Area Burned",
             br(),
             p(class = "text-muted small",
-              "Distribution of total area burned per year.  Three series when all data is loaded: ",
-              tags$b("Observed — Calibration boundary"), " (all FPA FOD fires within cal_vect), ",
-              tags$b("Observed — LANDIS landscape"), " (FPA FOD fires within the template extent, ",
-              "loaded on the Ignition tab under Option B), and ",
-              tags$b("Simulated — SCF"), " annual totals.  The LANDIS landscape series provides ",
-              "a like-for-like comparison with the simulated fires."),
-            plotOutput("val_area_plot", height = "450px"),
+              "Two separate comparisons at different spatial scales.  ",
+              tags$b("Top:"), " observed fires across the full calibration boundary (all FPA FOD ",
+              "within cal_vect) vs simulated — note the y-axes will differ substantially because ",
+              "the calibration boundary is much larger than the LANDIS landscape.  ",
+              tags$b("Bottom:"), " observed fires within the LANDIS landscape boundary ",
+              "(loaded on the Ignition tab under Option B) vs simulated — a like-for-like ",
+              "comparison at the same spatial scale."),
+            h6(class = "mt-2", icon("globe"), " Calibration Boundary Scale"),
+            plotOutput("val_area_cal_plot", height = "380px"),
+            br(),
+            h6(class = "mt-2", icon("map"), " LANDIS Landscape Scale"),
+            plotOutput("val_area_park_plot", height = "380px"),
             br(),
             downloadButton("dl_val_area", "Download PNG (300 dpi)",
                            class = "btn-sm btn-outline-secondary")
@@ -2684,12 +2689,37 @@ server <- function(input, output, session) {
     plot_val_size_ecdf(fpa_sizes, rv$simulated_events)
   })
 
-  output$val_area_plot <- renderPlot({
+  # Annual area burned — calibration boundary scale
+  output$val_area_cal_plot <- renderPlot({
     req(rv$simulated_events)
-    plot_val_annual_area(rv$ign_df, rv$simulated_events,
-                         park_fpa_df = rv$park_ign_df,
-                         year_min    = input$cal_years[1],
-                         year_max    = input$cal_years[2])
+    plot_val_annual_area(
+      rv$ign_df, rv$simulated_events,
+      obs_label  = "Observed — Cal. boundary",
+      plot_title = "Annual Area Burned — Calibration Boundary",
+      year_min   = input$cal_years[1],
+      year_max   = input$cal_years[2]
+    )
+  })
+
+  # Annual area burned — LANDIS landscape scale
+  output$val_area_park_plot <- renderPlot({
+    req(rv$simulated_events)
+    if (is.null(rv$park_ign_df)) {
+      return(ggplot() +
+               annotate("text", x = 0.5, y = 0.5, size = 4.5, hjust = 0.5,
+                        label = paste0(
+                          "LANDIS landscape fires not loaded.\n",
+                          "Load FPA FOD on the Ignition tab (Option B) to see this panel.")) +
+               labs(title = "Annual Area Burned — LANDIS Landscape") +
+               theme_void() + theme(plot.title = element_text(size = 13, face = "bold")))
+    }
+    plot_val_annual_area(
+      rv$park_ign_df, rv$simulated_events,
+      obs_label  = "Observed — LANDIS landscape",
+      plot_title = "Annual Area Burned — LANDIS Landscape",
+      year_min   = input$cal_years[1],
+      year_max   = input$cal_years[2]
+    )
   })
 
   output$val_fwi_size_plot <- renderPlot({
@@ -2842,9 +2872,12 @@ server <- function(input, output, session) {
   output$dl_val_area <- .make_val_png_handler(
     function() {
       req(rv$simulated_events)
+      # Export the calibration-boundary comparison for the download
       plot_val_annual_area(rv$ign_df, rv$simulated_events,
-                           year_min = input$cal_years[1],
-                           year_max = input$cal_years[2])
+                           obs_label  = "Observed — Cal. boundary",
+                           plot_title = "Annual Area Burned — Calibration Boundary",
+                           year_min   = input$cal_years[1],
+                           year_max   = input$cal_years[2])
     },
     "validation_annual_area_burned.png"
   )
@@ -2911,7 +2944,10 @@ server <- function(input, output, session) {
             rv$simulated_events), error = function(e) NULL),
         "03_annual_area_burned"     =
           tryCatch(plot_val_annual_area(rv$ign_df, rv$simulated_events,
-                                        input$cal_years[1], input$cal_years[2]),
+                                        obs_label  = "Observed — Cal. boundary",
+                                        plot_title = "Annual Area Burned — Calibration Boundary",
+                                        year_min   = input$cal_years[1],
+                                        year_max   = input$cal_years[2]),
                    error = function(e) NULL),
         "04_fire_climate"           = {
           cal_ha  <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$cal_area_ha  else NULL
@@ -4847,35 +4883,53 @@ server <- function(input, output, session) {
     fpa_p90 <- if (!is.null(fpa_sizes) && length(fpa_sizes) > 0)
       stats::quantile(fpa_sizes, 0.90, na.rm = TRUE) else NULL
 
-    # ---- Observed GeoMAC fires binned to FWI x EWS cells (navy triangles) ----
-    # Ensemble FWI bins: 5, 15, 25, 35  (boundaries at 10, 20, 30)
-    # Ensemble EWS bins: 5, 15, 25      (boundaries at 10, 20)
+    # ---- Observed FPA FOD fires binned to FWI x EWS cells (navy triangles) ----
+    # FWI from ERA-Interim joined by discovery date.
+    # EWS from ERA5 wind joined by date (WindSpeed_kmh as flat-terrain proxy);
+    # falls back to the middle bin (15 km/h) when wind data is not loaded.
+    # Ensemble bins: FWI 5/15/25/35 (boundaries 10/20/30); EWS 5/15/25 (10/20).
     obs_fires_df <- NULL
-    if (!is.null(rv$pairs_clean) &&
-        all(c("FIRE_ID", "daily_area_ha", "FWI", "EffectiveWind") %in% names(rv$pairs_clean))) {
+    if (!is.null(rv$ign_df) && "FIRE_SIZE_HA" %in% names(rv$ign_df) &&
+        "date" %in% names(rv$ign_df) && !is.null(rv$era_fwi_daily)) {
+
       fwi_breaks <- c(-Inf, 10, 20, 30, Inf)
       fwi_vals   <- c(5L, 15L, 25L, 35L)
       ews_breaks <- c(-Inf, 10, 20, Inf)
       ews_vals   <- c(5L, 15L, 25L)
 
-      obs_fires_df <- rv$pairs_clean |>
-        dplyr::filter(is.finite(daily_area_ha), daily_area_ha >= 0,
-                      is.finite(FWI), is.finite(EffectiveWind)) |>
-        dplyr::group_by(FIRE_ID) |>
-        dplyr::summarize(
-          fire_ha  = sum(daily_area_ha, na.rm = TRUE),
-          mean_FWI = mean(FWI, na.rm = TRUE),
-          mean_EWS = mean(EffectiveWind, na.rm = TRUE),
-          .groups  = "drop"
+      fpa <- rv$ign_df |>
+        dplyr::filter(is.finite(FIRE_SIZE_HA), FIRE_SIZE_HA > 0, !is.na(date)) |>
+        dplyr::left_join(
+          rv$era_fwi_daily |> dplyr::rename(FWI = value),
+          by = "date"
         ) |>
-        dplyr::filter(fire_ha > 0) |>
-        dplyr::mutate(
-          FWI_bin = fwi_vals[as.integer(cut(mean_FWI, breaks = fwi_breaks))],
-          EWS_bin = ews_vals[as.integer(cut(mean_EWS, breaks = ews_breaks))]
-        ) |>
-        dplyr::filter(!is.na(FWI_bin), !is.na(EWS_bin))
+        dplyr::filter(is.finite(FWI))
 
-      if (nrow(obs_fires_df) == 0) obs_fires_df <- NULL
+      # Optionally join ERA5 wind speed for EWS proxy
+      if (!is.null(rv$wind_daily) && "WindSpeed_kmh" %in% names(rv$wind_daily)) {
+        fpa <- fpa |>
+          dplyr::left_join(
+            rv$wind_daily |> dplyr::select(date, WindSpeed_kmh),
+            by = "date"
+          )
+      } else {
+        fpa$WindSpeed_kmh <- NA_real_
+      }
+
+      if (nrow(fpa) > 0) {
+        obs_fires_df <- fpa |>
+          dplyr::mutate(
+            fire_ha = FIRE_SIZE_HA,
+            # Use wind speed as flat-terrain EWS proxy; default to 15 km/h if missing
+            ews_val = dplyr::coalesce(WindSpeed_kmh, 15.0),
+            FWI_bin = fwi_vals[as.integer(cut(FWI,     breaks = fwi_breaks))],
+            EWS_bin = ews_vals[as.integer(cut(ews_val, breaks = ews_breaks))]
+          ) |>
+          dplyr::filter(!is.na(FWI_bin), !is.na(EWS_bin)) |>
+          dplyr::select(fire_ha, FWI_bin, EWS_bin)
+
+        if (nrow(obs_fires_df) == 0) obs_fires_df <- NULL
+      }
     }
 
     plot_fire_ensemble(ens,

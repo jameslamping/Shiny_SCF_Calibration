@@ -845,7 +845,8 @@ plot_fire_ensemble <- function(ensemble_df,
     facet_wrap(~ EWS_label, nrow = 1) +
     scale_y_log10(
       labels = scales::comma,
-      breaks = c(0.1, 1, 10, 100, 1000, 10000, 100000)
+      breaks = c(0.1, 1, 10, 100, 1000, 10000, 100000),
+      limits = c(0.01, 200000)
     ) +
     scale_fill_brewer(palette = "YlOrRd", guide = "none") +
     # Plausible size reference band
@@ -868,12 +869,12 @@ plot_fire_ensemble <- function(ensemble_df,
         "Each scenario: %d runs, %dx%d cell grid.  Sim median = %.1f ha  |  Sim P90 = %.1f ha%s",
         dplyr::n_distinct(df$rep), gd, gd,
         med_ha, p90_ha,
-        if (n_obs > 0) sprintf("  |  %d observed GeoMAC fires (triangles)", n_obs) else ""
+        if (n_obs > 0) sprintf("  |  %d observed FPA FOD fires (triangles)", n_obs) else ""
       ),
       x        = NULL,
       y        = "Fire size (ha, log scale)",
       caption  = paste0(
-        "Grey = simulated fires; navy triangles = observed GeoMAC fires binned to nearest FWI/EWS scenario. ",
+        "Grey = simulated fires; navy triangles = observed FPA FOD fires binned to nearest FWI/EWS scenario. ",
         if (!is.null(reference_p50)) sprintf("Blue dashed = FPA P50 (%.0f ha). ", reference_p50) else "",
         "Green band = plausible range."
       )
