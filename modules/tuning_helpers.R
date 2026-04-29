@@ -527,6 +527,222 @@ plot_dnbr_surface <- function(sm_b0, sm_b1, sm_b2, sm_b3, sm_b4, sm_b5, sm_b6,
 
 
 # =============================================================================
+# Site Mortality — Eta Decomposition Bar Chart
+#
+# At one set of predictor values, shows the additive contribution of each
+# term (Bn * predictor) to eta.  Positive contributions (blue) raise eta and
+# reduce severity; negative contributions (red) lower eta and raise dNBR.
+# The total eta and resulting dNBR are shown in the subtitle.
+# =============================================================================
+
+plot_sm_eta_decomposition <- function(sm_b0, sm_b1, sm_b2, sm_b3, sm_b4, sm_b5, sm_b6,
+                                       clay, et_mm, ews_kmh, cwd_mm, ff, lf) {
+
+  terms <- data.frame(
+    term  = c("B0 (Intercept)",
+              "B1 x Clay",
+              "B2 x ET",
+              "B3 x EWS",
+              "B4 x CWD",
+              "B5 x FineFuels",
+              "B6 x LadderFuels"),
+    coef  = c(sm_b0, sm_b1, sm_b2, sm_b3, sm_b4, sm_b5, sm_b6),
+    pred  = c(1, clay, et_mm, ews_kmh, cwd_mm, ff, lf)
+  ) |>
+    dplyr::mutate(
+      contribution = coef * pred,
+      direction    = ifelse(contribution >= 0,
+                            "Increases eta (reduces severity)",
+                            "Decreases eta (increases severity)"),
+      term         = factor(term, levels = rev(term))  # bottom-to-top display
+    )
+
+  eta_total <- sum(terms$contribution)
+  dnbr_val  <- if (eta_total <= 0) Inf else 1 / eta_total
+  dnbr_show <- min(dnbr_val, 2000)
+
+  sev_label <- dplyr::case_when(
+    is.infinite(dnbr_val) | dnbr_val > 1999 ~ "CAPPED at 2000 (eta <= 0)",
+    dnbr_val > 1000 ~ sprintf("%.0f  — Very High severity",  dnbr_show),
+    dnbr_val > 600  ~ sprintf("%.0f  — High severity",       dnbr_show),
+    dnbr_val > 355  ~ sprintf("%.0f  — Moderate severity",   dnbr_show),
+    dnbr_val > 185  ~ sprintf("%.0f  — Low-Moderate",        dnbr_show),
+    TRUE            ~ sprintf("%.0f  — Low severity",         dnbr_show)
+  )
+
+  eta_ok <- is.finite(dnbr_val) && dnbr_val < 2000
+  sub_col <- if (eta_ok) "grey40" else "#c0392b"
+
+  ggplot(terms, aes(x = contribution, y = term, fill = direction)) +
+    geom_col(alpha = 0.85, width = 0.65) +
+    geom_vline(xintercept = 0, colour = "grey30", linewidth = 0.5) +
+    geom_text(aes(label = sprintf("%.2e", contribution),
+                  hjust = ifelse(contribution >= 0, -0.1, 1.1)),
+              size = 3.2, colour = "grey20") +
+    scale_fill_manual(
+      values = c("Increases eta (reduces severity)"  = "#2980b9",
+                 "Decreases eta (increases severity)" = "#c0392b"),
+      name = NULL
+    ) +
+    scale_x_continuous(expand = expansion(mult = 0.3)) +
+    labs(
+      title    = "Eta Decomposition — term-by-term contributions",
+      subtitle = sprintf("eta = %.5f   =>   dNBR = %s", eta_total, sev_label),
+      x        = "Contribution to eta  (eta = sum of all terms = 1/dNBR)",
+      y        = NULL
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      legend.position = "bottom",
+      plot.subtitle   = element_text(size = 9.5, colour = sub_col, face = "bold")
+    )
+}
+
+
+# =============================================================================
+# Site Mortality — Marginal Effects Grid
+#
+# Holds all predictors at their current slider values and varies one at a
+# time, showing the isolated dNBR response.  A red diamond marks the
+# current slider position on each panel.
+# =============================================================================
+
+plot_sm_marginal_effects <- function(sm_b0, sm_b1, sm_b2, sm_b3, sm_b4, sm_b5, sm_b6,
+                                      clay, et_mm, ews_kmh, cwd_mm, ff, lf) {
+
+  # Baseline eta at current slider values
+  eta_base <- sm_b0 + sm_b1*clay + sm_b2*et_mm + sm_b3*ews_kmh +
+              sm_b4*cwd_mm + sm_b5*ff + sm_b6*lf
+
+  # For each predictor, replace that term with a range of values
+  make_curve <- function(b_coef, pred_range, current_val, panel_label, x_label) {
+    eta_vec <- eta_base - b_coef * current_val + b_coef * pred_range
+    data.frame(
+      panel   = panel_label,
+      x_label = x_label,
+      x       = pred_range,
+      eta     = eta_vec,
+      dNBR    = pmin(ifelse(eta_vec <= 0, 2000, 1 / eta_vec), 2000),
+      is_current = abs(pred_range - current_val) == min(abs(pred_range - current_val))
+    )
+  }
+
+  df <- dplyr::bind_rows(
+    make_curve(sm_b1, seq(0,    0.7, 0.005), clay,     "Clay",         "Clay (fraction 0-1)"),
+    make_curve(sm_b2, seq(0,  1500, 5),       et_mm,   "ET",           "ET (mm/yr)"),
+    make_curve(sm_b3, seq(0,    50, 0.25),    ews_kmh, "EWS",          "Effective Wind Speed (km/h)"),
+    make_curve(sm_b4, seq(0,   700, 2),       cwd_mm,  "CWD",          "Climatic Water Deficit (mm)"),
+    make_curve(sm_b5, seq(0,     1, 0.01),    ff,      "FineFuels",    "Fine Fuels (0-1 scaled)"),
+    make_curve(sm_b6, seq(0,  1000, 5),       lf,      "LadderFuels",  "Ladder Fuels (g C/m2)")
+  ) |>
+    dplyr::mutate(panel = factor(panel,
+                                  levels = c("Clay","ET","EWS","CWD","FineFuels","LadderFuels")))
+
+  current_pts <- df |> dplyr::filter(is_current)
+
+  ggplot(df, aes(x, dNBR)) +
+    geom_hline(yintercept = c(185, 355, 600, 1000), linetype = "dashed",
+               colour = "grey72", linewidth = 0.35) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = 0, ymax = 185,
+             fill = "#ffffcc", alpha = 0.35) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = 185, ymax = 355,
+             fill = "#fed976", alpha = 0.35) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = 355, ymax = 600,
+             fill = "#fd8d3c", alpha = 0.30) +
+    annotate("rect", xmin = -Inf, xmax = Inf, ymin = 600, ymax = 2100,
+             fill = "#e31a1c", alpha = 0.12) +
+    geom_line(colour = "#2c3e50", linewidth = 1.0) +
+    geom_point(data = current_pts, aes(x, dNBR),
+               colour = "#c0392b", size = 4, shape = 18) +
+    facet_wrap(~ panel, scales = "free_x", nrow = 2,
+               labeller = labeller(panel = c(
+                 Clay        = "Clay  (B1)",
+                 ET          = "ET  (B2)",
+                 EWS         = "EWS  (B3)",
+                 CWD         = "CWD  (B4)",
+                 FineFuels   = "FineFuels  (B5)",
+                 LadderFuels = "LadderFuels  (B6)"
+               ))) +
+    scale_y_continuous(limits = c(0, 2100),
+                       labels = scales::comma,
+                       breaks = c(0, 185, 355, 600, 1000, 2000)) +
+    labs(
+      title    = "Marginal Effects — isolated dNBR response per predictor",
+      subtitle = "All other predictors held at current slider values.  Red diamond = current value.  Shading = severity class.",
+      x        = NULL,
+      y        = "Predicted dNBR"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      strip.background = element_rect(fill = "#e8eaf6"),
+      strip.text       = element_text(face = "bold", size = 9),
+      plot.subtitle    = element_text(size = 8.5, colour = "grey40"),
+      axis.text.x      = element_text(size = 8)
+    )
+}
+
+
+# =============================================================================
+# Site Mortality — EWS x LadderFuels Severity Heatmap
+#
+# 2D color map of predicted severity class over the full EWS x LF space
+# at fixed Clay, ET, CWD, FF values from sliders.  Replaces guesswork
+# about which parameter combinations produce each severity class.
+# =============================================================================
+
+plot_sm_ews_lf_heatmap <- function(sm_b0, sm_b1, sm_b2, sm_b3, sm_b4, sm_b5, sm_b6,
+                                    clay, et_mm, cwd_mm, ff,
+                                    ews_max = 50, lf_max = 800) {
+
+  sev_breaks <- c(0, 185, 355, 600, 1000, 2001)
+  sev_labels <- c("Low (<185)", "Low-Mod (185-355)",
+                  "Moderate (355-600)", "High (600-1000)", "Very High (>1000)")
+  sev_colors <- c("#ffffb2", "#fecc5c", "#fd8d3c", "#e31a1c", "#800026")
+
+  df <- expand.grid(EWS = seq(0, ews_max, 0.5),
+                    LF  = seq(0, lf_max,  5)) |>
+    dplyr::mutate(
+      eta      = sm_b0 + sm_b1*clay + sm_b2*et_mm + sm_b3*EWS +
+                 sm_b4*cwd_mm + sm_b5*ff + sm_b6*LF,
+      dNBR     = pmin(ifelse(eta <= 0, 2000, 1/eta), 2000),
+      severity = cut(dNBR, breaks = sev_breaks, labels = sev_labels,
+                     right = FALSE, include.lowest = TRUE)
+    )
+
+  # Contour lines at key dNBR thresholds
+  df_cont <- expand.grid(EWS = seq(0, ews_max, 0.1),
+                          LF  = seq(0, lf_max,  1)) |>
+    dplyr::mutate(
+      eta  = sm_b0 + sm_b1*clay + sm_b2*et_mm + sm_b3*EWS + sm_b4*cwd_mm + sm_b5*ff + sm_b6*LF,
+      dNBR = pmin(ifelse(eta <= 0, 2000, 1/eta), 2000)
+    )
+
+  ggplot(df, aes(EWS, LF, fill = severity)) +
+    geom_raster(interpolate = TRUE) +
+    geom_contour(data = df_cont, aes(EWS, LF, z = dNBR),
+                 breaks = c(185, 355, 600, 1000),
+                 colour = "white", linewidth = 0.5, linetype = "solid") +
+    scale_fill_manual(
+      values = setNames(sev_colors, sev_labels),
+      name   = "Severity class",
+      drop   = FALSE
+    ) +
+    labs(
+      title    = "EWS x LadderFuels Severity Map",
+      subtitle = sprintf("Clay=%.3f  ET=%.0f mm  CWD=%.0f mm  FF=%.2f  |  White contours at dNBR 185/355/600/1000",
+                         clay, et_mm, cwd_mm, ff),
+      x        = "Effective Wind Speed (km/h)",
+      y        = "LadderFuels (g C/m2)"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      legend.position  = "right",
+      plot.subtitle    = element_text(size = 8.5, colour = "grey40")
+    )
+}
+
+
+# =============================================================================
 # Plot: Cohort Mortality
 # =============================================================================
 

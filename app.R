@@ -1580,8 +1580,12 @@ ui <- page_navbar(
                          value = 12, min = 0, step = 1),
             numericInput("tune_et",    "ET (mm/yr)",
                          value = 50, min = 0, step = 5),
-            numericInput("tune_ff_sm", "FineFuels for dNBR preview (0-1)",
-                         value = 0.3, min = 0, max = 1, step = 0.05)
+            numericInput("tune_ff_sm", "FineFuels (0-1 scaled)",
+                         value = 0.3, min = 0, max = 1, step = 0.05),
+            numericInput("tune_lf_sm", "LadderFuels (g C/m²)",
+                         value = 100, min = 0, step = 10),
+            p(class = "text-muted small",
+              "LadderFuels used for Eta Decomposition preview.")
           )
         ),
 
@@ -1705,10 +1709,14 @@ ui <- page_navbar(
           # ---- Site Mortality -----------------------------------------------
           nav_panel("Site Mortality",
             br(),
+            # Row 1: existing dNBR vs EWS curve + MTBS target
             fluidRow(
               column(6,
-                h6("Predicted dNBR — equation output"),
-                plotOutput("tune_dnbr_plot", height = "320px")
+                h6("Predicted dNBR vs Effective Wind Speed"),
+                p(class = "text-muted small",
+                  "Lines show dNBR at several LadderFuel levels. Aim for the ",
+                  "curves to span the observed MTBS range on the right."),
+                plotOutput("tune_dnbr_plot", height = "300px")
               ),
               column(6,
                 h6(icon("satellite"), " Observed dNBR target — MTBS"),
@@ -1716,11 +1724,42 @@ ui <- page_navbar(
                   "Histogram of MTBS observed mean dNBR per fire. Tune Site ",
                   "Mortality coefficients until the predicted dNBR range ",
                   "overlaps this distribution."),
-                plotOutput("tune_obs_dnbr_plot", height = "320px")
+                plotOutput("tune_obs_dnbr_plot", height = "300px")
               )
             ),
-            br(),
-            h6("dNBR sensitivity — varying LadderFuels at EWS = 15 km/h"),
+            hr(),
+            # Row 2: Eta decomposition + EWS x LF heatmap
+            fluidRow(
+              column(6,
+                h6(icon("chart-bar"), " Eta Decomposition"),
+                p(class = "text-muted small",
+                  "Shows each term's contribution to ", tags$code("eta"), " at current ",
+                  "slider values (including the LadderFuels preview). Blue bars raise ",
+                  "eta (less severe); red bars lower eta (more severe). ",
+                  "If the total eta is near 0 the model will be unstable."),
+                plotOutput("tune_sm_eta_plot", height = "300px")
+              ),
+              column(6,
+                h6(icon("th"), " EWS × LadderFuels Severity Map"),
+                p(class = "text-muted small",
+                  "2D color map of predicted severity class across the full ",
+                  "EWS × LadderFuels space. White contour lines mark the ",
+                  "185/355/600/1000 dNBR class boundaries. Use this to check ",
+                  "that the right conditions produce the right severity."),
+                plotOutput("tune_sm_heatmap_plot", height = "300px")
+              )
+            ),
+            hr(),
+            # Row 3: Marginal effects grid (full width)
+            h6(icon("sliders"), " Marginal Effects — isolated response of each predictor"),
+            p(class = "text-muted small",
+              "Each panel varies one predictor while holding all others at current ",
+              "slider values. The panel label shows which B coefficient controls it. ",
+              "Red diamond = current slider value. Use these to understand what ",
+              "each coefficient does before adjusting it."),
+            plotOutput("tune_sm_marginal_plot", height = "480px"),
+            hr(),
+            h6("dNBR sensitivity table — varying LadderFuels at EWS = 15 km/h"),
             tableOutput("tune_dnbr_table")
           ),
 
@@ -4283,6 +4322,7 @@ server <- function(input, output, session) {
       cwd        = input$tune_cwd,
       et         = input$tune_et,
       ff_sm      = input$tune_ff_sm,
+      lf_sm      = input$tune_lf_sm,
       sim_fwi    = input$tune_sim_fwi,
       sim_ews    = input$tune_sim_ews,
       sim_ff     = input$tune_sim_ff
@@ -4498,6 +4538,49 @@ server <- function(input, output, session) {
       ) |>
       dplyr::select(-Capped)
   }, striped = TRUE, hover = TRUE, bordered = TRUE, digits = 4)
+
+  # Eta decomposition bar chart — term contributions at current slider values
+  output$tune_sm_eta_plot <- renderPlot({
+    p <- tuning_r()
+    req(is.numeric(p$sm_b0))
+    plot_sm_eta_decomposition(
+      p$sm_b0, p$sm_b1, p$sm_b2, p$sm_b3, p$sm_b4, p$sm_b5, p$sm_b6,
+      clay    = coalesce(p$clay,  0.064),
+      et_mm   = coalesce(p$et,    50),
+      ews_kmh = coalesce(p$sim_ews, 15),
+      cwd_mm  = coalesce(p$cwd,   12),
+      ff      = coalesce(p$ff_sm, 0.3),
+      lf      = coalesce(p$lf_sm, 100)
+    )
+  })
+
+  # EWS x LadderFuels 2D severity heatmap
+  output$tune_sm_heatmap_plot <- renderPlot({
+    p <- tuning_r()
+    req(is.numeric(p$sm_b0))
+    plot_sm_ews_lf_heatmap(
+      p$sm_b0, p$sm_b1, p$sm_b2, p$sm_b3, p$sm_b4, p$sm_b5, p$sm_b6,
+      clay   = coalesce(p$clay,  0.064),
+      et_mm  = coalesce(p$et,    50),
+      cwd_mm = coalesce(p$cwd,   12),
+      ff     = coalesce(p$ff_sm, 0.3)
+    )
+  })
+
+  # Marginal effects 2x3 grid — isolated response per predictor
+  output$tune_sm_marginal_plot <- renderPlot({
+    p <- tuning_r()
+    req(is.numeric(p$sm_b0))
+    plot_sm_marginal_effects(
+      p$sm_b0, p$sm_b1, p$sm_b2, p$sm_b3, p$sm_b4, p$sm_b5, p$sm_b6,
+      clay    = coalesce(p$clay,   0.064),
+      et_mm   = coalesce(p$et,     50),
+      ews_kmh = coalesce(p$sim_ews, 15),
+      cwd_mm  = coalesce(p$cwd,    12),
+      ff      = coalesce(p$ff_sm,  0.3),
+      lf      = coalesce(p$lf_sm,  100)
+    )
+  })
 
   # ---------------------------------------------------------------------------
   # Cohort Mortality plot
