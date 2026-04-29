@@ -729,11 +729,13 @@ run_fire_ensemble <- function(fwi_vals     = c(5, 15, 25, 35),
                                ews_vals     = c(5, 15, 25),
                                ff_val       = 0.5,
                                n_reps       = 12,
+                               grid_dim     = 200L,
                                msa_b0, msa_b1, msa_b2,
                                sp_b0, sp_b1, sp_b2, sp_b3,
                                cell_area_ha = 0.09,
                                progress_fn  = NULL) {
 
+  grid_dim  <- max(50L, as.integer(grid_dim))
   scenarios <- expand.grid(FWI = fwi_vals, EWS = ews_vals,
                             stringsAsFactors = FALSE)
   n_total   <- nrow(scenarios) * n_reps
@@ -747,6 +749,7 @@ run_fire_ensemble <- function(fwi_vals     = c(5, 15, 25, 35),
       k <- k + 1L
       if (!is.null(progress_fn)) progress_fn(k, n_total)
       sim <- simulate_fire_simple(
+        grid_dim     = grid_dim,
         fwi          = fwi,
         ews          = ews,
         ff           = ff_val,
@@ -764,7 +767,8 @@ run_fire_ensemble <- function(fwi_vals     = c(5, 15, 25, 35),
         fire_ha  = sim$total_ha,
         days     = sim$days,
         p_spread = sim$p_spread,
-        msa_ha   = sim$msa_ha
+        msa_ha   = sim$msa_ha,
+        grid_dim = grid_dim
       )
     }
   }
@@ -792,6 +796,9 @@ plot_fire_ensemble <- function(ensemble_df,
   ews_vals <- sort(unique(ensemble_df$EWS))
   fwi_lvls <- paste0("FWI = ", fwi_vals)
   ews_lvls <- paste0("EWS ", ews_vals, " km/h")
+
+  # Grid size (stored per row; grab from first row)
+  gd <- if ("grid_dim" %in% names(ensemble_df)) ensemble_df$grid_dim[1] else 100L
 
   df <- ensemble_df |>
     dplyr::mutate(
@@ -838,7 +845,7 @@ plot_fire_ensemble <- function(ensemble_df,
     facet_wrap(~ EWS_label, nrow = 1) +
     scale_y_log10(
       labels = scales::comma,
-      breaks = c(0.1, 1, 10, 100, 1000, 10000)
+      breaks = c(0.1, 1, 10, 100, 1000, 10000, 100000)
     ) +
     scale_fill_brewer(palette = "YlOrRd", guide = "none") +
     # Plausible size reference band
@@ -858,8 +865,9 @@ plot_fire_ensemble <- function(ensemble_df,
     labs(
       title    = "Fire Size Distribution — Simulation Ensemble",
       subtitle = sprintf(
-        "Each scenario: %d runs, 100x100 cell grid.  Sim median = %.1f ha  |  Sim P90 = %.1f ha%s",
-        dplyr::n_distinct(df$rep), med_ha, p90_ha,
+        "Each scenario: %d runs, %dx%d cell grid.  Sim median = %.1f ha  |  Sim P90 = %.1f ha%s",
+        dplyr::n_distinct(df$rep), gd, gd,
+        med_ha, p90_ha,
         if (n_obs > 0) sprintf("  |  %d observed GeoMAC fires (triangles)", n_obs) else ""
       ),
       x        = NULL,

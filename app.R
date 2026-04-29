@@ -1339,11 +1339,12 @@ ui <- page_navbar(
           nav_panel("Annual Area Burned",
             br(),
             p(class = "text-muted small",
-              "Distribution of total area burned per year.  Observed = FPA FOD ",
-              "annual totals within the calibration boundary during the calibration ",
-              "period.  Simulated = SCF annual totals.  Both distributions should ",
-              "overlap, though the spatial extents differ if the LANDIS landscape ",
-              "is smaller than the calibration boundary."),
+              "Distribution of total area burned per year.  Three series when all data is loaded: ",
+              tags$b("Observed — Calibration boundary"), " (all FPA FOD fires within cal_vect), ",
+              tags$b("Observed — LANDIS landscape"), " (FPA FOD fires within the template extent, ",
+              "loaded on the Ignition tab under Option B), and ",
+              tags$b("Simulated — SCF"), " annual totals.  The LANDIS landscape series provides ",
+              "a like-for-like comparison with the simulated fires."),
             plotOutput("val_area_plot", height = "450px"),
             br(),
             downloadButton("dl_val_area", "Download PNG (300 dpi)",
@@ -1354,16 +1355,15 @@ ui <- page_navbar(
             br(),
             p(class = "text-muted small",
               "Median fire size per FWI bin (IQR shown as thick bar).  ",
-              tags$b("Important:"), " observed fires span the ~14 M ha calibration boundary ",
-              "while simulated fires are confined to the smaller LANDIS landscape, ",
-              "so absolute fire sizes are not directly comparable. ",
-              "When the LANDIS template is loaded, fire sizes are automatically normalised ",
-              "as ", tags$b("% of their respective landscape area"), " — this makes the ",
-              "FWI response slope directly comparable between observed and simulated. ",
-              "If both lines show a similar upward slope with FWI the climate-fire ",
-              "sensitivity is well-captured; if the simulated line is flat or inverted, ",
-              "the b1 (FWI slope) in the spread model may need adjustment."),
-            plotOutput("val_fwi_size_plot", height = "450px"),
+              tags$b("Top:"), " observed fires from the full calibration boundary vs simulated — ",
+              "sizes normalised as % of respective landscape area to remove the spatial scale ",
+              "mismatch (~14 M ha cal boundary vs smaller LANDIS template).  ",
+              tags$b("Bottom:"), " same relationship using only fires that occurred within the ",
+              "LANDIS landscape boundary, normalised to the LANDIS template area — ",
+              "a more direct apples-to-apples comparison with simulated fires."),
+            plotOutput("val_fwi_size_plot",      height = "380px"),
+            br(),
+            plotOutput("val_fwi_size_park_plot", height = "380px"),
             br(),
             downloadButton("dl_val_fwi_size", "Download PNG (300 dpi)",
                            class = "btn-sm btn-outline-secondary")
@@ -1782,6 +1782,10 @@ ui <- page_navbar(
                              value = 12, min = 5, max = 50, step = 1),
                 p(class = "text-muted small",
                   "More runs = smoother distributions but slower (~1s per 10 runs)."),
+                numericInput("tune_ens_grid_dim", "Grid size (cells per side)",
+                             value = 200, min = 100, max = 600, step = 50),
+                p(class = "text-muted small",
+                  "Max fire size = grid² × cell area (ha). 200 cells ≈ 160 k ha at 4 ha/cell."),
                 sliderInput("tune_ens_ff", "FineFuels (0-1 scaled)",
                             min = 0, max = 1, value = 0.5, step = 0.05),
                 br(),
@@ -2683,8 +2687,9 @@ server <- function(input, output, session) {
   output$val_area_plot <- renderPlot({
     req(rv$simulated_events)
     plot_val_annual_area(rv$ign_df, rv$simulated_events,
-                         year_min = input$cal_years[1],
-                         year_max = input$cal_years[2])
+                         park_fpa_df = rv$park_ign_df,
+                         year_min    = input$cal_years[1],
+                         year_max    = input$cal_years[2])
   })
 
   output$val_fwi_size_plot <- renderPlot({
@@ -2697,7 +2702,32 @@ server <- function(input, output, session) {
                           rv$era_fwi_daily,
                           cal_area_ha  = cal_ha,
                           tmpl_area_ha = tmpl_ha,
-                          min_ha       = 4)
+                          min_ha       = 4,
+                          plot_title   = "Fire Size – Climate Relationship (Calibration Boundary)")
+  })
+
+  # LANDIS-landscape-scale fire-climate: observed from park_ign_df,
+  # both obs and sim normalised to template area for a direct comparison.
+  output$val_fwi_size_park_plot <- renderPlot({
+    req(rv$simulated_events)
+    tmpl_ha <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$tmpl_area_ha else NULL
+    # Fall back to a placeholder if park fires not yet loaded
+    if (is.null(rv$park_ign_df)) {
+      return(ggplot() +
+               annotate("text", x = 0.5, y = 0.5, size = 4.5, hjust = 0.5,
+                        label = paste0(
+                          "LANDIS landscape fires not loaded.\n",
+                          "Load FPA FOD on the Ignition tab (Option B) to see this panel.")) +
+               labs(title = "Fire Size – Climate Relationship (LANDIS Landscape)") +
+               theme_void() + theme(plot.title = element_text(size = 13, face = "bold")))
+    }
+    # Both observed and simulated normalised to the same template area
+    plot_val_fire_climate(rv$park_ign_df, rv$simulated_events,
+                          rv$era_fwi_daily,
+                          cal_area_ha  = tmpl_ha,   # obs normalised to template area
+                          tmpl_area_ha = tmpl_ha,
+                          min_ha       = 4,
+                          plot_title   = "Fire Size – Climate Relationship (LANDIS Landscape)")
   })
 
   output$val_count_fwi_plot <- renderPlot({
@@ -4783,9 +4813,10 @@ server <- function(input, output, session) {
   ensemble_rv <- reactiveVal(NULL)
 
   observeEvent(input$run_ensemble, {
-    p      <- isolate(tuning_r())
-    n_reps <- max(5L, min(50L, as.integer(input$tune_ens_reps %||% 12L)))
-    ff_val <- input$tune_ens_ff %||% 0.5
+    p        <- isolate(tuning_r())
+    n_reps   <- max(5L, min(50L, as.integer(input$tune_ens_reps   %||% 12L)))
+    grid_dim <- max(50L, min(600L, as.integer(input$tune_ens_grid_dim %||% 200L)))
+    ff_val   <- input$tune_ens_ff %||% 0.5
 
     withProgress(message = "Running fire ensemble…", value = 0, {
       ens <- run_fire_ensemble(
@@ -4793,6 +4824,7 @@ server <- function(input, output, session) {
         ews_vals     = c(5, 15, 25),
         ff_val       = ff_val,
         n_reps       = n_reps,
+        grid_dim     = grid_dim,
         msa_b0       = p$msa_b0, msa_b1 = p$msa_b1, msa_b2 = p$msa_b2,
         sp_b0        = p$sp_b0,  sp_b1  = p$sp_b1,
         sp_b2        = p$sp_b2,  sp_b3  = p$sp_b3,
