@@ -134,14 +134,22 @@ load_fpa_fod <- function(gdb_path, cal_vect, working_crs,
   message(sprintf("FPA FOD: %d points within calibration boundary.", nrow(fpa_park)))
 
   # ---- Column detection ---------------------------------------------------
-  nm       <- names(fpa_park)
-  date_col <- pick_first_col(nm, c("discovery_date", "disc_date", "date", "fire_date"))
-  gc_col   <- pick_first_col(nm, c("nwcg_general_cause", "general_cause", "cause"))
-  cc_col   <- pick_first_col(nm, c("nwcg_cause_classification", "cause_classification",
-                                    "stat_cause_descr"))
-  size_col <- pick_first_col(nm, c("fire_size", "gis_acres", "acres", "size"))
+  nm        <- names(fpa_park)
+  date_col  <- pick_first_col(nm, c("discovery_date", "disc_date", "date", "fire_date"))
+  cont_col  <- pick_first_col(nm, c("cont_date", "containment_date", "contained_date",
+                                     "control_date"))
+  gc_col    <- pick_first_col(nm, c("nwcg_general_cause", "general_cause", "cause"))
+  cc_col    <- pick_first_col(nm, c("nwcg_cause_classification", "cause_classification",
+                                     "stat_cause_descr"))
+  size_col  <- pick_first_col(nm, c("fire_size", "gis_acres", "acres", "size"))
 
   if (is.na(date_col)) stop("Could not find a date column in FPA FOD.")
+
+  if (!is.na(cont_col)) {
+    message(sprintf("FPA FOD: containment date column found: '%s'", cont_col))
+  } else {
+    message("FPA FOD: no containment date column found; fire-duration FWI averaging unavailable.")
+  }
 
   # ---- Build data.frame ---------------------------------------------------
   xy <- crds(fpa_park)
@@ -150,21 +158,36 @@ load_fpa_fod <- function(gdb_path, cal_vect, working_crs,
     mutate(
       x    = xy[, 1],
       y    = xy[, 2],
-      
+
       # Use FIRE_YEAR directly from the GDB — it's a clean integer field
       FIRE_YEAR = as.integer(FIRE_YEAR),
-      
-      # Parse date separately; NAs here won't kill the year filter
+
+      # Discovery date (main date field used for joins)
       date = parse_any_date(.data[[date_col]]),
-      
+
+      # Containment date — used to compute mean FWI/EWS over fire duration.
+      # NA for fires with no recorded containment date; those fall back to
+      # discovery date in downstream code.
+      cont_date = if (!is.na(cont_col))
+        parse_any_date(.data[[cont_col]]) else as.Date(NA),
+
       ignition_type = classify_fpa_ignition_type(
         if (!is.na(gc_col)) .data[[gc_col]] else rep(NA_character_, n()),
         if (!is.na(cc_col)) .data[[cc_col]] else rep(NA_character_, n())
       ),
-      
+
       FIRE_SIZE_ACRES = if (!is.na(size_col))
         suppressWarnings(as.numeric(.data[[size_col]])) else NA_real_,
       FIRE_SIZE_HA = FIRE_SIZE_ACRES * 0.40468564224
+    ) %>%
+    # Fix cont_date: clamp to [date, date + 365] — bad values in FOD occasionally
+    # have containment before discovery or > 1 year later.
+    mutate(
+      cont_date = dplyr::if_else(
+        !is.na(cont_date) & cont_date >= date & cont_date <= date + 365,
+        cont_date,
+        as.Date(NA)
+      )
     ) %>%
     # Filter on FIRE_YEAR first — doesn't depend on date parsing
     filter(FIRE_YEAR >= year_min, FIRE_YEAR <= year_max) %>%

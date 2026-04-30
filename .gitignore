@@ -5,8 +5,12 @@
 # R session artifacts
 .Rhistory
 .RData
+*.RData
 .Rproj.user/
 *.Rproj
+
+# App session state / cache snapshots
+*.json
 
 # R package build outputs
 *.tar.gz

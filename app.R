@@ -206,9 +206,220 @@ ui <- page_navbar(
         card_header("Ignition Outputs"),
         full_screen = TRUE,
         navset_tab(
+
+          # ------------------------------------------------------------------
+          nav_panel("Method",
+            br(),
+            fluidRow(
+              # Left column — data pipeline + workflow
+              column(6,
+                tags$div(class = "card mb-3",
+                  tags$div(class = "card-header bg-primary text-white fw-semibold",
+                    icon("sitemap"), " Calibration Data Pipeline"
+                  ),
+                  tags$div(class = "card-body",
+                    tags$ol(class = "mb-0",
+                      tags$li(tags$b("Load FPA FOD ignitions"),
+                        " — the Fire-Program Analysis Fire-Occurrence Database",
+                        " (Short 2022) is filtered to the calibration boundary and",
+                        " date range. Each record is one ignition event with a",
+                        " discovery date, cause, and fire size."),
+                      tags$li(tags$b("Join ERA-Interim FWI"),
+                        " — each ignition is matched to the daily Fire Weather",
+                        " Index on its discovery date. Days with no recorded ignitions",
+                        " are zero-filled so the model correctly learns from low-FWI",
+                        " days with zero fires."),
+                      tags$li(tags$b("Aggregate to daily counts"),
+                        " — ignitions are summed by day and by type (Lightning /",
+                        " Accidental), producing a long-format table of daily counts",
+                        " paired with that day’s FWI value."),
+                      tags$li(tags$b("Fit count model"),
+                        " — a Poisson or Zero-Inflated Poisson (ZIP) GLM is fit",
+                        " separately for each ignition type. The log-link connects",
+                        " FWI to expected daily ignition count."),
+                      tags$li(tags$b("Generate ignition surfaces"),
+                        " — observed ignition point locations are smoothed with a",
+                        " Gaussian kernel onto the LANDIS template grid to produce",
+                        " spatial probability weights for each ignition type.")
+                    )
+                  )
+                ),
+                tags$div(class = "card mb-3",
+                  tags$div(class = "card-header bg-secondary text-white fw-semibold",
+                    icon("list-check"), " Recommended Workflow"
+                  ),
+                  tags$div(class = "card-body p-0",
+                    tags$table(class = "table table-sm table-striped mb-0",
+                      tags$thead(
+                        tags$tr(
+                          tags$th("Step"), tags$th("Action"), tags$th("Where")
+                        )
+                      ),
+                      tags$tbody(
+                        tags$tr(
+                          tags$td("1"),
+                          tags$td("Load ERA FWI NetCDF files in the Data tab"),
+                          tags$td(tags$span(class = "badge bg-secondary", "Data"))
+                        ),
+                        tags$tr(
+                          tags$td("2"),
+                          tags$td("Set calibration boundary and LANDIS template raster"),
+                          tags$td(tags$span(class = "badge bg-secondary", "Data"))
+                        ),
+                        tags$tr(
+                          tags$td("3"),
+                          tags$td("Specify FPA FOD GDB path and choose Poisson or ZIP"),
+                          tags$td(tags$span(class = "badge bg-danger", "Ignition"))
+                        ),
+                        tags$tr(
+                          tags$td("4"),
+                          tags$td("Adjust kernel bandwidth and click Run Ignition Calibration"),
+                          tags$td(tags$span(class = "badge bg-danger", "Ignition"))
+                        ),
+                        tags$tr(
+                          tags$td("5"),
+                          tags$td("Review Coefficients and Diagnostics tabs"),
+                          tags$td(tags$span(class = "badge bg-danger", "Ignition"))
+                        ),
+                        tags$tr(
+                          tags$td("6"),
+                          tags$td("Open Scale Adjustment — choose Area Offset (A) or Park Intercept (B)"),
+                          tags$td(tags$span(class = "badge bg-danger", "Ignition"))
+                        ),
+                        tags$tr(
+                          tags$td("7"),
+                          tags$td("Copy adjusted b0 to Parameter Tuning; use landscape maps for SCF inputs"),
+                          tags$td(tags$span(class = "badge bg-warning", "Tuning"))
+                        )
+                      )
+                    )
+                  )
+                )
+              ),
+
+              # Right column — the models + kernel + SCF mapping
+              column(6,
+                tags$div(class = "card mb-3 border-danger",
+                  tags$div(class = "card-header text-white fw-semibold",
+                    style = "background-color:#c0392b;",
+                    icon("bolt"), " Model Option A: Poisson GLM"
+                  ),
+                  tags$div(class = "card-body",
+                    tags$p(class = "mb-1",
+                      "Answers: how many ignitions are expected on a day with a",
+                      " given FWI? Fit separately for Lightning and Accidental fires."),
+                    tags$div(class = "alert alert-light border p-2 mb-2",
+                      style = "font-family:monospace; font-size:0.85rem;",
+                      tags$div("E[count] = λ = exp(b0 + b1 × FWI)"),
+                      tags$div(style = "color:#888; font-size:0.78rem; margin-top:4px;",
+                        "log-link GLM | family = poisson()")
+                    ),
+                    tags$table(class = "table table-sm mb-0",
+                      tags$thead(tags$tr(
+                        tags$th("Coef"), tags$th("Role"),
+                        tags$th("SCF parameter"), tags$th("Sign")
+                      )),
+                      tags$tbody(
+                        tags$tr(
+                          tags$td("b0"), tags$td("Log baseline rate"),
+                          tags$td(tags$code("LightningIgnitionB0")),
+                          tags$td("any")
+                        ),
+                        tags$tr(
+                          tags$td("b1"), tags$td("FWI slope"),
+                          tags$td(tags$code("LightningIgnitionB1")),
+                          tags$td(tags$span(class = "text-success", "+ (higher FWI → more fires)"))
+                        )
+                      )
+                    ),
+                    tags$p(class = "text-muted small mt-2 mb-0",
+                      "Same structure for Accidental: ",
+                      tags$code("AccidentalIgnitionB0"), " / ",
+                      tags$code("AccidentalIgnitionB1"), ".")
+                  )
+                ),
+                tags$div(class = "card mb-3 border-warning",
+                  tags$div(class = "card-header fw-semibold",
+                    style = "background-color:#e67e22; color:white;",
+                    icon("fire-flame-curved"), " Model Option B: Zero-Inflated Poisson (ZIP)"
+                  ),
+                  tags$div(class = "card-body",
+                    tags$p(class = "mb-1",
+                      "Extends Poisson with a separate zero-inflation component to",
+                      " account for the large number of fire-free days even at",
+                      " moderate FWI. Recommended when zero-day frequency exceeds",
+                      " what a standard Poisson can explain."),
+                    tags$div(class = "alert alert-light border p-2 mb-2",
+                      style = "font-family:monospace; font-size:0.82rem;",
+                      tags$div("π  = P(structural zero) = logistic(bz0 + bz1 × FWI)"),
+                      tags$div("λ  = exp(b0 + b1 × FWI)   [count component]"),
+                      tags$div(style = "color:#888; font-size:0.78rem; margin-top:4px;",
+                        "fitted via pscl::zeroinfl()")
+                    ),
+                    tags$table(class = "table table-sm mb-0",
+                      tags$thead(tags$tr(
+                        tags$th("Coef"), tags$th("Role"), tags$th("SCF parameter")
+                      )),
+                      tags$tbody(
+                        tags$tr(tags$td("b0"),  tags$td("Count log-baseline"),
+                          tags$td(tags$code("LightningIgnitionB0"))),
+                        tags$tr(tags$td("b1"),  tags$td("Count FWI slope"),
+                          tags$td(tags$code("LightningIgnitionB1"))),
+                        tags$tr(tags$td("bz0"), tags$td("Zero-inflation intercept"),
+                          tags$td(tags$code("LightningIgnitionBZ0"))),
+                        tags$tr(tags$td("bz1"), tags$td("Zero-inflation FWI slope"),
+                          tags$td(tags$code("LightningIgnitionBZ1")))
+                      )
+                    ),
+                    tags$p(class = "text-muted small mt-2 mb-0",
+                      icon("triangle-exclamation"),
+                      " bz1 should be negative — higher FWI reduces the",
+                      " probability of a structural zero (i.e., fire becomes more likely).")
+                  )
+                ),
+                tags$div(class = "card border-info",
+                  tags$div(class = "card-header text-white fw-semibold",
+                    style = "background-color:#2980b9;",
+                    icon("map"), " Ignition Surface (Kernel Smoothing)"
+                  ),
+                  tags$div(class = "card-body",
+                    tags$p(class = "mb-1",
+                      "The count model tells SCF ", tags$em("how many"),
+                      " ignitions occur each day. The ignition surface tells it",
+                      tags$em(" where"), " on the landscape those ignitions are placed."),
+                    tags$p(class = "mb-1",
+                      "Each observed FPA FOD ignition point is convolved with a",
+                      " 2D isotropic Gaussian kernel on the LANDIS template grid:"),
+                    tags$div(class = "alert alert-light border p-2 mb-2",
+                      style = "font-family:monospace; font-size:0.82rem;",
+                      "w(d) = exp(−d² / (2 × bw²))   for d ≤ max_dist"
+                    ),
+                    tags$table(class = "table table-sm mb-0",
+                      tags$tbody(
+                        tags$tr(
+                          tags$td(tags$code("bw")),
+                          tags$td("Bandwidth (m) — controls spatial spread of each point's influence")),
+                        tags$tr(
+                          tags$td(tags$code("max_dist")),
+                          tags$td("Hard cutoff radius; kernel weight is zero beyond this distance")),
+                        tags$tr(
+                          tags$td("Output"),
+                          tags$td("INT4S raster (0–100) exported as Lightning / Accidental / Rx ignition map"))
+                      )
+                    ),
+                    tags$p(class = "text-muted small mt-2 mb-0",
+                      icon("circle-info"),
+                      " Set max_dist to ~3–4× bandwidth to retain the full Gaussian tail.",
+                      " SCF draws ignition cells proportional to these weights each timestep.")
+                  )
+                )
+              ) # end right column
+            ) # end fluidRow
+          ), # end nav_panel("Method")
+
           nav_panel("Overview Map",
           tmapOutput("ign_map", height = "500px")
-                    
+
           ),
           nav_panel("Coefficients",
             br(),
@@ -735,6 +946,213 @@ ui <- page_navbar(
         card_header("Spread Outputs"),
         full_screen = TRUE,
         navset_tab(
+
+          # ------------------------------------------------------------------
+          nav_panel("Method",
+            br(),
+            fluidRow(
+              # Left column — data pipeline + workflow
+              column(6,
+                tags$div(class = "card mb-3",
+                  tags$div(class = "card-header bg-primary text-white fw-semibold",
+                    icon("sitemap"), " Calibration Data Pipeline"
+                  ),
+                  tags$div(class = "card-body",
+                    tags$ol(class = "mb-0",
+                      tags$li(tags$b("Load GeoMAC perimeters"),
+                        " — historic fire perimeters (2000–2018) clipped to the",
+                        " calibration boundary. Each fire may have multiple dated",
+                        " perimeter snapshots."),
+                      tags$li(tags$b("Build sequential perimeter pairs"),
+                        " — consecutive perimeter snapshots for the same fire are",
+                        " paired (day N → day N+1). The area difference between",
+                        " the two perimeters is the daily burned increment (ha)."),
+                      tags$li(tags$b("Rasterize perimeter pairs"),
+                        " — each pair is burned onto the spread grid. Pixels inside",
+                        " the day-N perimeter = 'did not spread'; pixels in the",
+                        " ring between day-N and day-N+1 = 'spread'. This produces",
+                        " a binary response for the spread probability GLM."),
+                      tags$li(tags$b("Join ERA climate"),
+                        " — ERA-Interim FWI (daily) and ERA5 wind (daily, km/h)",
+                        " are joined to each perimeter pair by the midpoint date.",
+                        " Effective wind speed (EWS) is computed per fire centroid",
+                        " using the Nelson (2002) terrain-corrected formula."),
+                      tags$li(tags$b("Fit models"),
+                        " — two separate GLMs are fit (see right) using the",
+                        " assembled pairs table.")
+                    )
+                  )
+                ),
+                tags$div(class = "card mb-3",
+                  tags$div(class = "card-header bg-secondary text-white fw-semibold",
+                    icon("list-check"), " Recommended Workflow"
+                  ),
+                  tags$div(class = "card-body p-0",
+                    tags$table(class = "table table-sm table-striped mb-0",
+                      tags$thead(
+                        tags$tr(
+                          tags$th("Step"), tags$th("Action"), tags$th("Where")
+                        )
+                      ),
+                      tags$tbody(
+                        tags$tr(
+                          tags$td("1"), tags$td("Load ERA FWI and ERA5 wind in the Data tab"),
+                          tags$td(tags$span(class="badge bg-secondary", "Data"))
+                        ),
+                        tags$tr(
+                          tags$td("2"), tags$td("Set calibration boundary and LANDIS template"),
+                          tags$td(tags$span(class="badge bg-secondary", "Data"))
+                        ),
+                        tags$tr(
+                          tags$td("3"), tags$td("Specify GeoMAC GDB path in Spread Inputs"),
+                          tags$td(tags$span(class="badge bg-primary", "Spread"))
+                        ),
+                        tags$tr(
+                          tags$td("4"), tags$td("Adjust cleaning thresholds and click Run Spread Fitting"),
+                          tags$td(tags$span(class="badge bg-primary", "Spread"))
+                        ),
+                        tags$tr(
+                          tags$td("5"), tags$td("Review Fit Coefficients and Diagnostics tabs"),
+                          tags$td(tags$span(class="badge bg-primary", "Spread"))
+                        ),
+                        tags$tr(
+                          tags$td("6"), tags$td("Check Terrain tab — verify EWS > raw wind for upslope fires"),
+                          tags$td(tags$span(class="badge bg-primary", "Spread"))
+                        ),
+                        tags$tr(
+                          tags$td("7"), tags$td("Use Threshold Search to optimize cleaning thresholds"),
+                          tags$td(tags$span(class="badge bg-primary", "Spread"))
+                        ),
+                        tags$tr(
+                          tags$td("8"), tags$td("Copy coefficients to Parameter Tuning and run ensemble"),
+                          tags$td(tags$span(class="badge bg-warning", "Tuning"))
+                        )
+                      )
+                    )
+                  )
+                )
+              ),
+
+              # Right column — the two models
+              column(6,
+                tags$div(class = "card mb-3 border-danger",
+                  tags$div(class = "card-header text-white fw-semibold",
+                    style = "background-color:#c0392b;",
+                    icon("fire"), " Model 1: Cell-to-Cell Spread Probability"
+                  ),
+                  tags$div(class = "card-body",
+                    tags$p(class = "mb-1",
+                      "Answers: given that a cell is burning, does the fire spread",
+                      " to each of its 8 neighbours on the next timestep?"),
+                    tags$p(class = "mb-1",
+                      tags$b("Fitted with:"), " Binomial GLM (logit link).",
+                      " Response = 1 (spread pixel) or 0 (no-spread pixel) from",
+                      " rasterized perimeter pairs."),
+                    tags$div(class = "alert alert-light border p-2 mb-2",
+                      style = "font-family:monospace; font-size:0.85rem;",
+                      "P(spread) = 1 / (1 + exp(−(B0 + B1·FWI + B2·FineFuels + B3·EWS)))"
+                    ),
+                    tags$table(class = "table table-sm mb-0",
+                      tags$thead(tags$tr(
+                        tags$th("Coefficient"), tags$th("Predictor"),
+                        tags$th("SCF parameter"), tags$th("Expected sign")
+                      )),
+                      tags$tbody(
+                        tags$tr(tags$td("B0"), tags$td("Intercept"),
+                          tags$td(tags$code("SpreadProbabilityB0")),
+                          tags$td("− (baseline < 50%)")),
+                        tags$tr(tags$td("B1"), tags$td("FWI"),
+                          tags$td(tags$code("SpreadProbabilityB1")),
+                          tags$td(tags$span(class="text-success", "+ (higher FWI → more spread)"))),
+                        tags$tr(tags$td("B2"), tags$td("Fine Fuels (0–1)"),
+                          tags$td(tags$code("SpreadProbabilityB2")),
+                          tags$td(tags$span(class="text-success", "+ (more fuel → more spread)"))),
+                        tags$tr(tags$td("B3"), tags$td("EWS (km/h)"),
+                          tags$td(tags$code("SpreadProbabilityB3")),
+                          tags$td(tags$span(class="text-success", "+ (stronger wind → more spread)")))
+                      )
+                    ),
+                    tags$p(class = "text-muted small mt-2 mb-0",
+                      icon("triangle-exclamation"),
+                      " Diagonal spread gets a 0.71× weight inside SCF at runtime;",
+                      " this is applied automatically and does not affect calibrated coefficients.")
+                  )
+                ),
+                tags$div(class = "card mb-3 border-warning",
+                  tags$div(class = "card-header fw-semibold",
+                    style = "background-color:#e67e22; color:white;",
+                    icon("ruler-horizontal"), " Model 2: Maximum Daily Spread Area"
+                  ),
+                  tags$div(class = "card-body",
+                    tags$p(class = "mb-1",
+                      "Answers: how many hectares can a fire burn in a single day",
+                      " before SCF advances the calendar to the next day?"),
+                    tags$p(class = "mb-1",
+                      tags$b("Fitted with:"), " Linear OLS (raw ha, NO log transform).",
+                      " Response = daily burned increment (ha) from perimeter pairs."),
+                    tags$div(class = "alert alert-light border p-2 mb-2",
+                      style = "font-family:monospace; font-size:0.85rem;",
+                      "MaxSpreadArea (ha) = B0 + B1·FWI + B2·EWS"
+                    ),
+                    tags$table(class = "table table-sm mb-0",
+                      tags$thead(tags$tr(
+                        tags$th("Coefficient"), tags$th("Predictor"),
+                        tags$th("SCF parameter"), tags$th("Notes")
+                      )),
+                      tags$tbody(
+                        tags$tr(tags$td("B0"), tags$td("Intercept"),
+                          tags$td(tags$code("MaximumSpreadAreaB0")),
+                          tags$td("Must be > 0 to avoid SCF warnings at low FWI")),
+                        tags$tr(tags$td("B1"), tags$td("FWI"),
+                          tags$td(tags$code("MaximumSpreadAreaB1")),
+                          tags$td("Positive; main fire weather driver")),
+                        tags$tr(tags$td("B2"), tags$td("EWS (km/h)"),
+                          tags$td(tags$code("MaximumSpreadAreaB2")),
+                          tags$td("Positive; wind contribution"))
+                      )
+                    ),
+                    tags$p(class = "text-muted small mt-2 mb-0",
+                      icon("bullseye"),
+                      " Coefficients are fit to the ", tags$b("75th percentile"),
+                      " of daily area increments. MaxSpreadArea is a ceiling, not a",
+                      " mean — fitting to the mean would make fires spread too slowly.")
+                  )
+                ),
+                tags$div(class = "card border-info",
+                  tags$div(class = "card-header text-white fw-semibold",
+                    style = "background-color:#2980b9;",
+                    icon("wind"), " Effective Wind Speed (EWS)"
+                  ),
+                  tags$div(class = "card-body",
+                    tags$p(class = "mb-1",
+                      "Raw ERA5 wind speed is corrected for slope and aspect at each",
+                      " fire centroid using the Nelson (2002) vector formula",
+                      " (Int. J. Wildland Fire, Eq. 5):"),
+                    tags$div(class = "alert alert-light border p-2 mb-2",
+                      style = "font-family:monospace; font-size:0.82rem;",
+                      "EWS = Cb × √( (Ua/Cb)² + 2(Ua/Cb)sin(θ)cos(φ) + sin²(θ) )"
+                    ),
+                    tags$table(class = "table table-sm mb-0",
+                      tags$tbody(
+                        tags$tr(tags$td(tags$code("Ua")),
+                          tags$td("ERA5 wind speed (km/h)")),
+                        tags$tr(tags$td(tags$code("θ")),
+                          tags$td("Slope angle at fire centroid (radians)")),
+                        tags$tr(tags$td(tags$code("φ")),
+                          tags$td("Angle between wind direction and uphill azimuth")),
+                        tags$tr(tags$td(tags$code("Cb")),
+                          tags$td("Combustion buoyancy: 10 = low, 25 = moderate, 50 = high"))
+                      )
+                    ),
+                    tags$p(class = "text-muted small mt-2 mb-0",
+                      icon("circle-info"),
+                      " ERA5 wind (m/s) is converted to km/h before all calculations",
+                      " (SCF User Guide §2.43). EWS is always in km/h.")
+                  )
+                )
+              ) # end right column
+            ) # end fluidRow
+          ), # end nav_panel("Method")
 
           nav_panel("Fit Coefficients",
             br(),
@@ -1826,10 +2244,7 @@ ui <- page_navbar(
                              value = 12, min = 5, max = 50, step = 1),
                 p(class = "text-muted small",
                   "More runs = smoother distributions but slower (~1s per 10 runs)."),
-                numericInput("tune_ens_grid_dim", "Grid size (cells per side)",
-                             value = 200, min = 100, max = 600, step = 50),
-                p(class = "text-muted small",
-                  "Max fire size = grid² × cell area (ha). 200 cells ≈ 160 k ha at 4 ha/cell."),
+                uiOutput("tune_ens_grid_info_ui"),
                 sliderInput("tune_ens_ff", "FineFuels (0-1 scaled)",
                             min = 0, max = 1, value = 0.5, step = 0.05),
                 br(),
@@ -4932,10 +5347,20 @@ server <- function(input, output, session) {
   ensemble_rv <- reactiveVal(NULL)
 
   observeEvent(input$run_ensemble, {
-    p        <- isolate(tuning_r())
-    n_reps   <- max(5L, min(50L, as.integer(input$tune_ens_reps   %||% 12L)))
-    grid_dim <- max(50L, min(600L, as.integer(input$tune_ens_grid_dim %||% 200L)))
-    ff_val   <- input$tune_ens_ff %||% 0.5
+    p      <- isolate(tuning_r())
+    n_reps <- max(5L, min(50L, as.integer(input$tune_ens_reps %||% 12L)))
+    ff_val <- input$tune_ens_ff %||% 0.5
+
+    # Grid dimensions: use LANDIS template if loaded, else fall back to manual input.
+    # simulate_fire_simple() uses a square grid, so take the larger template dimension.
+    if (!is.null(rv$template_r)) {
+      grid_dim     <- max(nrow(rv$template_r), ncol(rv$template_r))
+      grid_dim     <- max(50L, min(800L, as.integer(grid_dim)))
+      cell_area_ha <- rv$cell_area_ha
+    } else {
+      grid_dim     <- max(50L, min(600L, as.integer(input$tune_ens_grid_dim %||% 200L)))
+      cell_area_ha <- p$cell_area
+    }
 
     withProgress(message = "Running fire ensemble…", value = 0, {
       ens <- run_fire_ensemble(
@@ -4947,7 +5372,7 @@ server <- function(input, output, session) {
         msa_b0       = p$msa_b0, msa_b1 = p$msa_b1, msa_b2 = p$msa_b2,
         sp_b0        = p$sp_b0,  sp_b1  = p$sp_b1,
         sp_b2        = p$sp_b2,  sp_b3  = p$sp_b3,
-        cell_area_ha = p$cell_area,
+        cell_area_ha = cell_area_ha,
         progress_fn  = function(k, n) setProgress(k / n)
       )
       ensemble_rv(ens)
@@ -4971,10 +5396,11 @@ server <- function(input, output, session) {
       stats::quantile(fpa_sizes, 0.90, na.rm = TRUE) else NULL
 
     # ---- Observed FPA FOD fires binned to FWI x EWS cells -------------------
-    # FWI from ERA-Interim joined by discovery date.
-    # EWS from ERA5 WindSpeed_kmh as flat-terrain proxy (defaults to 15 km/h
-    # if wind data not loaded). Size filter (>= MIN_HA) applied inside
-    # plot_fire_ensemble() so the same threshold is used everywhere.
+    # For each FOD fire, compute mean FWI and mean wind speed over the full fire
+    # duration (DISCOVERY_DATE → CONT_DATE). Falls back to discovery-date only
+    # if cont_date is NA or not present. EWS = WindSpeed_kmh as flat-terrain
+    # proxy; defaults to 15 km/h if wind data not loaded.
+    # Size filter (>= MIN_HA) applied inside plot_fire_ensemble().
     obs_fires_df <- NULL
     if (!is.null(rv$ign_df) && "FIRE_SIZE_HA" %in% names(rv$ign_df) &&
         "date" %in% names(rv$ign_df) && !is.null(rv$era_fwi_daily)) {
@@ -4984,19 +5410,61 @@ server <- function(input, output, session) {
       ews_breaks <- c(-Inf, 10, 20, Inf)
       ews_vals   <- c(5L, 15L, 25L)
 
-      fpa <- rv$ign_df |>
-        dplyr::filter(is.finite(FIRE_SIZE_HA), FIRE_SIZE_HA > 0, !is.na(date)) |>
-        dplyr::left_join(rv$era_fwi_daily |> dplyr::rename(FWI = value),
-                         by = "date") |>
-        dplyr::filter(is.finite(FWI))
+      fwi_df  <- rv$era_fwi_daily |> dplyr::rename(FWI = value)
+      wind_df <- if (!is.null(rv$wind_daily) && "WindSpeed_kmh" %in% names(rv$wind_daily))
+        rv$wind_daily |> dplyr::select(date, WindSpeed_kmh)
+      else NULL
 
-      if (!is.null(rv$wind_daily) && "WindSpeed_kmh" %in% names(rv$wind_daily)) {
-        fpa <- fpa |>
-          dplyr::left_join(rv$wind_daily |> dplyr::select(date, WindSpeed_kmh),
-                           by = "date")
+      fpa_raw <- rv$ign_df |>
+        dplyr::filter(is.finite(FIRE_SIZE_HA), FIRE_SIZE_HA > 0, !is.na(date)) |>
+        dplyr::mutate(fire_id = dplyr::row_number())
+
+      # Determine end date for each fire: cont_date if valid, else discovery date
+      has_cont <- "cont_date" %in% names(fpa_raw) &&
+                  any(!is.na(fpa_raw$cont_date))
+
+      fpa_raw <- fpa_raw |>
+        dplyr::mutate(
+          end_date = if (has_cont && "cont_date" %in% names(fpa_raw))
+            dplyr::coalesce(cont_date, date)
+          else date
+        )
+
+      # Build fire × day cross-table and compute mean FWI / wind per fire.
+      # For single-day fires (cont_date == date or NA), this collapses to a
+      # simple daily join. For multi-day fires, all days in [date, end_date]
+      # are averaged.
+      fire_days <- fpa_raw |>
+        dplyr::select(fire_id, disc_date = date, end_date) |>
+        dplyr::rowwise() |>
+        dplyr::mutate(
+          fire_date = list(seq.Date(disc_date, end_date, by = "1 day"))
+        ) |>
+        dplyr::ungroup() |>
+        tidyr::unnest(fire_date)
+
+      # Mean FWI per fire
+      fire_fwi <- fire_days |>
+        dplyr::left_join(fwi_df, by = c("fire_date" = "date")) |>
+        dplyr::group_by(fire_id) |>
+        dplyr::summarise(FWI = mean(FWI, na.rm = TRUE), .groups = "drop")
+
+      # Mean wind per fire (NA → 15 km/h fallback applied later)
+      if (!is.null(wind_df)) {
+        fire_wind <- fire_days |>
+          dplyr::left_join(wind_df, by = c("fire_date" = "date")) |>
+          dplyr::group_by(fire_id) |>
+          dplyr::summarise(WindSpeed_kmh = mean(WindSpeed_kmh, na.rm = TRUE),
+                           .groups = "drop")
       } else {
-        fpa$WindSpeed_kmh <- NA_real_
+        fire_wind <- dplyr::tibble(fire_id = fpa_raw$fire_id,
+                                   WindSpeed_kmh = NA_real_)
       }
+
+      fpa <- fpa_raw |>
+        dplyr::left_join(fire_fwi,  by = "fire_id") |>
+        dplyr::left_join(fire_wind, by = "fire_id") |>
+        dplyr::filter(is.finite(FWI))
 
       if (nrow(fpa) > 0) {
         obs_fires_df <- fpa |>
@@ -5018,6 +5486,34 @@ server <- function(input, output, session) {
                        reference_p90 = fpa_p90,
                        obs_fires_df  = obs_fires_df,
                        min_obs_ha    = MIN_HA)
+  })
+
+  # Show grid dimensions: from LANDIS template if loaded, else manual fallback input
+  output$tune_ens_grid_info_ui <- renderUI({
+    if (!is.null(rv$template_r)) {
+      nr <- nrow(rv$template_r); nc <- ncol(rv$template_r)
+      gd <- max(nr, nc)
+      ca <- round(rv$cell_area_ha, 4)
+      max_ha <- round(gd^2 * ca / 1000, 0)  # in 1000s of ha
+      tagList(
+        tags$div(class = "alert alert-success p-2",
+                 style = "font-size:0.82rem;",
+                 icon("check"), " ",
+                 tags$b("Grid from LANDIS template:"),
+                 tags$br(),
+                 sprintf("%d rows × %d cols (%d-cell sim grid)", nr, nc, gd),
+                 tags$br(),
+                 sprintf("Cell: %.4f ha | Max fire: ~%d k ha", ca, max_ha))
+      )
+    } else {
+      tagList(
+        numericInput("tune_ens_grid_dim", "Grid size (cells per side)",
+                     value = 200, min = 100, max = 600, step = 50),
+        p(class = "text-muted small",
+          "Load a LANDIS template raster to use actual landscape dimensions.",
+          "Max fire size = grid² × cell area (ha).")
+      )
+    }
   })
 
   output$tune_ens_status_ui <- renderUI({

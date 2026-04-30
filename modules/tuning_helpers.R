@@ -718,10 +718,12 @@ plot_sm_ews_lf_heatmap <- function(sm_b0, sm_b1, sm_b2, sm_b3, sm_b4, sm_b5, sm_
     )
 
   ggplot(df, aes(EWS, LF, fill = severity)) +
-    geom_raster(interpolate = TRUE) +
-    geom_contour(data = df_cont, aes(EWS, LF, z = dNBR),
-                 breaks = c(185, 355, 600, 1000),
-                 colour = "white", linewidth = 0.5, linetype = "solid") +
+    geom_raster(interpolate = FALSE) +
+    geom_contour(data        = df_cont,
+                 mapping     = aes(x = EWS, y = LF, z = dNBR),
+                 inherit.aes = FALSE,
+                 breaks      = c(185, 355, 600, 1000),
+                 colour      = "white", linewidth = 0.5, linetype = "solid") +
     scale_fill_manual(
       values = setNames(sev_colors, sev_labels),
       name   = "Severity class",
