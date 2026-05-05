@@ -1140,3 +1140,314 @@ save_validation_figures <- function(
   }
   paths
 }
+
+
+# =============================================================================
+# Fire Return Interval (FRI) helpers
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# fetch_landfire_mfri
+#
+# Downloads LANDFIRE Mean Fire Return Interval (MFRI, years) for the
+# calibration boundary via the LFPS ImageServer REST API.
+# Uses LF2020 first, falls back to LF2016 if unavailable.
+# Returns a SpatRaster in working_crs resampled to template_r resolution.
+# MFRI pixel values are in years; 0 / NA = no fire history information.
+# -----------------------------------------------------------------------------
+fetch_landfire_mfri <- function(cal_vect, working_crs, template_r,
+                                 progress_fn = NULL) {
+
+  pacman::p_load(httr, terra)
+
+  cal_wgs84 <- project(cal_vect, "EPSG:4326")
+  bb        <- as.vector(ext(cal_wgs84))  # xmin, xmax, ymin, ymax
+
+  # LANDFIRE native ~30 m; cap per-axis at 4096 px to stay within API limits
+  deg_per_30m <- 30 / 111320
+  nx <- min(as.integer(ceiling((bb["xmax"] - bb["xmin"]) / deg_per_30m)), 4096L)
+  ny <- min(as.integer(ceiling((bb["ymax"] - bb["ymin"]) / deg_per_30m)), 4096L)
+
+  message(sprintf(
+    "Requesting LANDFIRE MFRI: %d x %d px  bbox [%.4f %.4f %.4f %.4f]",
+    nx, ny, bb["xmin"], bb["ymin"], bb["xmax"], bb["ymax"]))
+
+  # Try LF2020, then LF2016 as fallback
+  endpoints <- c(
+    "https://lfps.usgs.gov/arcgis/rest/services/Landfire_LF2020/LF2020_200MFRI_CONUS/ImageServer/exportImage",
+    "https://lfps.usgs.gov/arcgis/rest/services/Landfire_LF2016/LF2016_200MFRI_CONUS/ImageServer/exportImage"
+  )
+
+  tmp_tif <- tempfile(fileext = ".tif")
+  resp    <- NULL
+  used_ep <- NULL
+
+  for (ep in endpoints) {
+    svc <- sub(".*/services/", "", sub("/ImageServer.*", "", ep))
+    if (!is.null(progress_fn)) progress_fn(sprintf("Fetching MFRI from %s ...", svc))
+    r <- tryCatch(
+      httr::GET(
+        ep,
+        query = list(
+          bbox          = sprintf("%.6f,%.6f,%.6f,%.6f",
+                                  bb["xmin"], bb["ymin"], bb["xmax"], bb["ymax"]),
+          bboxSR        = "4326",
+          imageSR       = "4326",
+          size          = sprintf("%d,%d", nx, ny),
+          format        = "tiff",
+          pixelType     = "S16",
+          renderingRule = '{"rasterFunction":"None"}',
+          f             = "image"
+        ),
+        httr::write_disk(tmp_tif, overwrite = TRUE),
+        httr::timeout(300)
+      ),
+      error = function(e) NULL
+    )
+    if (!is.null(r) && !httr::http_error(r)) { resp <- r; used_ep <- svc; break }
+  }
+
+  if (is.null(resp))
+    stop("LANDFIRE MFRI fetch failed on all endpoints. Check internet connection.")
+
+  message("MFRI downloaded from: ", used_ep)
+
+  mfri_r <- tryCatch(rast(tmp_tif), error = function(e)
+    stop("Could not read LANDFIRE MFRI response as raster: ", conditionMessage(e)))
+
+  # 0 and negative values = no data in LANDFIRE
+  mfri_r[mfri_r <= 0] <- NA
+
+  rng <- range(values(mfri_r, mat = FALSE), na.rm = TRUE)
+  message(sprintf("LANDFIRE MFRI range: [%.0f, %.0f] years", rng[1], rng[2]))
+
+  if (!is.null(progress_fn)) progress_fn("Reprojecting MFRI to working CRS...")
+  mfri_proj <- project(mfri_r, working_crs, method = "bilinear")
+  resample(mfri_proj, template_r, method = "bilinear")
+}
+
+
+# -----------------------------------------------------------------------------
+# compute_scf_fri
+#
+# Computes a per-cell Fire Return Interval raster from annual SCF fire maps.
+# Expects one raster per simulation year; any value > 0 = burned that year.
+# FRI (years) = n_sim_years / times_burned_per_cell.
+# Cells never burned are returned as NA.
+# -----------------------------------------------------------------------------
+compute_scf_fri <- function(maps_dir, n_sim_years, template_r,
+                             file_pattern = NULL, progress_fn = NULL) {
+
+  pacman::p_load(terra)
+
+  if (!dir.exists(maps_dir))
+    stop("SCF fire maps directory not found: ", maps_dir)
+
+  # Auto-detect raster files if no pattern supplied
+  if (is.null(file_pattern) || nchar(trimws(file_pattern)) == 0) {
+    all_files  <- list.files(maps_dir, full.names = TRUE)
+    candidates <- all_files[grepl(
+      "scfire|fire[-_][0-9]|SCFire|severity.*[0-9]{4}|[0-9]{4}.*severity",
+      basename(all_files), ignore.case = TRUE
+    )]
+    candidates <- candidates[grepl(
+      "\\.(img|tif|tiff|bil|asc|grd)$", candidates, ignore.case = TRUE
+    )]
+  } else {
+    candidates <- list.files(maps_dir, pattern = file_pattern,
+                              full.names = TRUE, recursive = FALSE)
+  }
+
+  if (length(candidates) == 0)
+    stop("No fire raster files found in: ", maps_dir,
+         "\nExpected names like: scfire-YYYY.img, fire-YYYY.tif, severity-YYYY.img")
+
+  candidates <- sort(candidates)
+  n_found    <- length(candidates)
+  n_years    <- if (!is.na(n_sim_years) && n_sim_years > 0) n_sim_years else n_found
+  message(sprintf("Computing FRI from %d maps over %d simulation years", n_found, n_years))
+
+  wk_crs     <- crs(template_r)
+  burn_count  <- template_r * 0L
+  names(burn_count) <- "burn_count"
+
+  for (i in seq_along(candidates)) {
+    if (!is.null(progress_fn))
+      progress_fn(sprintf("Reading fire map %d / %d", i, n_found))
+
+    r_yr <- tryCatch(rast(candidates[[i]]), error = function(e) {
+      warning("Could not read ", basename(candidates[[i]]), " — skipping")
+      NULL
+    })
+    if (is.null(r_yr)) next
+
+    if (!same.crs(r_yr, wk_crs))
+      r_yr <- project(r_yr, wk_crs, method = "near")
+
+    r_yr <- resample(r_yr, template_r, method = "near")
+
+    # Any non-zero, non-NA value = burned
+    r_bin       <- ifel(is.na(r_yr) | r_yr == 0, 0L, 1L)
+    burn_count  <- burn_count + r_bin
+  }
+
+  fri_r <- ifel(burn_count == 0L, NA_real_,
+                as.numeric(n_years) / as.numeric(burn_count))
+  names(fri_r) <- "FRI_years"
+
+  n_burned <- sum(values(burn_count, mat = FALSE) > 0, na.rm = TRUE)
+  n_total  <- sum(!is.na(values(template_r, mat = FALSE)))
+  message(sprintf(
+    "FRI: %d / %d cells burned at least once (%.1f%%)  |  median FRI = %.0f yrs",
+    n_burned, n_total, 100 * n_burned / max(n_total, 1),
+    median(values(fri_r, mat = FALSE), na.rm = TRUE)))
+
+  fri_r
+}
+
+
+# -----------------------------------------------------------------------------
+# compute_mean_fri_events
+#
+# Non-spatial mean FRI from the events log + template extent.
+# Mean FRI = (n_cells * n_sim_years) / total_cells_burned_across_all_events
+# Works without annual spatial maps; gives a landscape-mean FRI directly
+# comparable to the spatial mean of LANDFIRE MFRI over the template.
+# -----------------------------------------------------------------------------
+compute_mean_fri_events <- function(sim_events_df, template_r, n_sim_years) {
+
+  if (is.null(sim_events_df) || nrow(sim_events_df) == 0) return(NA_real_)
+  if (is.null(template_r))                                 return(NA_real_)
+
+  n_cells      <- sum(!is.na(values(template_r, mat = FALSE)))
+  if (n_cells == 0) return(NA_real_)
+
+  total_burned <- sum(sim_events_df$TotalSitesBurned, na.rm = TRUE)
+  if (total_burned == 0) return(NA_real_)
+
+  as.numeric(n_cells) * as.numeric(n_sim_years) / as.numeric(total_burned)
+}
+
+
+# -----------------------------------------------------------------------------
+# plot_val_fri
+#
+# Fire Return Interval validation figure.
+# Modes (resolved automatically):
+#   A — Spatial: overlaid histograms of cell-level FRI (simulated) and
+#       LANDFIRE MFRI (observed), plus summary stats in subtitle.
+#   B — Summary only: bar chart of mean landscape FRI (sim vs LANDFIRE)
+#       when annual fire maps are not available.
+# -----------------------------------------------------------------------------
+plot_val_fri <- function(scf_fri_r    = NULL,
+                          lf_mfri_r    = NULL,
+                          mean_fri_sim = NULL,
+                          mean_fri_lf  = NULL,
+                          n_sim_years  = NULL) {
+
+  has_spatial <- !is.null(scf_fri_r) && !is.null(lf_mfri_r)
+  has_lf_mean <- !is.null(mean_fri_lf)  && is.finite(mean_fri_lf)
+  has_sim_mean <- !is.null(mean_fri_sim) && is.finite(mean_fri_sim)
+
+  FRI_CAP <- 500L   # years — cap for display; common across both modes
+
+  # ---- Mode A: cell-level distributions ------------------------------------
+  if (has_spatial) {
+    sim_v <- values(scf_fri_r,  mat = FALSE)
+    sim_v <- sim_v[is.finite(sim_v) & !is.na(sim_v)]
+    lf_v  <- values(lf_mfri_r,  mat = FALSE)
+    lf_v  <- lf_v[is.finite(lf_v)  & !is.na(lf_v) & lf_v > 0]
+
+    df <- dplyr::bind_rows(
+      dplyr::tibble(FRI = pmin(sim_v, FRI_CAP), Source = "Simulated (SCF)"),
+      dplyr::tibble(FRI = pmin(lf_v,  FRI_CAP), Source = "LANDFIRE MFRI")
+    )
+
+    n_sim   <- scales::comma(length(sim_v))
+    n_lf    <- scales::comma(length(lf_v))
+    med_sim <- median(sim_v, na.rm = TRUE)
+    med_lf  <- median(lf_v,  na.rm = TRUE)
+    p25_sim <- quantile(sim_v, 0.25, na.rm = TRUE)
+    p75_sim <- quantile(sim_v, 0.75, na.rm = TRUE)
+    p25_lf  <- quantile(lf_v,  0.25, na.rm = TRUE)
+    p75_lf  <- quantile(lf_v,  0.75, na.rm = TRUE)
+
+    subtitle <- sprintf(
+      "Simulated: median %.0f yrs (IQR %.0f–%.0f, n=%s cells)  │  LANDFIRE: median %.0f yrs (IQR %.0f–%.0f, n=%s cells)",
+      med_sim, p25_sim, p75_sim, n_sim,
+      med_lf,  p25_lf,  p75_lf,  n_lf)
+
+    vlines <- dplyr::tibble(
+      Source = c("Simulated (SCF)", "LANDFIRE MFRI"),
+      med    = c(med_sim, med_lf)
+    )
+
+    ggplot(df, aes(x = FRI, fill = Source, colour = Source)) +
+      geom_histogram(aes(y = after_stat(density)),
+                     position = "identity", alpha = 0.40,
+                     binwidth = 15, boundary = 0) +
+      geom_vline(data = vlines, aes(xintercept = med, colour = Source),
+                 linetype = "dashed", linewidth = 0.9) +
+      scale_fill_manual(values = c("Simulated (SCF)" = .COL_SIM,
+                                   "LANDFIRE MFRI"   = .COL_OBS)) +
+      scale_colour_manual(values = c("Simulated (SCF)" = .COL_SIM,
+                                     "LANDFIRE MFRI"   = .COL_OBS)) +
+      scale_x_continuous(
+        labels = scales::comma,
+        limits = c(0, FRI_CAP),
+        expand = expansion(mult = c(0, 0.02))
+      ) +
+      labs(
+        title    = "Fire Return Interval: Simulated vs LANDFIRE Historic",
+        subtitle = subtitle,
+        x        = sprintf("Fire Return Interval (years, capped at %d)", FRI_CAP),
+        y        = "Density",
+        caption  = paste0(
+          "Simulated FRI = simulation years ÷ times each cell burned (cells burned ≥1 time shown).\n",
+          "LANDFIRE MFRI = mean fire return interval from LF2020 Historic Fire Regimes dataset. Dashed lines = medians.")
+      ) +
+      .pub_theme()
+  } else {
+    # ---- Mode B: summary bar chart ------------------------------------------
+    sum_df <- dplyr::bind_rows(
+      if (has_sim_mean) dplyr::tibble(Source = "Simulated (SCF)", FRI = mean_fri_sim) else NULL,
+      if (has_lf_mean)  dplyr::tibble(Source = "LANDFIRE MFRI",   FRI = mean_fri_lf)  else NULL
+    )
+
+    if (nrow(sum_df) == 0) {
+      return(ggplot() +
+        annotate("text", x = 0.5, y = 0.5,
+                 label = paste0("No FRI data available.\n\n",
+                                "Load the SCF events log to compute mean landscape FRI,\n",
+                                "or provide annual SCF fire maps for cell-level comparison."),
+                 hjust = 0.5, vjust = 0.5, size = 4.5, colour = "grey40") +
+        theme_void())
+    }
+
+    cap_note <- if (!is.null(n_sim_years))
+      sprintf("Landscape mean FRI estimated from events log over %d simulation years.\n", n_sim_years)
+    else "Landscape mean FRI estimated from events log.\n"
+
+    ggplot(sum_df, aes(Source, FRI, fill = Source)) +
+      geom_col(width = 0.45, show.legend = FALSE) +
+      geom_text(aes(label = sprintf("%.0f yrs", FRI)),
+                vjust = -0.45, fontface = "bold", size = 5) +
+      scale_fill_manual(values = c("Simulated (SCF)" = .COL_SIM,
+                                   "LANDFIRE MFRI"   = .COL_OBS)) +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+      labs(
+        title    = "Mean Fire Return Interval: Simulated vs LANDFIRE Historic",
+        subtitle = if (!is.null(n_sim_years))
+          sprintf("Based on %d simulation years  |  FRI = landscape cells × years ÷ total cell-fires",
+                  n_sim_years)
+        else "FRI = landscape cells × years ÷ total cell-fires",
+        x        = NULL,
+        y        = "Mean FRI (years)",
+        caption  = paste0(
+          cap_note,
+          "Load annual SCF fire raster maps for a cell-by-cell spatial comparison.")
+      ) +
+      .pub_theme() +
+      theme(panel.grid.major.x = element_blank())
+  }
+}

@@ -1861,6 +1861,91 @@ ui <- page_navbar(
             br(),
             downloadButton("dl_val_duration", "Download PNG (300 dpi)",
                            class = "btn-sm btn-outline-secondary")
+          ),
+
+          # ------------------------------------------------------------------
+          nav_panel("Fire Return Interval",
+            br(),
+            p(class = "text-muted small",
+              "Compares the fire return interval (FRI) produced by SCF against the",
+              " LANDFIRE Historic Fire Regimes Mean Fire Return Interval (MFRI) for",
+              " your landscape. FRI = years of simulation ÷ times each cell burned.",
+              " A good calibration should produce a landscape-mean FRI that matches",
+              " the LANDFIRE MFRI for your dominant forest type."),
+            fluidRow(
+              # -- Left: data loading controls --------------------------------
+              column(4,
+                tags$div(class = "card mb-3",
+                  tags$div(class = "card-header fw-semibold",
+                    icon("calculator"), " Quick FRI (from events log)"
+                  ),
+                  tags$div(class = "card-body",
+                    p(class = "text-muted small mb-2",
+                      "Estimates a single landscape-mean FRI directly from the loaded",
+                      " SCF events log and the LANDIS template raster. No annual fire",
+                      " maps required. Mean FRI = (cells × sim years) ÷ total cell-fires."),
+                    uiOutput("val_fri_summary_ui")
+                  )
+                ),
+                tags$div(class = "card mb-3",
+                  tags$div(class = "card-header fw-semibold",
+                    icon("map"), " Spatial FRI (annual fire maps)"
+                  ),
+                  tags$div(class = "card-body",
+                    p(class = "text-muted small mb-2",
+                      "Loads one raster per simulation year from a LANDIS output",
+                      " directory. Any non-zero cell value = burned that year.",
+                      " Produces a cell-level FRI map for direct comparison with",
+                      " LANDFIRE MFRI."),
+                    textInput("fri_maps_dir", "Annual fire maps directory",
+                              placeholder = "/path/to/LANDIS/output/"),
+                    p(class = "text-muted small",
+                      "Files matching ", tags$code("scfire-*.img"),
+                      " or ", tags$code("fire-*.tif"), " are detected automatically.",
+                      " Leave blank to use events log only."),
+                    textInput("fri_file_pattern", "Custom file pattern (optional)",
+                              placeholder = "scfire.*\\.img"),
+                    numericInput("fri_n_sim_years",
+                                 "Override simulation years (optional)",
+                                 value = NA, min = 1, step = 1),
+                    p(class = "text-muted small",
+                      "Auto-derived from events log (max SimYear − min SimYear + 1)",
+                      " when left blank."),
+                    actionButton("compute_fri_maps", "Compute Spatial FRI",
+                                 class = "btn-sm btn-outline-primary w-100",
+                                 icon  = icon("layer-group")),
+                    br(), br(),
+                    uiOutput("fri_maps_status_ui")
+                  )
+                ),
+                tags$div(class = "card",
+                  tags$div(class = "card-header fw-semibold",
+                    icon("cloud-arrow-down"), " LANDFIRE MFRI"
+                  ),
+                  tags$div(class = "card-body",
+                    p(class = "text-muted small mb-2",
+                      "Downloads the LANDFIRE 2020 Mean Fire Return Interval raster",
+                      " for your calibration boundary via the LFPS REST API (~30 m",
+                      " native resolution, resampled to the LANDIS template)."),
+                    actionButton("fetch_lf_mfri", "Fetch LANDFIRE MFRI",
+                                 class = "btn-sm btn-outline-primary w-100",
+                                 icon  = icon("cloud-arrow-down")),
+                    br(), br(),
+                    uiOutput("lf_mfri_status_ui")
+                  )
+                )
+              ),
+
+              # -- Right: plot + spatial maps ---------------------------------
+              column(8,
+                plotOutput("val_fri_plot", height = "400px"),
+                br(),
+                uiOutput("val_fri_maps_ui")
+              )
+            ),
+            br(),
+            downloadButton("dl_val_fri", "Download PNG (300 dpi)",
+                           class = "btn-sm btn-outline-secondary")
           )
         )
       )
@@ -2458,7 +2543,13 @@ server <- function(input, output, session) {
     site_mort_fit       = NULL,   # list from fit_site_mortality()
     cohort_mort_fit     = NULL,   # list from fit_cohort_mortality()
     cohort_tree_df      = NULL,   # tree_df from load_ftm_cohort_data() (for diagnostics)
-    yr1status_counts    = NULL    # raw yr1status distribution (for diagnostics)
+    yr1status_counts    = NULL,   # raw yr1status distribution (for diagnostics)
+
+    # Fire Return Interval outputs
+    scf_fri_r           = NULL,   # SpatRaster of per-cell FRI (years) from annual maps
+    lf_mfri_r           = NULL,   # SpatRaster of LANDFIRE MFRI (years)
+    mean_fri_sim        = NULL,   # scalar: landscape-mean FRI from events log
+    fri_n_sim_years     = NULL    # integer: simulation year span used for FRI
   )
 
   # ---------------------------------------------------------------------------
@@ -3379,6 +3470,228 @@ server <- function(input, output, session) {
       plot_val_duration(rv$simulated_events)
     },
     "validation_fire_duration.png"
+  )
+
+  # ---------------------------------------------------------------------------
+  # Fire Return Interval — reactive computations
+  # ---------------------------------------------------------------------------
+
+  # Auto-compute mean FRI from events log whenever simulated_events or
+  # template_r are updated.
+  observe({
+    req(rv$simulated_events, rv$template_r)
+    sim <- rv$simulated_events
+    n_years <- if (!is.null(sim$SimYear) && length(unique(sim$SimYear)) > 0)
+      as.integer(max(sim$SimYear, na.rm = TRUE) - min(sim$SimYear, na.rm = TRUE) + 1L)
+    else NA_integer_
+    rv$fri_n_sim_years <- n_years
+    rv$mean_fri_sim    <- tryCatch(
+      compute_mean_fri_events(sim, rv$template_r, n_years),
+      error = function(e) { warning(e$message); NA_real_ }
+    )
+  })
+
+  # Quick FRI summary box
+  output$val_fri_summary_ui <- renderUI({
+    sim_fri <- rv$mean_fri_sim
+    lf_fri  <- if (!is.null(rv$lf_mfri_r))
+      mean(values(rv$lf_mfri_r, mat = FALSE), na.rm = TRUE)
+    else NULL
+    n_yrs   <- rv$fri_n_sim_years
+
+    if (is.null(rv$simulated_events)) {
+      return(tags$p(class = "text-muted small",
+                    "Load the SCF events log to compute mean FRI."))
+    }
+    rows <- list()
+    if (!is.null(n_yrs) && is.finite(n_yrs))
+      rows <- c(rows, list(tags$tr(tags$td(tags$b("Simulation years")),
+                                   tags$td(sprintf("%d", n_yrs)))))
+    if (!is.null(sim_fri) && is.finite(sim_fri))
+      rows <- c(rows, list(tags$tr(
+        tags$td(tags$b("Mean FRI — Simulated")),
+        tags$td(tags$span(style = sprintf("color:%s; font-weight:bold;", .COL_SIM),
+                          sprintf("%.0f yrs", sim_fri))))))
+    if (!is.null(lf_fri) && is.finite(lf_fri))
+      rows <- c(rows, list(tags$tr(
+        tags$td(tags$b("Mean FRI — LANDFIRE")),
+        tags$td(tags$span(style = sprintf("color:%s; font-weight:bold;", .COL_OBS),
+                          sprintf("%.0f yrs", lf_fri))))))
+
+    if (length(rows) == 0)
+      return(tags$p(class = "text-muted small", "No FRI data computed yet."))
+
+    ratio_row <- if (!is.null(sim_fri) && !is.null(lf_fri) &&
+                     is.finite(sim_fri) && is.finite(lf_fri) && lf_fri > 0) {
+      ratio <- sim_fri / lf_fri
+      colour <- if (abs(ratio - 1) < 0.25) "#2c7a2c"
+                else if (abs(ratio - 1) < 0.50) "#e67e22"
+                else "#c0392b"
+      list(tags$tr(
+        tags$td(tags$b("Ratio (Sim / LANDFIRE)")),
+        tags$td(tags$span(style = sprintf("color:%s; font-weight:bold;", colour),
+                          sprintf("%.2f", ratio)))))
+    } else NULL
+
+    tagList(
+      tags$table(class = "table table-sm mb-0",
+        tags$tbody(c(rows, ratio_row)))
+    )
+  })
+
+  # Compute spatial FRI from annual fire maps
+  observeEvent(input$compute_fri_maps, {
+    req(rv$template_r)
+    maps_dir <- trimws(input$fri_maps_dir %||% "")
+    if (nchar(maps_dir) == 0) {
+      showNotification("Enter a directory path containing annual SCF fire maps.",
+                       type = "warning"); return()
+    }
+    pattern  <- trimws(input$fri_file_pattern %||% "")
+    n_years  <- if (!is.na(input$fri_n_sim_years) && input$fri_n_sim_years > 0)
+      as.integer(input$fri_n_sim_years)
+    else rv$fri_n_sim_years %||% NA_integer_
+
+    withProgress(message = "Computing FRI from annual fire maps…", value = 0, {
+      fri <- tryCatch(
+        compute_scf_fri(
+          maps_dir     = maps_dir,
+          n_sim_years  = n_years,
+          template_r   = rv$template_r,
+          file_pattern = if (nchar(pattern) > 0) pattern else NULL,
+          progress_fn  = function(msg) incProgress(0.05, detail = msg)
+        ),
+        error = function(e) { showNotification(e$message, type = "error"); NULL }
+      )
+    })
+    if (!is.null(fri)) {
+      rv$scf_fri_r <- fri
+      showNotification(
+        sprintf("Spatial FRI computed. Median: %.0f yrs",
+                median(values(fri, mat = FALSE), na.rm = TRUE)),
+        type = "message")
+    }
+  })
+
+  output$fri_maps_status_ui <- renderUI({
+    if (is.null(rv$scf_fri_r)) return(NULL)
+    med_fri <- median(values(rv$scf_fri_r, mat = FALSE), na.rm = TRUE)
+    n_burned <- sum(is.finite(values(rv$scf_fri_r, mat = FALSE)), na.rm = TRUE)
+    tags$div(class = "alert alert-success p-2 mt-1", style = "font-size:0.82rem;",
+      icon("check"), " Spatial FRI computed",
+      tags$br(),
+      sprintf("Median: %.0f yrs  |  %s cells burned ≥1×",
+              med_fri, scales::comma(n_burned)))
+  })
+
+  # Fetch LANDFIRE MFRI
+  observeEvent(input$fetch_lf_mfri, {
+    req(rv$cal_vect_proj, rv$template_r, rv$working_crs)
+    withProgress(message = "Fetching LANDFIRE MFRI…", value = 0, {
+      mfri <- tryCatch(
+        fetch_landfire_mfri(
+          cal_vect    = rv$cal_vect_proj,
+          working_crs = rv$working_crs,
+          template_r  = rv$template_r,
+          progress_fn = function(msg) incProgress(0.3, detail = msg)
+        ),
+        error = function(e) { showNotification(e$message, type = "error"); NULL }
+      )
+    })
+    if (!is.null(mfri)) {
+      rv$lf_mfri_r <- mfri
+      showNotification(
+        sprintf("LANDFIRE MFRI loaded. Mean: %.0f yrs",
+                mean(values(mfri, mat = FALSE), na.rm = TRUE)),
+        type = "message")
+    }
+  })
+
+  output$lf_mfri_status_ui <- renderUI({
+    if (is.null(rv$lf_mfri_r)) return(NULL)
+    mn <- mean(values(rv$lf_mfri_r, mat = FALSE), na.rm = TRUE)
+    md <- median(values(rv$lf_mfri_r, mat = FALSE), na.rm = TRUE)
+    tags$div(class = "alert alert-info p-2 mt-1", style = "font-size:0.82rem;",
+      icon("check"), " LANDFIRE MFRI loaded",
+      tags$br(),
+      sprintf("Mean: %.0f yrs  |  Median: %.0f yrs", mn, md))
+  })
+
+  # FRI comparison plot
+  output$val_fri_plot <- renderPlot({
+    lf_mean <- if (!is.null(rv$lf_mfri_r))
+      mean(values(rv$lf_mfri_r, mat = FALSE), na.rm = TRUE)
+    else NULL
+
+    plot_val_fri(
+      scf_fri_r    = rv$scf_fri_r,
+      lf_mfri_r    = rv$lf_mfri_r,
+      mean_fri_sim = rv$mean_fri_sim,
+      mean_fri_lf  = lf_mean,
+      n_sim_years  = rv$fri_n_sim_years
+    )
+  })
+
+  # Side-by-side tmap maps (spatial FRI vs LANDFIRE MFRI)
+  output$val_fri_maps_ui <- renderUI({
+    if (is.null(rv$scf_fri_r) && is.null(rv$lf_mfri_r)) return(NULL)
+    fluidRow(
+      if (!is.null(rv$scf_fri_r))
+        column(6, h6("Simulated FRI (years)"), tmapOutput("val_fri_sim_map", height = "320px")),
+      if (!is.null(rv$lf_mfri_r))
+        column(6, h6("LANDFIRE MFRI (years)"), tmapOutput("val_fri_lf_map",  height = "320px"))
+    )
+  })
+
+  output$val_fri_sim_map <- renderTmap({
+    req(rv$scf_fri_r)
+    r_disp <- rv$scf_fri_r
+    # Cap display at 500 yrs to prevent colour scale compression
+    r_disp[r_disp > 500] <- 500
+    tmap::tm_shape(r_disp) +
+      tmap::tm_raster(
+        col          = "FRI_years",
+        col.scale    = tmap::tm_scale_continuous(
+          values     = "brewer.rd_yl_gn",
+          limits     = c(0, 500),
+          midpoint   = 100
+        ),
+        col.legend   = tmap::tm_legend(title = "FRI (yrs, max 500)")
+      ) +
+      tmap::tm_layout(frame = FALSE)
+  })
+
+  output$val_fri_lf_map <- renderTmap({
+    req(rv$lf_mfri_r)
+    r_disp <- rv$lf_mfri_r
+    r_disp[r_disp > 500] <- 500
+    tmap::tm_shape(r_disp) +
+      tmap::tm_raster(
+        col          = names(r_disp)[1],
+        col.scale    = tmap::tm_scale_continuous(
+          values     = "brewer.rd_yl_gn",
+          limits     = c(0, 500),
+          midpoint   = 100
+        ),
+        col.legend   = tmap::tm_legend(title = "MFRI (yrs, max 500)")
+      ) +
+      tmap::tm_layout(frame = FALSE)
+  })
+
+  output$dl_val_fri <- .make_val_png_handler(
+    function() {
+      lf_mean <- if (!is.null(rv$lf_mfri_r))
+        mean(values(rv$lf_mfri_r, mat = FALSE), na.rm = TRUE)
+      else NULL
+      plot_val_fri(
+        scf_fri_r    = rv$scf_fri_r,
+        lf_mfri_r    = rv$lf_mfri_r,
+        mean_fri_sim = rv$mean_fri_sim,
+        mean_fri_lf  = lf_mean,
+        n_sim_years  = rv$fri_n_sim_years
+      )
+    },
+    "validation_fire_return_interval.png"
   )
 
   # -- Download all figures as ZIP --------------------------------------------
