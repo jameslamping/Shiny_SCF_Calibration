@@ -1150,80 +1150,197 @@ save_validation_figures <- function(
 # fetch_landfire_mfri
 #
 # Downloads LANDFIRE Mean Fire Return Interval (MFRI, years) for the
-# calibration boundary via the LFPS ImageServer REST API.
-# Uses LF2020 first, falls back to LF2016 if unavailable.
-# Returns a SpatRaster in working_crs resampled to template_r resolution.
+# calibration boundary via the LFPS asynchronous job API (USGS).
+#
+# API flow (LFPS User Guide §3):
+#   1. Submit job: GET https://lfps.usgs.gov/api/job/submit
+#      params: Layer_List, Area_of_Interest ("W S E N"), Email
+#   2. Poll:   GET https://lfps.usgs.gov/api/job/status?JobId=<id>
+#      until status ∈ {Succeeded, Failed, Canceled}
+#   3. Download zip, extract <jobId>.tif, read with terra
+#
+# Products tried in order: LF2020_MFRI → LF2016_MFRI
 # MFRI pixel values are in years; 0 / NA = no fire history information.
+# Returns a SpatRaster in working_crs resampled to template_r resolution.
 # -----------------------------------------------------------------------------
 fetch_landfire_mfri <- function(cal_vect, working_crs, template_r,
-                                 progress_fn = NULL) {
+                                 email       = "Jameslamping@me.com",
+                                 progress_fn = NULL,
+                                 poll_interval_sec = 10,
+                                 max_wait_sec      = 720) {
 
-  pacman::p_load(httr, terra)
+  pacman::p_load(httr, jsonlite, terra)
 
+  # -- 1. Build AOI string: "W S E N" (WGS84 decimal degrees) -----------------
   cal_wgs84 <- project(cal_vect, "EPSG:4326")
-  bb        <- as.vector(ext(cal_wgs84))  # xmin, xmax, ymin, ymax
+  bb        <- as.vector(ext(cal_wgs84))   # xmin xmax ymin ymax
+  aoi_str   <- sprintf("%.6f %.6f %.6f %.6f",
+                        bb["xmin"], bb["ymin"], bb["xmax"], bb["ymax"])
+  message(sprintf("LFPS AOI (W S E N): %s", aoi_str))
 
-  # LANDFIRE native ~30 m; cap per-axis at 4096 px to stay within API limits
-  deg_per_30m <- 30 / 111320
-  nx <- min(as.integer(ceiling((bb["xmax"] - bb["xmin"]) / deg_per_30m)), 4096L)
-  ny <- min(as.integer(ceiling((bb["ymax"] - bb["ymin"]) / deg_per_30m)), 4096L)
+  # -- 2. Submit job, trying product codes in order ----------------------------
+  layer_candidates <- c("LF2020_MFRI", "LF2016_MFRI")
+  submit_url <- "https://lfps.usgs.gov/api/job/submit"
+  job_id     <- NULL
+  used_layer <- NULL
 
-  message(sprintf(
-    "Requesting LANDFIRE MFRI: %d x %d px  bbox [%.4f %.4f %.4f %.4f]",
-    nx, ny, bb["xmin"], bb["ymin"], bb["xmax"], bb["ymax"]))
+  for (layer in layer_candidates) {
+    if (!is.null(progress_fn))
+      progress_fn(sprintf("Submitting LFPS job for %s...", layer))
+    message(sprintf("Submitting LFPS job: Layer_List=%s", layer))
 
-  # Try LF2020, then LF2016 as fallback
-  endpoints <- c(
-    "https://lfps.usgs.gov/arcgis/rest/services/Landfire_LF2020/LF2020_200MFRI_CONUS/ImageServer/exportImage",
-    "https://lfps.usgs.gov/arcgis/rest/services/Landfire_LF2016/LF2016_200MFRI_CONUS/ImageServer/exportImage"
-  )
-
-  tmp_tif <- tempfile(fileext = ".tif")
-  resp    <- NULL
-  used_ep <- NULL
-
-  for (ep in endpoints) {
-    svc <- sub(".*/services/", "", sub("/ImageServer.*", "", ep))
-    if (!is.null(progress_fn)) progress_fn(sprintf("Fetching MFRI from %s ...", svc))
-    r <- tryCatch(
+    resp <- tryCatch(
       httr::GET(
-        ep,
-        query = list(
-          bbox          = sprintf("%.6f,%.6f,%.6f,%.6f",
-                                  bb["xmin"], bb["ymin"], bb["xmax"], bb["ymax"]),
-          bboxSR        = "4326",
-          imageSR       = "4326",
-          size          = sprintf("%d,%d", nx, ny),
-          format        = "tiff",
-          pixelType     = "S16",
-          renderingRule = '{"rasterFunction":"None"}',
-          f             = "image"
+        submit_url,
+        query   = list(
+          Layer_List       = layer,
+          Area_of_Interest = aoi_str,
+          Email            = email
         ),
-        httr::write_disk(tmp_tif, overwrite = TRUE),
-        httr::timeout(300)
+        httr::timeout(60)
       ),
       error = function(e) NULL
     )
-    if (!is.null(r) && !httr::http_error(r)) { resp <- r; used_ep <- svc; break }
+
+    if (is.null(resp)) next
+    if (httr::http_error(resp)) {
+      message(sprintf("LFPS submit HTTP error %d for layer %s",
+                      httr::status_code(resp), layer))
+      next
+    }
+
+    parsed <- tryCatch(
+      jsonlite::fromJSON(httr::content(resp, as = "text", encoding = "UTF-8")),
+      error = function(e) NULL
+    )
+
+    # Response may nest jobId under a key; handle both flat and nested forms
+    jid <- parsed$jobId %||% parsed$Job$jobId %||% parsed[["job_id"]]
+    if (!is.null(jid) && nchar(jid) > 0) {
+      job_id     <- jid
+      used_layer <- layer
+      message(sprintf("LFPS job submitted: jobId=%s  (layer=%s)", job_id, layer))
+      break
+    }
+    message(sprintf("LFPS submit: no jobId in response for layer %s — body: %s",
+                    layer,
+                    substr(httr::content(resp, as = "text", encoding = "UTF-8"), 1, 300)))
   }
 
-  if (is.null(resp))
-    stop("LANDFIRE MFRI fetch failed on all endpoints. Check internet connection.")
+  if (is.null(job_id))
+    stop("LFPS job submission failed for all product candidates (LF2020_MFRI, LF2016_MFRI).",
+         " Check your internet connection and LFPS service status at https://lfps.usgs.gov")
 
-  message("MFRI downloaded from: ", used_ep)
+  # -- 3. Poll until Succeeded / Failed / timeout ------------------------------
+  status_url  <- "https://lfps.usgs.gov/api/job/status"
+  elapsed     <- 0
+  job_status  <- "Pending"
 
-  mfri_r <- tryCatch(rast(tmp_tif), error = function(e)
-    stop("Could not read LANDFIRE MFRI response as raster: ", conditionMessage(e)))
+  while (job_status %in% c("Pending", "Executing", "Submitted")) {
+    Sys.sleep(poll_interval_sec)
+    elapsed <- elapsed + poll_interval_sec
 
-  # 0 and negative values = no data in LANDFIRE
+    if (elapsed > max_wait_sec)
+      stop(sprintf("LFPS job %s timed out after %d seconds (status: %s).",
+                   job_id, max_wait_sec, job_status))
+
+    poll_resp <- tryCatch(
+      httr::GET(status_url,
+                query = list(JobId = job_id),
+                httr::timeout(30)),
+      error = function(e) NULL
+    )
+
+    if (is.null(poll_resp) || httr::http_error(poll_resp)) {
+      message(sprintf("LFPS poll failed at %d s elapsed; retrying...", elapsed))
+      next
+    }
+
+    poll_parsed <- tryCatch(
+      jsonlite::fromJSON(httr::content(poll_resp, as = "text", encoding = "UTF-8")),
+      error = function(e) list()
+    )
+
+    job_status <- poll_parsed$status %||% poll_parsed$Status %||% job_status
+    queue_pos  <- poll_parsed$queuePosition %||% poll_parsed$QueuePosition
+    msg_detail <- if (!is.null(queue_pos) && !is.na(queue_pos))
+      sprintf("queue position %s", queue_pos) else sprintf("%d s elapsed", elapsed)
+
+    message(sprintf("LFPS status [%s]: %s  (%s)", job_id, job_status, msg_detail))
+    if (!is.null(progress_fn))
+      progress_fn(sprintf("LFPS job %s: %s (%s)", job_id, job_status, msg_detail))
+  }
+
+  if (job_status != "Succeeded")
+    stop(sprintf("LFPS job %s ended with status '%s'. Check LFPS for details.",
+                 job_id, job_status))
+
+  # -- 4. Download the result zip ----------------------------------------------
+  if (!is.null(progress_fn)) progress_fn("Downloading LFPS result zip...")
+
+  dl_url <- sprintf(
+    "https://lfps.usgs.gov/arcgis/rest/directories/arcgisjobs/landfireproductservice_gpserver/%s/scratch/%s.zip",
+    job_id, job_id
+  )
+  message("Downloading: ", dl_url)
+
+  tmp_zip <- tempfile(fileext = ".zip")
+  dl_resp <- tryCatch(
+    httr::GET(dl_url,
+              httr::write_disk(tmp_zip, overwrite = TRUE),
+              httr::timeout(600)),
+    error = function(e)
+      stop("LFPS download failed: ", conditionMessage(e))
+  )
+  if (httr::http_error(dl_resp))
+    stop(sprintf("LFPS zip download returned HTTP %d", httr::status_code(dl_resp)))
+
+  # -- 5. Extract and read the GeoTIFF -----------------------------------------
+  if (!is.null(progress_fn)) progress_fn("Extracting and reading raster...")
+
+  tmp_dir  <- tempfile()
+  dir.create(tmp_dir)
+  unzip(tmp_zip, exdir = tmp_dir)
+
+  # Find any .tif in the extracted directory (typically <jobId>.tif)
+  tif_files <- list.files(tmp_dir, pattern = "\\.tif$", full.names = TRUE,
+                           recursive = TRUE, ignore.case = TRUE)
+  if (length(tif_files) == 0)
+    stop("No .tif found in LFPS result zip. Files present: ",
+         paste(list.files(tmp_dir, recursive = TRUE), collapse = ", "))
+
+  tif_path <- tif_files[1]
+  message("Reading: ", tif_path)
+
+  mfri_r <- tryCatch(
+    terra::rast(tif_path),
+    error = function(e)
+      stop("Could not read LFPS GeoTIFF as raster: ", conditionMessage(e))
+  )
+
+  # LFPS delivers multiband GeoTIFFs; MFRI is typically band 1
+  if (terra::nlyr(mfri_r) > 1) {
+    message(sprintf("LFPS GeoTIFF has %d bands; using band 1 (MFRI).",
+                    terra::nlyr(mfri_r)))
+    mfri_r <- mfri_r[[1]]
+  }
+
+  # 0 and negative pixel values = no data in LANDFIRE encoding
   mfri_r[mfri_r <= 0] <- NA
 
-  rng <- range(values(mfri_r, mat = FALSE), na.rm = TRUE)
-  message(sprintf("LANDFIRE MFRI range: [%.0f, %.0f] years", rng[1], rng[2]))
+  n_valid <- sum(!is.na(values(mfri_r, mat = FALSE)))
+  if (n_valid == 0)
+    stop("LFPS MFRI raster contains no valid (> 0) pixels after masking. ",
+         "Check that the AOI overlaps CONUS LANDFIRE coverage.")
 
+  rng <- range(values(mfri_r, mat = FALSE), na.rm = TRUE)
+  message(sprintf("LANDFIRE MFRI (%s) range: [%.0f, %.0f] years  (%d valid cells)",
+                  used_layer, rng[1], rng[2], n_valid))
+
+  # -- 6. Reproject and resample to template -----------------------------------
   if (!is.null(progress_fn)) progress_fn("Reprojecting MFRI to working CRS...")
-  mfri_proj <- project(mfri_r, working_crs, method = "bilinear")
-  resample(mfri_proj, template_r, method = "bilinear")
+  mfri_proj <- terra::project(mfri_r, working_crs, method = "bilinear")
+  terra::resample(mfri_proj, template_r, method = "bilinear")
 }
 
 

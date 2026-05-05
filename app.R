@@ -1925,8 +1925,17 @@ ui <- page_navbar(
                   tags$div(class = "card-body",
                     p(class = "text-muted small mb-2",
                       "Downloads the LANDFIRE 2020 Mean Fire Return Interval raster",
-                      " for your calibration boundary via the LFPS REST API (~30 m",
-                      " native resolution, resampled to the LANDIS template)."),
+                      " for your calibration boundary via the LFPS asynchronous job",
+                      " API (~30 m native resolution, resampled to the LANDIS template).",
+                      " Processing typically takes 30 seconds – 5 minutes."),
+                    textInput("fri_lfps_email",
+                              tags$span("Email address",
+                                        tags$span(class = "text-danger", " *")),
+                              value       = "Jameslamping@me.com",
+                              placeholder = "your@email.com"),
+                    p(class = "text-muted small mb-2",
+                      "Required by the LFPS API. Your address is never stored beyond",
+                      " this session."),
                     actionButton("fetch_lf_mfri", "Fetch LANDFIRE MFRI",
                                  class = "btn-sm btn-outline-primary w-100",
                                  icon  = icon("cloud-arrow-down")),
@@ -3584,18 +3593,30 @@ server <- function(input, output, session) {
               med_fri, scales::comma(n_burned)))
   })
 
-  # Fetch LANDFIRE MFRI
+  # Fetch LANDFIRE MFRI via LFPS async job API
   observeEvent(input$fetch_lf_mfri, {
     req(rv$cal_vect_proj, rv$template_r, rv$working_crs)
-    withProgress(message = "Fetching LANDFIRE MFRI…", value = 0, {
+    email <- trimws(input$fri_lfps_email %||% "Jameslamping@me.com")
+    if (!grepl("@", email, fixed = TRUE))
+      return(showNotification("Please enter a valid email address for the LFPS API.",
+                              type = "warning"))
+
+    mfri <- NULL
+    withProgress(message = "Fetching LANDFIRE MFRI via LFPS…", value = 0.05, {
       mfri <- tryCatch(
         fetch_landfire_mfri(
-          cal_vect    = rv$cal_vect_proj,
-          working_crs = rv$working_crs,
-          template_r  = rv$template_r,
-          progress_fn = function(msg) incProgress(0.3, detail = msg)
+          cal_vect          = rv$cal_vect_proj,
+          working_crs       = rv$working_crs,
+          template_r        = rv$template_r,
+          email             = email,
+          poll_interval_sec = 10,
+          max_wait_sec      = 720,
+          progress_fn       = function(msg) incProgress(0.1, detail = msg)
         ),
-        error = function(e) { showNotification(e$message, type = "error"); NULL }
+        error = function(e) {
+          showNotification(conditionMessage(e), type = "error", duration = 15)
+          NULL
+        }
       )
     })
     if (!is.null(mfri)) {
