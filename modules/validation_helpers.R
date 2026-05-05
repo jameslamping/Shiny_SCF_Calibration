@@ -1147,63 +1147,142 @@ save_validation_figures <- function(
 # =============================================================================
 
 # -----------------------------------------------------------------------------
+# .auto_detect_fri_csv
+#
+# LANDFIRE distributes the attribute table that maps raster VALUE codes to
+# actual FRI values in a CSV alongside the TIF.  The standard directory
+# structure is:
+#   {product_root}/Tif/LF2016_FRI_CONUS.tif      ← tif_path
+#   {product_root}/CSV_Data/LF2016_FRI.csv        ← auto-detected
+#
+# Returns the path to the first CSV found in CSV_Data/, or NULL if absent.
+# -----------------------------------------------------------------------------
+.auto_detect_fri_csv <- function(tif_path) {
+  product_root <- dirname(dirname(tif_path))        # up two levels from .tif
+  csv_dir      <- file.path(product_root, "CSV_Data")
+  if (!dir.exists(csv_dir)) return(NULL)
+  csvs <- list.files(csv_dir, pattern = "\\.csv$", full.names = TRUE,
+                     ignore.case = TRUE)
+  if (length(csvs) == 0) return(NULL)
+  csvs[1]
+}
+
+
+# -----------------------------------------------------------------------------
 # load_local_lf_fri
 #
 # Loads a locally downloaded LANDFIRE Fire Return Interval (FRI) GeoTIFF,
-# clips it to the calibration boundary, and reprojects / resamples to the
-# LANDIS template grid.
+# joins the attribute table CSV to convert class codes → FRI years, clips
+# to the calibration boundary, and reprojects / resamples to the LANDIS
+# template grid.
+#
+# LANDFIRE FRI raster encoding (IMPORTANT):
+#   Pixel values are INTEGER CLASS CODES (BpS-derived), NOT years directly.
+#   The companion CSV (CSV_Data/LF2016_FRI.csv) maps each VALUE code to:
+#     FRI_ALLFIR  = mean FRI across all fire severities (years) ← used here
+#     FRI_REPLAC  = replacement-severity FRI (years)
+#     FRI_MIXED   = mixed-severity FRI (years)
+#     FRI_SURFAC  = surface-severity FRI (years)
+#   No-data sentinel values: -9999 (Fill-NoData), -1111 (Fill-Not Mapped)
+#
+# The CSV is auto-detected from the standard LANDFIRE directory structure:
+#   {product_root}/Tif/LF2016_FRI_CONUS.tif
+#   {product_root}/CSV_Data/LF2016_FRI.csv    ← found automatically
+# Supply csv_path explicitly to override.
 #
 # Recommended product: LF2016_FRI_CONUS (download from landfire.gov)
-#   Typical path: .../LF2016_FRI_CONUS/Tif/LF2016_FRI_CONUS.tif
-#
-# LANDFIRE FRI encoding:
-#   Pixel values = mean fire return interval in years (integer).
-#   No-data values: -9999, 0, and negative values → masked to NA.
-#   High values (> 10 000) indicate extremely rare fire or no fire history.
-#
-# Returns a SpatRaster in working_crs, resampled to template_r resolution.
+# Returns a SpatRaster of FRI in years, in working_crs, resampled to
+# template_r resolution.
 # -----------------------------------------------------------------------------
 load_local_lf_fri <- function(tif_path, cal_vect, working_crs, template_r,
+                               csv_path    = NULL,
+                               fri_col     = "FRI_ALLFIR",
                                progress_fn = NULL) {
 
-  pacman::p_load(terra)
+  pacman::p_load(terra, dplyr, readr)
 
   tif_path <- trimws(tif_path)
   if (!file.exists(tif_path))
     stop("LANDFIRE FRI TIF not found: ", tif_path,
          "\nDownload LF2016_FRI_CONUS from https://landfire.gov and point to the .tif")
 
+  # -- 1. Read raster (stores class codes, not years yet) ----------------------
   if (!is.null(progress_fn)) progress_fn("Reading LANDFIRE FRI TIF...")
   fri_r <- tryCatch(
     terra::rast(tif_path),
-    error = function(e)
-      stop("Could not open LANDFIRE FRI TIF: ", conditionMessage(e))
+    error = function(e) stop("Could not open LANDFIRE FRI TIF: ", conditionMessage(e))
   )
-
   if (terra::nlyr(fri_r) > 1) {
     message(sprintf("LANDFIRE FRI TIF has %d bands; using band 1.", terra::nlyr(fri_r)))
     fri_r <- fri_r[[1]]
   }
 
-  # -- Clip to calibration boundary (reproject boundary to LF native CRS) -----
-  if (!is.null(progress_fn)) progress_fn("Clipping LANDFIRE FRI to calibration boundary...")
+  # -- 2. Clip to calibration boundary first (much faster on full-CONUS TIF) --
+  if (!is.null(progress_fn)) progress_fn("Clipping to calibration boundary...")
   cal_lf <- terra::project(cal_vect, terra::crs(fri_r))
   fri_r  <- terra::crop(fri_r, cal_lf, mask = TRUE)
 
-  # -- Mask LANDFIRE no-data values -------------------------------------------
-  # LF FRI: -9999 = no data, 0 = open water / non-burnable, negative = artifact
-  fri_r[fri_r <= 0] <- NA
+  # -- 3. Join attribute table: class codes → FRI years ------------------------
+  if (is.null(csv_path)) csv_path <- .auto_detect_fri_csv(tif_path)
 
+  if (!is.null(csv_path) && file.exists(csv_path)) {
+    if (!is.null(progress_fn)) progress_fn("Joining FRI attribute table...")
+    message("Joining attribute table: ", basename(csv_path))
+
+    att <- tryCatch(
+      readr::read_csv(csv_path, col_types = readr::cols(.default = "d"),
+                      show_col_types = FALSE),
+      error = function(e) {
+        warning("Could not read FRI CSV (", csv_path, "): ", conditionMessage(e),
+                " — using raw pixel values instead.")
+        NULL
+      }
+    )
+
+    if (!is.null(att) && "VALUE" %in% names(att) && fri_col %in% names(att)) {
+      # Build reclassification matrix: [from_value, to_fri_years]
+      # Only include rows with valid FRI (> 0); -9999 / -1111 rows → NA via others=NA
+      rcl_df <- att %>%
+        dplyr::filter(.data[["VALUE"]] > 0,
+                      .data[[fri_col]] > 0) %>%
+        dplyr::select(from = VALUE, to = !!fri_col)
+
+      if (nrow(rcl_df) == 0)
+        stop("Attribute table join produced no valid FRI rows. Check column name '",
+             fri_col, "' in: ", csv_path)
+
+      rcl_mat <- as.matrix(rcl_df)
+      fri_r   <- terra::classify(fri_r, rcl_mat, others = NA)
+      names(fri_r) <- "FRI_years"
+      message(sprintf("Reclassified: %d class codes → FRI years (col: %s)",
+                      nrow(rcl_df), fri_col))
+    } else {
+      warning("CSV missing 'VALUE' or '", fri_col, "' column — using raw pixel values.")
+      fri_r[fri_r <= 0] <- NA
+    }
+
+  } else {
+    # No CSV found — warn loudly but don't crash; raw pixel values are class codes
+    warning(
+      "No attribute table CSV found for LANDFIRE FRI.\n",
+      "Expected: ", file.path(dirname(dirname(tif_path)), "CSV_Data", "*.csv"), "\n",
+      "Pixel values are class codes (NOT years). Results will be incorrect.\n",
+      "Download the full LANDFIRE product folder to get the CSV."
+    )
+    fri_r[fri_r <= 0] <- NA
+  }
+
+  # -- 4. Validate -----------------------------------------------------------
   n_valid <- sum(!is.na(terra::values(fri_r, mat = FALSE)))
   if (n_valid == 0)
-    stop("No valid FRI pixels found within the calibration boundary. ",
+    stop("No valid FRI pixels within the calibration boundary after attribute join. ",
          "Check that the TIF extent overlaps your calibration vector.")
 
   rng <- range(terra::values(fri_r, mat = FALSE), na.rm = TRUE)
-  message(sprintf("LANDFIRE FRI range after clip: [%.0f, %.0f] years  (%d valid cells)",
-                  rng[1], rng[2], n_valid))
+  message(sprintf("LANDFIRE FRI (%s) range after clip + join: [%.0f, %.0f] years  (%d valid cells)",
+                  fri_col, rng[1], rng[2], n_valid))
 
-  # -- Reproject and resample to LANDIS template grid -------------------------
+  # -- 5. Reproject and resample to LANDIS template grid ----------------------
   if (!is.null(progress_fn)) progress_fn("Reprojecting FRI to working CRS...")
   fri_proj <- terra::project(fri_r, working_crs, method = "bilinear")
   terra::resample(fri_proj, template_r, method = "bilinear")
