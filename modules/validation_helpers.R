@@ -1300,9 +1300,12 @@ compute_scf_fri <- function(maps_dir, n_sim_years, template_r,
   message(sprintf("Computing FRI from %d maps over %d simulation years  (severity encoding: %s)",
                   n_found, n_years, use_severity_encoding))
 
-  wk_crs     <- crs(template_r)
-  burn_count  <- template_r * 0L;  names(burn_count)  <- "burn_count"
-  active_count <- template_r * 0L; names(active_count) <- "active_count"
+  wk_crs      <- crs(template_r)
+  tmpl_ext    <- ext(template_r)
+  tmpl_nrow   <- nrow(template_r)
+  tmpl_ncol   <- ncol(template_r)
+  burn_count   <- template_r * 0L;  names(burn_count)  <- "burn_count"
+  active_count <- template_r * 0L;  names(active_count) <- "active_count"
 
   for (i in seq_along(candidates)) {
     if (!is.null(progress_fn))
@@ -1314,9 +1317,27 @@ compute_scf_fri <- function(maps_dir, n_sim_years, template_r,
     })
     if (is.null(r_yr)) next
 
-    if (!same.crs(r_yr, wk_crs))
+    # LANDIS outputs have no embedded CRS or extent metadata.
+    # Following the SCF Output Viewer approach (fix_raster_georef): if the
+    # raster has no CRS, stamp it directly with the template's CRS and extent.
+    # This is valid because LANDIS outputs are always on the same grid as the
+    # template raster — same cell count, same spatial footprint, just missing
+    # the metadata.
+    has_crs <- !is.na(crs(r_yr)) && nchar(crs(r_yr)) > 0
+
+    if (!has_crs && nrow(r_yr) == tmpl_nrow && ncol(r_yr) == tmpl_ncol) {
+      # Dimensions match — stamp CRS + extent, no reprojection needed
+      terra::crs(r_yr) <- wk_crs
+      terra::ext(r_yr) <- tmpl_ext
+    } else if (!has_crs) {
+      # Different dimensions but no CRS — stamp CRS then resample
+      terra::crs(r_yr) <- wk_crs
+      r_yr <- resample(r_yr, template_r, method = "near")
+    } else if (!same.crs(r_yr, wk_crs)) {
+      # Has a CRS but it differs — reproject then resample
       r_yr <- project(r_yr, wk_crs, method = "near")
-    r_yr <- resample(r_yr, template_r, method = "near")
+      r_yr <- resample(r_yr, template_r, method = "near")
+    }
 
     if (use_severity_encoding) {
       # SCF encoding: 0 = non-active, 1 = unburned active, 2-11 = burned
