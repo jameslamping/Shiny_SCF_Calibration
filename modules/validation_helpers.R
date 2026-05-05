@@ -1147,235 +1147,101 @@ save_validation_figures <- function(
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# fetch_landfire_mfri
+# load_local_lf_fri
 #
-# Downloads LANDFIRE Fire Return Interval (FRI, years) for the calibration
-# boundary via the LFPS asynchronous job API (USGS).
+# Loads a locally downloaded LANDFIRE Fire Return Interval (FRI) GeoTIFF,
+# clips it to the calibration boundary, and reprojects / resamples to the
+# LANDIS template grid.
 #
-# NOTE ON PRODUCT NAME: LANDFIRE renamed "MFRI" (Mean Fire Return Interval)
-# to "FRI" in their post-2016 product catalog. The correct LFPS Layer_List
-# code for CONUS is LF2016_FRI. There is no LF2020_MFRI or LF2016_MFRI.
-# See https://lfps.usgs.gov/products for the current catalog.
+# Recommended product: LF2016_FRI_CONUS (download from landfire.gov)
+#   Typical path: .../LF2016_FRI_CONUS/Tif/LF2016_FRI_CONUS.tif
 #
-# API flow (LFPS User Guide §7):
-#   1. Submit job: GET https://lfps.usgs.gov/api/job/submit
-#      params: Layer_List, Area_of_Interest ("W S E N"), Email
-#   2. Poll:   GET https://lfps.usgs.gov/api/job/status?JobId=<id>
-#      until status ∈ {Succeeded, Failed, Canceled}
-#      Response includes: jobId, status, messages[], queuePosition
-#   3. Download zip, extract <jobId>.tif, read with terra
+# LANDFIRE FRI encoding:
+#   Pixel values = mean fire return interval in years (integer).
+#   No-data values: -9999, 0, and negative values → masked to NA.
+#   High values (> 10 000) indicate extremely rare fire or no fire history.
 #
-# FRI pixel values are in years; 0 / NA = no fire history information.
-# Returns a SpatRaster in working_crs resampled to template_r resolution.
+# Returns a SpatRaster in working_crs, resampled to template_r resolution.
 # -----------------------------------------------------------------------------
-fetch_landfire_mfri <- function(cal_vect, working_crs, template_r,
-                                 email       = "Jameslamping@me.com",
-                                 progress_fn = NULL,
-                                 poll_interval_sec = 10,
-                                 max_wait_sec      = 720) {
+load_local_lf_fri <- function(tif_path, cal_vect, working_crs, template_r,
+                               progress_fn = NULL) {
 
-  pacman::p_load(httr, jsonlite, terra)
+  pacman::p_load(terra)
 
-  # -- 1. Build AOI string: "W S E N" (WGS84 decimal degrees) -----------------
-  cal_wgs84 <- project(cal_vect, "EPSG:4326")
-  bb        <- as.vector(ext(cal_wgs84))   # xmin xmax ymin ymax
-  aoi_str   <- sprintf("%.6f %.6f %.6f %.6f",
-                        bb["xmin"], bb["ymin"], bb["xmax"], bb["ymax"])
-  message(sprintf("LFPS AOI (W S E N): %s", aoi_str))
+  tif_path <- trimws(tif_path)
+  if (!file.exists(tif_path))
+    stop("LANDFIRE FRI TIF not found: ", tif_path,
+         "\nDownload LF2016_FRI_CONUS from https://landfire.gov and point to the .tif")
 
-  # -- 2. Submit job, trying product codes in order ----------------------------
-  # LF2016_FRI = CONUS Fire Return Interval (renamed from MFRI in post-2016 catalog)
-  # LF2023_FRI = Alaska only; listed as a secondary fallback but rarely needed for CONUS
-  layer_candidates <- c("LF2016_FRI", "LF2023_FRI")
-  submit_url <- "https://lfps.usgs.gov/api/job/submit"
-  job_id     <- NULL
-  used_layer <- NULL
-
-  for (layer in layer_candidates) {
-    if (!is.null(progress_fn))
-      progress_fn(sprintf("Submitting LFPS job for %s...", layer))
-    message(sprintf("Submitting LFPS job: Layer_List=%s", layer))
-
-    resp <- tryCatch(
-      httr::GET(
-        submit_url,
-        query   = list(
-          Layer_List       = layer,
-          Area_of_Interest = aoi_str,
-          Email            = email
-        ),
-        httr::timeout(60)
-      ),
-      error = function(e) NULL
-    )
-
-    if (is.null(resp)) next
-    if (httr::http_error(resp)) {
-      message(sprintf("LFPS submit HTTP error %d for layer %s",
-                      httr::status_code(resp), layer))
-      next
-    }
-
-    parsed <- tryCatch(
-      jsonlite::fromJSON(httr::content(resp, as = "text", encoding = "UTF-8")),
-      error = function(e) NULL
-    )
-
-    # Response may nest jobId under a key; handle both flat and nested forms
-    jid <- parsed$jobId %||% parsed$Job$jobId %||% parsed[["job_id"]]
-    if (!is.null(jid) && nchar(jid) > 0) {
-      job_id     <- jid
-      used_layer <- layer
-      message(sprintf("LFPS job submitted: jobId=%s  (layer=%s)", job_id, layer))
-      break
-    }
-    message(sprintf("LFPS submit: no jobId in response for layer %s — body: %s",
-                    layer,
-                    substr(httr::content(resp, as = "text", encoding = "UTF-8"), 1, 300)))
-  }
-
-  if (is.null(job_id))
-    stop("LFPS job submission failed for all product candidates (LF2016_FRI, LF2023_FRI).",
-         " Check your internet connection and LFPS service status at https://lfps.usgs.gov")
-
-  # -- 3. Poll until Succeeded / Failed / timeout ------------------------------
-  status_url   <- "https://lfps.usgs.gov/api/job/status"
-  elapsed      <- 0
-  job_status   <- "Pending"
-  last_msgs    <- character(0)   # capture LFPS messages[] for error reporting
-
-  while (job_status %in% c("Pending", "Executing", "Submitted")) {
-    Sys.sleep(poll_interval_sec)
-    elapsed <- elapsed + poll_interval_sec
-
-    if (elapsed > max_wait_sec)
-      stop(sprintf("LFPS job %s timed out after %d seconds (status: %s).",
-                   job_id, max_wait_sec, job_status))
-
-    poll_resp <- tryCatch(
-      httr::GET(status_url,
-                query = list(JobId = job_id),
-                httr::timeout(30)),
-      error = function(e) NULL
-    )
-
-    if (is.null(poll_resp) || httr::http_error(poll_resp)) {
-      message(sprintf("LFPS poll failed at %d s elapsed; retrying...", elapsed))
-      next
-    }
-
-    poll_parsed <- tryCatch(
-      jsonlite::fromJSON(httr::content(poll_resp, as = "text", encoding = "UTF-8")),
-      error = function(e) list()
-    )
-
-    job_status <- poll_parsed$status %||% poll_parsed$Status %||% job_status
-    queue_pos  <- poll_parsed$queuePosition %||% poll_parsed$QueuePosition
-    msg_detail <- if (!is.null(queue_pos) && !is.na(as.integer(queue_pos)) &&
-                      as.integer(queue_pos) >= 0)
-      sprintf("queue position %s", queue_pos) else sprintf("%d s elapsed", elapsed)
-
-    # Capture messages[] — array with type+description fields (§8 of User Guide)
-    raw_msgs <- poll_parsed$messages
-    if (!is.null(raw_msgs)) {
-      last_msgs <- tryCatch({
-        if (is.data.frame(raw_msgs))
-          paste(raw_msgs$description %||% raw_msgs[[1]], collapse = "; ")
-        else
-          paste(as.character(raw_msgs), collapse = "; ")
-      }, error = function(e) character(0))
-      message("LFPS messages: ", last_msgs)
-    }
-
-    message(sprintf("LFPS status [%s]: %s  (%s)", job_id, job_status, msg_detail))
-    if (!is.null(progress_fn))
-      progress_fn(sprintf("LFPS: %s (%s)", job_status, msg_detail))
-  }
-
-  if (job_status != "Succeeded") {
-    msg_snippet <- if (length(last_msgs) > 0 && nchar(last_msgs[1]) > 0)
-      sprintf(" LFPS messages: %s", paste(last_msgs, collapse = " | "))
-    else ""
-    stop(sprintf("LFPS job %s ended with status '%s'.%s",
-                 job_id, job_status, msg_snippet))
-  }
-
-  # -- 4. Download the result zip ----------------------------------------------
-  if (!is.null(progress_fn)) progress_fn("Downloading LFPS result zip...")
-
-  dl_url <- sprintf(
-    "https://lfps.usgs.gov/arcgis/rest/directories/arcgisjobs/landfireproductservice_gpserver/%s/scratch/%s.zip",
-    job_id, job_id
-  )
-  message("Downloading: ", dl_url)
-
-  tmp_zip <- tempfile(fileext = ".zip")
-  dl_resp <- tryCatch(
-    httr::GET(dl_url,
-              httr::write_disk(tmp_zip, overwrite = TRUE),
-              httr::timeout(600)),
-    error = function(e)
-      stop("LFPS download failed: ", conditionMessage(e))
-  )
-  if (httr::http_error(dl_resp))
-    stop(sprintf("LFPS zip download returned HTTP %d", httr::status_code(dl_resp)))
-
-  # -- 5. Extract and read the GeoTIFF -----------------------------------------
-  if (!is.null(progress_fn)) progress_fn("Extracting and reading raster...")
-
-  tmp_dir  <- tempfile()
-  dir.create(tmp_dir)
-  unzip(tmp_zip, exdir = tmp_dir)
-
-  # Find any .tif in the extracted directory (typically <jobId>.tif)
-  tif_files <- list.files(tmp_dir, pattern = "\\.tif$", full.names = TRUE,
-                           recursive = TRUE, ignore.case = TRUE)
-  if (length(tif_files) == 0)
-    stop("No .tif found in LFPS result zip. Files present: ",
-         paste(list.files(tmp_dir, recursive = TRUE), collapse = ", "))
-
-  tif_path <- tif_files[1]
-  message("Reading: ", tif_path)
-
-  mfri_r <- tryCatch(
+  if (!is.null(progress_fn)) progress_fn("Reading LANDFIRE FRI TIF...")
+  fri_r <- tryCatch(
     terra::rast(tif_path),
     error = function(e)
-      stop("Could not read LFPS GeoTIFF as raster: ", conditionMessage(e))
+      stop("Could not open LANDFIRE FRI TIF: ", conditionMessage(e))
   )
 
-  # LFPS delivers multiband GeoTIFFs; MFRI is typically band 1
-  if (terra::nlyr(mfri_r) > 1) {
-    message(sprintf("LFPS GeoTIFF has %d bands; using band 1 (MFRI).",
-                    terra::nlyr(mfri_r)))
-    mfri_r <- mfri_r[[1]]
+  if (terra::nlyr(fri_r) > 1) {
+    message(sprintf("LANDFIRE FRI TIF has %d bands; using band 1.", terra::nlyr(fri_r)))
+    fri_r <- fri_r[[1]]
   }
 
-  # 0 and negative pixel values = no data in LANDFIRE encoding
-  mfri_r[mfri_r <= 0] <- NA
+  # -- Clip to calibration boundary (reproject boundary to LF native CRS) -----
+  if (!is.null(progress_fn)) progress_fn("Clipping LANDFIRE FRI to calibration boundary...")
+  cal_lf <- terra::project(cal_vect, terra::crs(fri_r))
+  fri_r  <- terra::crop(fri_r, cal_lf, mask = TRUE)
 
-  n_valid <- sum(!is.na(values(mfri_r, mat = FALSE)))
+  # -- Mask LANDFIRE no-data values -------------------------------------------
+  # LF FRI: -9999 = no data, 0 = open water / non-burnable, negative = artifact
+  fri_r[fri_r <= 0] <- NA
+
+  n_valid <- sum(!is.na(terra::values(fri_r, mat = FALSE)))
   if (n_valid == 0)
-    stop("LFPS MFRI raster contains no valid (> 0) pixels after masking. ",
-         "Check that the AOI overlaps CONUS LANDFIRE coverage.")
+    stop("No valid FRI pixels found within the calibration boundary. ",
+         "Check that the TIF extent overlaps your calibration vector.")
 
-  rng <- range(values(mfri_r, mat = FALSE), na.rm = TRUE)
-  message(sprintf("LANDFIRE FRI (%s) range: [%.0f, %.0f] years  (%d valid cells)",
-                  used_layer, rng[1], rng[2], n_valid))
+  rng <- range(terra::values(fri_r, mat = FALSE), na.rm = TRUE)
+  message(sprintf("LANDFIRE FRI range after clip: [%.0f, %.0f] years  (%d valid cells)",
+                  rng[1], rng[2], n_valid))
 
-  # -- 6. Reproject and resample to template -----------------------------------
-  if (!is.null(progress_fn)) progress_fn("Reprojecting MFRI to working CRS...")
-  mfri_proj <- terra::project(mfri_r, working_crs, method = "bilinear")
-  terra::resample(mfri_proj, template_r, method = "bilinear")
+  # -- Reproject and resample to LANDIS template grid -------------------------
+  if (!is.null(progress_fn)) progress_fn("Reprojecting FRI to working CRS...")
+  fri_proj <- terra::project(fri_r, working_crs, method = "bilinear")
+  terra::resample(fri_proj, template_r, method = "bilinear")
 }
+
+# Keep the old name as an alias so any stale server references don't break
+fetch_landfire_mfri <- load_local_lf_fri
 
 
 # -----------------------------------------------------------------------------
 # compute_scf_fri
 #
-# Computes a per-cell Fire Return Interval raster from annual SCF fire maps.
-# Expects one raster per simulation year; any value > 0 = burned that year.
-# FRI (years) = n_sim_years / times_burned_per_cell.
-# Cells never burned are returned as NA.
+# Computes a per-cell Fire Return Interval raster from annual SCF fire-severity
+# rasters, using the same encoding as the LANDIS-II SCF Output Viewer.
+#
+# SCF fire-severity encoding (fire-severity-YYYY.tif):
+#   0        = non-active cell (outside LANDIS landscape mask)
+#   1        = active cell, did NOT burn this year
+#   2–11     = active cell, burned with severity level 1–10
+#
+# FRI per cell = active_years / burn_count
+#   active_years = number of years the cell had value >= 1 (in-landscape)
+#   burn_count   = number of years the cell had value > 1 (actually burned)
+#
+# This matches LANDFIRE FRI semantics: FRI = years / fires, restricted to
+# years when the cell was a valid burnable landscape cell. Non-active cells
+# (value == 0) are excluded from both numerator and denominator, so cells
+# that enter or leave the landscape mid-simulation are handled correctly.
+#
+# Auto-detects two file layouts:
+#   1. SCF Output Viewer layout (preferred):
+#      {maps_dir}/social-climate-fire/fire-severity-YYYY.tif
+#   2. Legacy calibration app layout:
+#      {maps_dir}/scfire-YYYY.img  or  {maps_dir}/fire-YYYY.tif  (any raster)
+#      In this case, 0 = non-active (no mask) and any value > 0 = burned;
+#      active_years defaults to n_sim_years for all cells.
+#
+# Returns SpatRaster "FRI_years"; never-burned active cells → NA.
 # -----------------------------------------------------------------------------
 compute_scf_fri <- function(maps_dir, n_sim_years, template_r,
                              file_pattern = NULL, progress_fn = NULL) {
@@ -1385,37 +1251,62 @@ compute_scf_fri <- function(maps_dir, n_sim_years, template_r,
   if (!dir.exists(maps_dir))
     stop("SCF fire maps directory not found: ", maps_dir)
 
-  # Auto-detect raster files if no pattern supplied
-  if (is.null(file_pattern) || nchar(trimws(file_pattern)) == 0) {
-    all_files  <- list.files(maps_dir, full.names = TRUE)
+  # -- Locate annual fire rasters ----------------------------------------------
+  # Priority 1: SCF Output Viewer layout  {maps_dir}/social-climate-fire/fire-severity-YYYY.tif
+  scf_subdir <- file.path(maps_dir, "social-climate-fire")
+  use_severity_encoding <- FALSE
+
+  if (!is.null(file_pattern) && nchar(trimws(file_pattern)) > 0) {
+    candidates <- list.files(maps_dir, pattern = file_pattern,
+                              full.names = TRUE, recursive = TRUE)
+    # Infer encoding from file name
+    use_severity_encoding <- any(grepl("severity", candidates, ignore.case = TRUE))
+
+  } else if (dir.exists(scf_subdir)) {
+    candidates <- list.files(scf_subdir,
+                              pattern = "^fire-severity-\\d+\\.tif$",
+                              full.names = TRUE)
+    if (length(candidates) > 0) {
+      use_severity_encoding <- TRUE
+      message("SCF Output Viewer layout detected: using fire-severity encoding ",
+              "(0=non-active, 1=unburned, 2-11=burned)")
+    }
+  }
+
+  # Fallback: legacy calibration app file patterns
+  if (length(candidates) == 0 || (!exists("candidates"))) {
+    all_files  <- list.files(maps_dir, full.names = TRUE, recursive = TRUE)
     candidates <- all_files[grepl(
-      "scfire|fire[-_][0-9]|SCFire|severity.*[0-9]{4}|[0-9]{4}.*severity",
+      "scfire|fire[-_][0-9]|SCFire|severity.*[0-9]|[0-9].*severity",
       basename(all_files), ignore.case = TRUE
     )]
     candidates <- candidates[grepl(
       "\\.(img|tif|tiff|bil|asc|grd)$", candidates, ignore.case = TRUE
     )]
-  } else {
-    candidates <- list.files(maps_dir, pattern = file_pattern,
-                              full.names = TRUE, recursive = FALSE)
   }
 
   if (length(candidates) == 0)
     stop("No fire raster files found in: ", maps_dir,
-         "\nExpected names like: scfire-YYYY.img, fire-YYYY.tif, severity-YYYY.img")
+         "\nExpected either:\n",
+         "  (a) social-climate-fire/fire-severity-YYYY.tif  [SCF Output Viewer layout]\n",
+         "  (b) scfire-YYYY.img / fire-YYYY.tif  [legacy layout]")
 
-  candidates <- sort(candidates)
-  n_found    <- length(candidates)
-  n_years    <- if (!is.na(n_sim_years) && n_sim_years > 0) n_sim_years else n_found
-  message(sprintf("Computing FRI from %d maps over %d simulation years", n_found, n_years))
+  # Sort by the embedded year number so layers accumulate in order
+  candidates <- candidates[order(as.integer(
+    gsub("[^0-9]", "", basename(candidates))
+  ))]
+  n_found <- length(candidates)
+  n_years <- if (!is.na(n_sim_years) && n_sim_years > 0) n_sim_years else n_found
+  message(sprintf("Computing FRI from %d maps over %d simulation years  (severity encoding: %s)",
+                  n_found, n_years, use_severity_encoding))
 
   wk_crs     <- crs(template_r)
-  burn_count  <- template_r * 0L
-  names(burn_count) <- "burn_count"
+  burn_count  <- template_r * 0L;  names(burn_count)  <- "burn_count"
+  active_count <- template_r * 0L; names(active_count) <- "active_count"
 
   for (i in seq_along(candidates)) {
     if (!is.null(progress_fn))
-      progress_fn(sprintf("Reading fire map %d / %d", i, n_found))
+      progress_fn(sprintf("Reading fire map %d / %d ...", i, n_found))
 
     r_yr <- tryCatch(rast(candidates[[i]]), error = function(e) {
       warning("Could not read ", basename(candidates[[i]]), " — skipping")
@@ -1425,23 +1316,38 @@ compute_scf_fri <- function(maps_dir, n_sim_years, template_r,
 
     if (!same.crs(r_yr, wk_crs))
       r_yr <- project(r_yr, wk_crs, method = "near")
-
     r_yr <- resample(r_yr, template_r, method = "near")
 
-    # Any non-zero, non-NA value = burned
-    r_bin       <- ifel(is.na(r_yr) | r_yr == 0, 0L, 1L)
-    burn_count  <- burn_count + r_bin
+    if (use_severity_encoding) {
+      # SCF encoding: 0 = non-active, 1 = unburned active, 2-11 = burned
+      r_active <- ifel(!is.na(r_yr) & r_yr >= 1L, 1L, 0L)
+      r_burned <- ifel(!is.na(r_yr) & r_yr >  1L, 1L, 0L)
+    } else {
+      # Legacy: 0 = outside mask, any non-zero = burned; all cells count as active
+      r_active <- ifel(!is.na(r_yr), 1L, 0L)
+      r_burned <- ifel(!is.na(r_yr) & r_yr != 0L, 1L, 0L)
+    }
+
+    burn_count   <- burn_count   + r_burned
+    active_count <- active_count + r_active
   }
 
+  # For legacy mode, replace per-cell active_count with global n_years
+  if (!use_severity_encoding) {
+    active_count <- ifel(!is.na(active_count), as.numeric(n_years), NA_real_)
+  }
+
+  # FRI = active_years / burn_count  (NA where cell never burned)
   fri_r <- ifel(burn_count == 0L, NA_real_,
-                as.numeric(n_years) / as.numeric(burn_count))
+                as.numeric(active_count) / as.numeric(burn_count))
   names(fri_r) <- "FRI_years"
 
-  n_burned <- sum(values(burn_count, mat = FALSE) > 0, na.rm = TRUE)
+  n_burned <- sum(values(burn_count,   mat = FALSE) > 0,  na.rm = TRUE)
+  n_active <- sum(values(active_count, mat = FALSE) >= 1, na.rm = TRUE)
   n_total  <- sum(!is.na(values(template_r, mat = FALSE)))
   message(sprintf(
-    "FRI: %d / %d cells burned at least once (%.1f%%)  |  median FRI = %.0f yrs",
-    n_burned, n_total, 100 * n_burned / max(n_total, 1),
+    "FRI: %d active cells  |  %d burned ≥1× (%.1f%% of active)  |  median FRI = %.0f yrs",
+    n_active, n_burned, 100 * n_burned / max(n_active, 1),
     median(values(fri_r, mat = FALSE), na.rm = TRUE)))
 
   fri_r

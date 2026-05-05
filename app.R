@@ -1868,10 +1868,12 @@ ui <- page_navbar(
             br(),
             p(class = "text-muted small",
               "Compares the fire return interval (FRI) produced by SCF against the",
-              " LANDFIRE LF2016 Fire Return Interval (FRI) product for your landscape.",
-              " FRI = years of simulation ÷ times each cell burned.",
-              " A good calibration should produce a landscape-mean FRI that matches",
-              " the LANDFIRE FRI for your dominant forest type."),
+              " LANDFIRE LF2016 Fire Return Interval (FRI) product.",
+              " FRI = active years ÷ times each cell burned.",
+              " SCF FRI uses the fire-severity raster encoding from the LANDIS Output Viewer",
+              " (0 = non-active, 1 = unburned, 2–11 = burned), so only landscape-active",
+              " years contribute to each cell's FRI. A well-calibrated run should produce",
+              " a landscape-mean FRI close to the LANDFIRE FRI for your forest type."),
             fluidRow(
               # -- Left: data loading controls --------------------------------
               column(4,
@@ -1893,18 +1895,16 @@ ui <- page_navbar(
                   ),
                   tags$div(class = "card-body",
                     p(class = "text-muted small mb-2",
-                      "Loads one raster per simulation year from a LANDIS output",
-                      " directory. Any non-zero cell value = burned that year.",
-                      " Produces a cell-level FRI map for direct comparison with",
-                      " LANDFIRE FRI."),
-                    textInput("fri_maps_dir", "Annual fire maps directory",
-                              placeholder = "/path/to/LANDIS/output/"),
-                    p(class = "text-muted small",
-                      "Files matching ", tags$code("scfire-*.img"),
-                      " or ", tags$code("fire-*.tif"), " are detected automatically.",
-                      " Leave blank to use events log only."),
+                      "Point to your LANDIS run root directory. The app first looks",
+                      " for ", tags$code("social-climate-fire/fire-severity-YYYY.tif"),
+                      " (SCF Output Viewer layout) and applies the correct SCF encoding:",
+                      " 0 = non-active, 1 = unburned active, 2–11 = burned. Falls back",
+                      " to legacy ", tags$code("scfire-*.img"), " / ", tags$code("fire-*.tif"),
+                      " patterns if the subdirectory is absent."),
+                    textInput("fri_maps_dir", "LANDIS run directory",
+                              placeholder = "/path/to/LANDIS/run/"),
                     textInput("fri_file_pattern", "Custom file pattern (optional)",
-                              placeholder = "scfire.*\\.img"),
+                              placeholder = "leave blank for auto-detect"),
                     numericInput("fri_n_sim_years",
                                  "Override simulation years (optional)",
                                  value = NA, min = 1, step = 1),
@@ -1920,25 +1920,25 @@ ui <- page_navbar(
                 ),
                 tags$div(class = "card",
                   tags$div(class = "card-header fw-semibold",
-                    icon("cloud-arrow-down"), " LANDFIRE FRI"
+                    icon("folder-open"), " LANDFIRE FRI (local file)"
                   ),
                   tags$div(class = "card-body",
                     p(class = "text-muted small mb-2",
-                      "Downloads the LANDFIRE LF2016 Fire Return Interval (FRI) raster",
-                      " for your calibration boundary via the LFPS asynchronous job",
-                      " API (~30 m native resolution, resampled to the LANDIS template).",
-                      " Processing typically takes 30 seconds – 5 minutes."),
-                    textInput("fri_lfps_email",
-                              tags$span("Email address",
-                                        tags$span(class = "text-danger", " *")),
-                              value       = "Jameslamping@me.com",
-                              placeholder = "your@email.com"),
-                    p(class = "text-muted small mb-2",
-                      "Required by the LFPS API. Your address is never stored beyond",
-                      " this session."),
-                    actionButton("fetch_lf_mfri", "Fetch LANDFIRE FRI",
+                      "Load the LANDFIRE LF2016 Fire Return Interval TIF from disk.",
+                      " Download from ", tags$a("landfire.gov", href = "https://landfire.gov",
+                                                target = "_blank"),
+                      " → LF2016 → Fire Regime → FRI. The full-CONUS TIF is clipped",
+                      " to your calibration boundary and resampled to the LANDIS template."),
+                    textInput("fri_lf_tif_path",
+                              "Path to LF2016_FRI_CONUS.tif",
+                              value = paste0("/Users/jlamping/University of Oregon Dropbox/",
+                                             "James Lamping/Lamping/NPS_postdoc/Spatial/",
+                                             "LANDFIRE/LF2016_FRI_CONUS/Tif/",
+                                             "LF2016_FRI_CONUS.tif"),
+                              placeholder = "/path/to/LF2016_FRI_CONUS.tif"),
+                    actionButton("fetch_lf_mfri", "Load LANDFIRE FRI",
                                  class = "btn-sm btn-outline-primary w-100",
-                                 icon  = icon("cloud-arrow-down")),
+                                 icon  = icon("folder-open")),
                     br(), br(),
                     uiOutput("lf_mfri_status_ui")
                   )
@@ -3593,25 +3593,23 @@ server <- function(input, output, session) {
               med_fri, scales::comma(n_burned)))
   })
 
-  # Fetch LANDFIRE MFRI via LFPS async job API
+  # Load LANDFIRE FRI from local TIF
   observeEvent(input$fetch_lf_mfri, {
     req(rv$cal_vect_proj, rv$template_r, rv$working_crs)
-    email <- trimws(input$fri_lfps_email %||% "Jameslamping@me.com")
-    if (!grepl("@", email, fixed = TRUE))
-      return(showNotification("Please enter a valid email address for the LFPS API.",
+    tif_path <- trimws(input$fri_lf_tif_path %||% "")
+    if (nchar(tif_path) == 0)
+      return(showNotification("Please enter the path to the LANDFIRE FRI TIF file.",
                               type = "warning"))
 
-    mfri <- NULL
-    withProgress(message = "Fetching LANDFIRE MFRI via LFPS…", value = 0.05, {
-      mfri <- tryCatch(
-        fetch_landfire_mfri(
-          cal_vect          = rv$cal_vect_proj,
-          working_crs       = rv$working_crs,
-          template_r        = rv$template_r,
-          email             = email,
-          poll_interval_sec = 10,
-          max_wait_sec      = 720,
-          progress_fn       = function(msg) incProgress(0.1, detail = msg)
+    fri <- NULL
+    withProgress(message = "Loading LANDFIRE FRI from local file…", value = 0.1, {
+      fri <- tryCatch(
+        load_local_lf_fri(
+          tif_path    = tif_path,
+          cal_vect    = rv$cal_vect_proj,
+          working_crs = rv$working_crs,
+          template_r  = rv$template_r,
+          progress_fn = function(msg) incProgress(0.3, detail = msg)
         ),
         error = function(e) {
           showNotification(conditionMessage(e), type = "error", duration = 15)
@@ -3619,11 +3617,12 @@ server <- function(input, output, session) {
         }
       )
     })
-    if (!is.null(mfri)) {
-      rv$lf_mfri_r <- mfri
+    if (!is.null(fri)) {
+      rv$lf_mfri_r <- fri
       showNotification(
-        sprintf("LANDFIRE FRI loaded (LF2016_FRI). Mean: %.0f yrs",
-                mean(values(mfri, mat = FALSE), na.rm = TRUE)),
+        sprintf("LANDFIRE FRI loaded. Mean: %.0f yrs  |  Median: %.0f yrs",
+                mean(values(fri, mat = FALSE), na.rm = TRUE),
+                median(values(fri, mat = FALSE), na.rm = TRUE)),
         type = "message")
     }
   })
@@ -3633,7 +3632,7 @@ server <- function(input, output, session) {
     mn <- mean(values(rv$lf_mfri_r, mat = FALSE), na.rm = TRUE)
     md <- median(values(rv$lf_mfri_r, mat = FALSE), na.rm = TRUE)
     tags$div(class = "alert alert-info p-2 mt-1", style = "font-size:0.82rem;",
-      icon("check"), " LANDFIRE FRI loaded (LF2016_FRI)",
+      icon("check"), " LANDFIRE FRI loaded",
       tags$br(),
       sprintf("Mean: %.0f yrs  |  Median: %.0f yrs", mn, md))
   })
