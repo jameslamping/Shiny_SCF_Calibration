@@ -1868,10 +1868,10 @@ ui <- page_navbar(
             br(),
             p(class = "text-muted small",
               "Compares the fire return interval (FRI) produced by SCF against the",
-              " LANDFIRE Historic Fire Regimes Mean Fire Return Interval (MFRI) for",
-              " your landscape. FRI = years of simulation ÷ times each cell burned.",
+              " LANDFIRE LF2016 Fire Return Interval (FRI) product for your landscape.",
+              " FRI = years of simulation ÷ times each cell burned.",
               " A good calibration should produce a landscape-mean FRI that matches",
-              " the LANDFIRE MFRI for your dominant forest type."),
+              " the LANDFIRE FRI for your dominant forest type."),
             fluidRow(
               # -- Left: data loading controls --------------------------------
               column(4,
@@ -1896,7 +1896,7 @@ ui <- page_navbar(
                       "Loads one raster per simulation year from a LANDIS output",
                       " directory. Any non-zero cell value = burned that year.",
                       " Produces a cell-level FRI map for direct comparison with",
-                      " LANDFIRE MFRI."),
+                      " LANDFIRE FRI."),
                     textInput("fri_maps_dir", "Annual fire maps directory",
                               placeholder = "/path/to/LANDIS/output/"),
                     p(class = "text-muted small",
@@ -1920,11 +1920,11 @@ ui <- page_navbar(
                 ),
                 tags$div(class = "card",
                   tags$div(class = "card-header fw-semibold",
-                    icon("cloud-arrow-down"), " LANDFIRE MFRI"
+                    icon("cloud-arrow-down"), " LANDFIRE FRI"
                   ),
                   tags$div(class = "card-body",
                     p(class = "text-muted small mb-2",
-                      "Downloads the LANDFIRE 2020 Mean Fire Return Interval raster",
+                      "Downloads the LANDFIRE LF2016 Fire Return Interval (FRI) raster",
                       " for your calibration boundary via the LFPS asynchronous job",
                       " API (~30 m native resolution, resampled to the LANDIS template).",
                       " Processing typically takes 30 seconds – 5 minutes."),
@@ -1936,7 +1936,7 @@ ui <- page_navbar(
                     p(class = "text-muted small mb-2",
                       "Required by the LFPS API. Your address is never stored beyond",
                       " this session."),
-                    actionButton("fetch_lf_mfri", "Fetch LANDFIRE MFRI",
+                    actionButton("fetch_lf_mfri", "Fetch LANDFIRE FRI",
                                  class = "btn-sm btn-outline-primary w-100",
                                  icon  = icon("cloud-arrow-down")),
                     br(), br(),
@@ -3622,7 +3622,7 @@ server <- function(input, output, session) {
     if (!is.null(mfri)) {
       rv$lf_mfri_r <- mfri
       showNotification(
-        sprintf("LANDFIRE MFRI loaded. Mean: %.0f yrs",
+        sprintf("LANDFIRE FRI loaded (LF2016_FRI). Mean: %.0f yrs",
                 mean(values(mfri, mat = FALSE), na.rm = TRUE)),
         type = "message")
     }
@@ -3633,7 +3633,7 @@ server <- function(input, output, session) {
     mn <- mean(values(rv$lf_mfri_r, mat = FALSE), na.rm = TRUE)
     md <- median(values(rv$lf_mfri_r, mat = FALSE), na.rm = TRUE)
     tags$div(class = "alert alert-info p-2 mt-1", style = "font-size:0.82rem;",
-      icon("check"), " LANDFIRE MFRI loaded",
+      icon("check"), " LANDFIRE FRI loaded (LF2016_FRI)",
       tags$br(),
       sprintf("Mean: %.0f yrs  |  Median: %.0f yrs", mn, md))
   })

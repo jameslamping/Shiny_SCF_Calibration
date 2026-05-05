@@ -1149,18 +1149,23 @@ save_validation_figures <- function(
 # -----------------------------------------------------------------------------
 # fetch_landfire_mfri
 #
-# Downloads LANDFIRE Mean Fire Return Interval (MFRI, years) for the
-# calibration boundary via the LFPS asynchronous job API (USGS).
+# Downloads LANDFIRE Fire Return Interval (FRI, years) for the calibration
+# boundary via the LFPS asynchronous job API (USGS).
 #
-# API flow (LFPS User Guide §3):
+# NOTE ON PRODUCT NAME: LANDFIRE renamed "MFRI" (Mean Fire Return Interval)
+# to "FRI" in their post-2016 product catalog. The correct LFPS Layer_List
+# code for CONUS is LF2016_FRI. There is no LF2020_MFRI or LF2016_MFRI.
+# See https://lfps.usgs.gov/products for the current catalog.
+#
+# API flow (LFPS User Guide §7):
 #   1. Submit job: GET https://lfps.usgs.gov/api/job/submit
 #      params: Layer_List, Area_of_Interest ("W S E N"), Email
 #   2. Poll:   GET https://lfps.usgs.gov/api/job/status?JobId=<id>
 #      until status ∈ {Succeeded, Failed, Canceled}
+#      Response includes: jobId, status, messages[], queuePosition
 #   3. Download zip, extract <jobId>.tif, read with terra
 #
-# Products tried in order: LF2020_MFRI → LF2016_MFRI
-# MFRI pixel values are in years; 0 / NA = no fire history information.
+# FRI pixel values are in years; 0 / NA = no fire history information.
 # Returns a SpatRaster in working_crs resampled to template_r resolution.
 # -----------------------------------------------------------------------------
 fetch_landfire_mfri <- function(cal_vect, working_crs, template_r,
@@ -1179,7 +1184,9 @@ fetch_landfire_mfri <- function(cal_vect, working_crs, template_r,
   message(sprintf("LFPS AOI (W S E N): %s", aoi_str))
 
   # -- 2. Submit job, trying product codes in order ----------------------------
-  layer_candidates <- c("LF2020_MFRI", "LF2016_MFRI")
+  # LF2016_FRI = CONUS Fire Return Interval (renamed from MFRI in post-2016 catalog)
+  # LF2023_FRI = Alaska only; listed as a secondary fallback but rarely needed for CONUS
+  layer_candidates <- c("LF2016_FRI", "LF2023_FRI")
   submit_url <- "https://lfps.usgs.gov/api/job/submit"
   job_id     <- NULL
   used_layer <- NULL
@@ -1228,13 +1235,14 @@ fetch_landfire_mfri <- function(cal_vect, working_crs, template_r,
   }
 
   if (is.null(job_id))
-    stop("LFPS job submission failed for all product candidates (LF2020_MFRI, LF2016_MFRI).",
+    stop("LFPS job submission failed for all product candidates (LF2016_FRI, LF2023_FRI).",
          " Check your internet connection and LFPS service status at https://lfps.usgs.gov")
 
   # -- 3. Poll until Succeeded / Failed / timeout ------------------------------
-  status_url  <- "https://lfps.usgs.gov/api/job/status"
-  elapsed     <- 0
-  job_status  <- "Pending"
+  status_url   <- "https://lfps.usgs.gov/api/job/status"
+  elapsed      <- 0
+  job_status   <- "Pending"
+  last_msgs    <- character(0)   # capture LFPS messages[] for error reporting
 
   while (job_status %in% c("Pending", "Executing", "Submitted")) {
     Sys.sleep(poll_interval_sec)
@@ -1263,17 +1271,34 @@ fetch_landfire_mfri <- function(cal_vect, working_crs, template_r,
 
     job_status <- poll_parsed$status %||% poll_parsed$Status %||% job_status
     queue_pos  <- poll_parsed$queuePosition %||% poll_parsed$QueuePosition
-    msg_detail <- if (!is.null(queue_pos) && !is.na(queue_pos))
+    msg_detail <- if (!is.null(queue_pos) && !is.na(as.integer(queue_pos)) &&
+                      as.integer(queue_pos) >= 0)
       sprintf("queue position %s", queue_pos) else sprintf("%d s elapsed", elapsed)
+
+    # Capture messages[] — array with type+description fields (§8 of User Guide)
+    raw_msgs <- poll_parsed$messages
+    if (!is.null(raw_msgs)) {
+      last_msgs <- tryCatch({
+        if (is.data.frame(raw_msgs))
+          paste(raw_msgs$description %||% raw_msgs[[1]], collapse = "; ")
+        else
+          paste(as.character(raw_msgs), collapse = "; ")
+      }, error = function(e) character(0))
+      message("LFPS messages: ", last_msgs)
+    }
 
     message(sprintf("LFPS status [%s]: %s  (%s)", job_id, job_status, msg_detail))
     if (!is.null(progress_fn))
-      progress_fn(sprintf("LFPS job %s: %s (%s)", job_id, job_status, msg_detail))
+      progress_fn(sprintf("LFPS: %s (%s)", job_status, msg_detail))
   }
 
-  if (job_status != "Succeeded")
-    stop(sprintf("LFPS job %s ended with status '%s'. Check LFPS for details.",
-                 job_id, job_status))
+  if (job_status != "Succeeded") {
+    msg_snippet <- if (length(last_msgs) > 0 && nchar(last_msgs[1]) > 0)
+      sprintf(" LFPS messages: %s", paste(last_msgs, collapse = " | "))
+    else ""
+    stop(sprintf("LFPS job %s ended with status '%s'.%s",
+                 job_id, job_status, msg_snippet))
+  }
 
   # -- 4. Download the result zip ----------------------------------------------
   if (!is.null(progress_fn)) progress_fn("Downloading LFPS result zip...")
@@ -1334,7 +1359,7 @@ fetch_landfire_mfri <- function(cal_vect, working_crs, template_r,
          "Check that the AOI overlaps CONUS LANDFIRE coverage.")
 
   rng <- range(values(mfri_r, mat = FALSE), na.rm = TRUE)
-  message(sprintf("LANDFIRE MFRI (%s) range: [%.0f, %.0f] years  (%d valid cells)",
+  message(sprintf("LANDFIRE FRI (%s) range: [%.0f, %.0f] years  (%d valid cells)",
                   used_layer, rng[1], rng[2], n_valid))
 
   # -- 6. Reproject and resample to template -----------------------------------
@@ -1429,7 +1454,7 @@ compute_scf_fri <- function(maps_dir, n_sim_years, template_r,
 # Non-spatial mean FRI from the events log + template extent.
 # Mean FRI = (n_cells * n_sim_years) / total_cells_burned_across_all_events
 # Works without annual spatial maps; gives a landscape-mean FRI directly
-# comparable to the spatial mean of LANDFIRE MFRI over the template.
+# comparable to the spatial mean of LANDFIRE FRI over the template.
 # -----------------------------------------------------------------------------
 compute_mean_fri_events <- function(sim_events_df, template_r, n_sim_years) {
 
@@ -1452,7 +1477,7 @@ compute_mean_fri_events <- function(sim_events_df, template_r, n_sim_years) {
 # Fire Return Interval validation figure.
 # Modes (resolved automatically):
 #   A — Spatial: overlaid histograms of cell-level FRI (simulated) and
-#       LANDFIRE MFRI (observed), plus summary stats in subtitle.
+#       LANDFIRE FRI (observed), plus summary stats in subtitle.
 #   B — Summary only: bar chart of mean landscape FRI (sim vs LANDFIRE)
 #       when annual fire maps are not available.
 # -----------------------------------------------------------------------------
@@ -1477,7 +1502,7 @@ plot_val_fri <- function(scf_fri_r    = NULL,
 
     df <- dplyr::bind_rows(
       dplyr::tibble(FRI = pmin(sim_v, FRI_CAP), Source = "Simulated (SCF)"),
-      dplyr::tibble(FRI = pmin(lf_v,  FRI_CAP), Source = "LANDFIRE MFRI")
+      dplyr::tibble(FRI = pmin(lf_v,  FRI_CAP), Source = "LANDFIRE FRI")
     )
 
     n_sim   <- scales::comma(length(sim_v))
@@ -1495,7 +1520,7 @@ plot_val_fri <- function(scf_fri_r    = NULL,
       med_lf,  p25_lf,  p75_lf,  n_lf)
 
     vlines <- dplyr::tibble(
-      Source = c("Simulated (SCF)", "LANDFIRE MFRI"),
+      Source = c("Simulated (SCF)", "LANDFIRE FRI"),
       med    = c(med_sim, med_lf)
     )
 
@@ -1506,9 +1531,9 @@ plot_val_fri <- function(scf_fri_r    = NULL,
       geom_vline(data = vlines, aes(xintercept = med, colour = Source),
                  linetype = "dashed", linewidth = 0.9) +
       scale_fill_manual(values = c("Simulated (SCF)" = .COL_SIM,
-                                   "LANDFIRE MFRI"   = .COL_OBS)) +
+                                   "LANDFIRE FRI"   = .COL_OBS)) +
       scale_colour_manual(values = c("Simulated (SCF)" = .COL_SIM,
-                                     "LANDFIRE MFRI"   = .COL_OBS)) +
+                                     "LANDFIRE FRI"   = .COL_OBS)) +
       scale_x_continuous(
         labels = scales::comma,
         limits = c(0, FRI_CAP),
@@ -1521,14 +1546,14 @@ plot_val_fri <- function(scf_fri_r    = NULL,
         y        = "Density",
         caption  = paste0(
           "Simulated FRI = simulation years ÷ times each cell burned (cells burned ≥1 time shown).\n",
-          "LANDFIRE MFRI = mean fire return interval from LF2020 Historic Fire Regimes dataset. Dashed lines = medians.")
+          "LANDFIRE FRI = fire return interval from LANDFIRE LF2016 Historic Fire Regimes (LF2016_FRI). Dashed lines = medians.")
       ) +
       .pub_theme()
   } else {
     # ---- Mode B: summary bar chart ------------------------------------------
     sum_df <- dplyr::bind_rows(
       if (has_sim_mean) dplyr::tibble(Source = "Simulated (SCF)", FRI = mean_fri_sim) else NULL,
-      if (has_lf_mean)  dplyr::tibble(Source = "LANDFIRE MFRI",   FRI = mean_fri_lf)  else NULL
+      if (has_lf_mean)  dplyr::tibble(Source = "LANDFIRE FRI",   FRI = mean_fri_lf)  else NULL
     )
 
     if (nrow(sum_df) == 0) {
@@ -1550,7 +1575,7 @@ plot_val_fri <- function(scf_fri_r    = NULL,
       geom_text(aes(label = sprintf("%.0f yrs", FRI)),
                 vjust = -0.45, fontface = "bold", size = 5) +
       scale_fill_manual(values = c("Simulated (SCF)" = .COL_SIM,
-                                   "LANDFIRE MFRI"   = .COL_OBS)) +
+                                   "LANDFIRE FRI"   = .COL_OBS)) +
       scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
       labs(
         title    = "Mean Fire Return Interval: Simulated vs LANDFIRE Historic",
