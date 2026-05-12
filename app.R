@@ -37,8 +37,9 @@ if (!require("pacman", quietly = TRUE)) install.packages("pacman")
 pacman::p_load(
   shiny, bslib, terra, dplyr, lubridate, readr, tidyr,
   ggplot2, glue, DT, tmap, purrr, stringr, broom, sf, scales,
-  climateR, elevatr, patchwork
+  climateR, elevatr, patchwork, gifski, tigris
 )
+options(tigris_use_cache = TRUE)   # cache downloaded TIGER/Line files locally
 
 source("modules/era_helpers.R")
 source("modules/ignition_helpers.R")
@@ -49,7 +50,7 @@ source("modules/validation_helpers.R")
 source("modules/mortality_helpers.R")
 source("modules/tuning_helpers.R")
 options(jsonlite.named_vectors_as_objects = FALSE)
-options(shiny.maxRequestSize = 2 * 1024^3)   # 2 GB upload limit for .RData session cache
+options(shiny.maxRequestSize = 50 * 1024^2)   # 50 MB — covers JSON settings; .RData loaded by path (no upload)
 
 # =============================================================================
 # UI
@@ -72,15 +73,49 @@ ui <- page_navbar(
     title = "Landscape Setup",
 
     # -- Calibration boundary (large region)
-    h6("1. Calibration Boundary Shapefile"),
-    p(class = "text-muted small",
-      "Large regional boundary used to clip ERA data, FPA FOD, and GeoMAC ",
-      "perimeters (e.g. WA Cascades + Coast Range). The .dbf, .shx, and .prj ",
-      "files must be in the same directory as the .shp."),
-    textInput("shp_path", label = NULL,
-              value       = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/S_USA.ECOSYS_ECOMAPPROVINCES_2025/ECOSYS_CoastalRange.shp",
-              placeholder = "/path/to/calibration_region.shp"),
-    actionButton("load_shp", "Load Shapefile", class = "btn-sm btn-secondary w-100"),
+    h6("1. Calibration Boundary"),
+    radioButtons("cal_bound_source", label = NULL,
+      choices  = c("Shapefile / vector file"                = "file",
+                   "US States (auto-download via tigris)"   = "states"),
+      selected = "file"
+    ),
+
+    conditionalPanel(
+      "input.cal_bound_source == 'file'",
+      p(class = "text-muted small",
+        "Large regional boundary used to clip ERA data, FPA FOD, and GeoMAC ",
+        "perimeters (e.g. WA Cascades + Coast Range). The .dbf, .shx, and .prj ",
+        "files must be in the same directory as the .shp."),
+      textInput("shp_path", label = NULL,
+                value       = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/S_USA.ECOSYS_ECOMAPPROVINCES_2025/ECOSYS_CoastalRange.shp",
+                placeholder = "/path/to/calibration_region.shp"),
+      actionButton("load_shp", "Load Shapefile", class = "btn-sm btn-secondary w-100")
+    ),
+
+    conditionalPanel(
+      "input.cal_bound_source == 'states'",
+      p(class = "text-muted small",
+        "Select one or more US states. Boundaries are fetched from the US Census ",
+        "TIGER/Line cartographic files via the ",
+        tags$a("tigris", href = "https://github.com/walkerke/tigris",
+               target = "_blank"),
+        " package and cached locally after the first download. Multiple states ",
+        "are dissolved into a single polygon."),
+      selectizeInput(
+        "cal_states",
+        label   = NULL,
+        choices = sort(c(state.name, "District of Columbia")),
+        selected = NULL,
+        multiple = TRUE,
+        options  = list(placeholder  = "Type to search states...",
+                        plugins      = list("remove_button"),
+                        openOnFocus  = FALSE)
+      ),
+      actionButton("load_states", "Download State Boundaries",
+                   class = "btn-sm btn-secondary w-100",
+                   icon  = icon("cloud-arrow-down"))
+    ),
+
     uiOutput("shp_status"),
 
     hr(),
@@ -826,11 +861,39 @@ ui <- page_navbar(
       card(
         card_header("Spread Inputs"),
 
-        h6("GeoMAC Perimeter Geodatabase"),
-        p(class = "text-muted small",
-          "Historic_Geomac_Perimeters_All_Years_2000_2018.gdb"),
-        textInput("geomac_gdb_path", label = NULL,
-                  placeholder = "/path/to/Historic_Geomac.gdb"),
+        h6("Perimeter Data Source"),
+        selectInput("perimeter_source", NULL,
+          choices = c("FIRED (MODIS daily, recommended)" = "fired",
+                      "GeoMAC (historic, 2000-2018)"     = "geomac"),
+          selected = "fired"),
+
+        conditionalPanel(
+          "input.perimeter_source == 'geomac'",
+          h6("GeoMAC Perimeter Geodatabase"),
+          p(class = "text-muted small",
+            "Historic_Geomac_Perimeters_All_Years_2000_2018.gdb"),
+          textInput("geomac_gdb_path", label = NULL,
+                    placeholder = "/path/to/Historic_Geomac.gdb")
+        ),
+
+        conditionalPanel(
+          "input.perimeter_source == 'fired'",
+          h6("FIRED Daily GPKG"),
+          textInput("fired_gpkg_path", label = NULL,
+                    placeholder = "/path/to/fired_conus_daily_nov2001-jan2019.gpkg"),
+          h6("FIRED Events GPKG (for MaxSpreadArea)"),
+          textInput("fired_events_gpkg_path", label = NULL,
+                    placeholder = "/path/to/fired_events_conus_nov2001-jan2019.gpkg"),
+          numericInput("fired_min_fire_ha", "Min Fire Size (ha)",
+                       value = 100, min = 1),
+          numericInput("fired_min_detection_days", "Min Detection Days",
+                       value = 3, min = 1, max = 30, step = 1),
+          p(class = "text-muted small",
+            "Require each FIRED event to have at least this many days with MODIS ",
+            "detections before entering calibration. Events with fewer days produce ",
+            "very few sequential pairs and are more likely to be detection artifacts ",
+            "than real multi-day fire progressions.")
+        ),
 
         hr(),
         h6("Combustion Buoyancy (Cb)"),
@@ -871,6 +934,16 @@ ui <- page_navbar(
           "Pairs where the later perimeter is more than N ha ",
           "smaller than the earlier are dropped. Small negative values (\u2264 1 ha) ",
           "are GeoMAC remapping noise; large negatives indicate a data problem."),
+        numericInput("max_growth_factor",
+                     "Max Daily Growth Factor (0 = disabled)",
+                     value = 0, min = 0, step = 0.5),
+        p(class = "text-muted small",
+          "Drops pairs where the daily area increment exceeds N \u00d7 the existing ",
+          "fire size. For example, a value of 3 removes any pair where the fire ",
+          "more than tripled in one day \u2014 a strong sign that MODIS missed several ",
+          "days of burning and compressed them into a single record. ",
+          "Set to 0 to disable. Recommended starting value: 3\u20135 for FIRED data; ",
+          "leave disabled for GeoMAC."),
 
         hr(),
         h6("Spread Rasterization"),
@@ -904,6 +977,22 @@ ui <- page_navbar(
         p(class = "text-muted small",
           "Cap on total raster cells per perimeter pair. Prevents very large fires ",
           "from dominating the fit."),
+        numericInput("dilation_cells", "Dilation Cells (frontier ring width)",
+                     value = 5, min = 1, max = 10),
+        p(class = "text-muted small",
+          "Controls how many cells wide the frontier ring is. 1 = original 1-cell ",
+          "rook ring; 5 = 5-cell disk (better for rapid-growth or coarse-grid fires)."),
+        numericInput("min_pct_proximal",
+                     "Min Proximal Spread % (0 = no filter)",
+                     value = 0, min = 0, max = 100),
+        p(class = "text-muted small",
+          "Drop pairs where fewer than this % of newly-burned cells were adjacent to ",
+          "the previous perimeter's frontier ring. 0 = use all pairs."),
+        numericInput("n_cores", "CPU Cores (blank = auto)",
+                     value = NA, min = 1),
+        p(class = "text-muted small",
+          "Number of parallel workers for perimeter rasterization. Leave blank to ",
+          "auto-detect (all physical cores minus 1)."),
 
         hr(),
         h6("Fine Fuels"),
@@ -934,6 +1023,63 @@ ui <- page_navbar(
             "FCCS surface fuel load, or custom map). Will be reprojected and ",
             "resampled to the spread grid automatically.")
         ),
+        checkboxInput("normalize_fine_fuels",
+                      "Normalize fine fuels to 0-1 index", value = TRUE),
+        p(class = "text-muted small",
+          "When checked, fuel load values are divided by the raster maximum so the ",
+          "B2 coefficient is dimensionless. Uncheck to keep raw tons/acre values."),
+
+        hr(),
+        h6("Seasonal & Weather Filters"),
+        p(class = "text-muted small",
+          "Restrict calibration to specific months and/or fire danger conditions. ",
+          "Useful for maritime landscapes where fall east-wind events produce ",
+          "wrong-sign coefficients when mixed with summer fire seasons."),
+        checkboxGroupInput(
+          "cal_months_input",
+          "Calibration months (blank = all)",
+          choices  = setNames(1:12, month.abb),
+          selected = 1:12,
+          inline   = TRUE
+        ),
+        numericInput("fwi_min", "Minimum FWI (0 = no filter)",
+                     value = 0, min = 0, max = 60, step = 1),
+        p(class = "text-muted small",
+          "Pairs/events with FWI below this threshold are excluded before fitting."),
+
+        hr(),
+        h6("Predictor Selection — Spread Probability"),
+        p(class = "text-muted small",
+          "Uncheck predictors to zero them out (set the corresponding coefficient to 0 ",
+          "in the SCF parameter file). Useful when a predictor produces a wrong-sign ",
+          "coefficient due to ecological or data issues."),
+        checkboxGroupInput(
+          "sp_predictors",
+          NULL,
+          choices  = c("FWI"       = "FWI",
+                       "FineFuels" = "FineFuels",
+                       "EWS (Effective Wind Speed)" = "EWS"),
+          selected = c("FWI", "FineFuels", "EWS"),
+          inline   = FALSE
+        ),
+        checkboxInput("use_ews_maxarea",
+                      "Include EWS in MaxSpreadArea model",
+                      value = TRUE),
+        p(class = "text-muted small",
+          "When unchecked, the MaxSpreadArea model uses FWI only ",
+          "(MaximumSpreadAreaB2 = 0). Recommended when FWI and EWS are ",
+          "anti-correlated in your calibration domain."),
+
+        hr(),
+        h6("Coefficient Constraints — MaxSpreadArea"),
+        checkboxInput("constrain_max_area",
+                      "Apply sign constraints (B0 ≥ 50 ha, B1 ≥ 0, B2 ≥ 0)",
+                      value = FALSE),
+        p(class = "text-muted small",
+          "Unconstrained (default): plain quantile regression — coefficients are free. ",
+          "Check this box to enforce non-negative slopes and a positive intercept floor, ",
+          "which prevents SCF 'MaxSpreadArea < 0' warnings at low FWI/EWS. ",
+          "Useful when collinearity causes sign-flipped coefficients."),
 
         hr(),
         actionButton("run_spread_fit", "Run Spread Fitting",
@@ -1168,6 +1314,13 @@ ui <- page_navbar(
               " All three quantile targets shown; 75th percentile is recommended."),
             DTOutput("max_area_coef_table"),
             br(),
+            h5("Model Comparison (M1-M4)"),
+            p(class = "text-muted small",
+              "Side-by-side comparison of candidate spread probability models. ",
+              "M4 (FWI + FineFuels + EWS) is the primary SCF model; review FWI_sign, ",
+              "FF_sign, and EWS_sign columns to confirm all coefficients are positive."),
+            DTOutput("spread_model_comparison_table"),
+            br(),
             downloadButton("dl_spread_coef", "Download All Spread Coefficients CSV",
                            class = "btn-sm btn-outline-primary")
           ),
@@ -1384,6 +1537,11 @@ ui <- page_navbar(
             br(),
             downloadButton("dl_scores", "Download Scores CSV",
                            class = "btn-sm btn-outline-primary")
+          ),
+
+          nav_panel("Fire Growth Animation",
+            br(),
+            uiOutput("anim_tab_ui")
           )
         )
       )
@@ -2411,6 +2569,9 @@ ui <- page_navbar(
           "rasters, model fits) to an .RData file. Load it next session to skip ",
           "expensive re-processing steps. Settings (paths, parameters) are saved ",
           "separately in the JSON above."),
+        p(class = "text-muted small",
+          tags$b("Note:"), " note the download location — you will need to enter ",
+          "the full path below to reload it in a future session."),
         downloadButton("save_rdata", "Save Computed Data (.RData)",
                        class = "btn-outline-primary w-100"),
 
@@ -2418,16 +2579,17 @@ ui <- page_navbar(
 
         h6("Load computed data cache (.RData)"),
         p(class = "text-muted small",
-          "Upload an .RData cache file saved by this app to restore all computed ",
-          "results. After loading, outputs and plots will populate immediately ",
-          "without re-running any processing steps."),
-        fileInput("load_rdata_file", NULL,
-                  accept = c(".RData", ".rdata", ".rda"),
-                  buttonLabel = "Choose .RData\u2026",
-                  placeholder = "No file selected"),
+          "Enter the full path to an .RData cache saved by this app. The file is ",
+          "read directly from disk \u2014 no upload needed, so there is no file-size limit."),
+        textInput("rdata_load_path", label = NULL,
+                  placeholder = "/path/to/scf_cache_20260508_123456.RData"),
+        p(class = "text-muted small",
+          tags$b("Tip:"), " on macOS, right-click the file in Finder \u2192 ",
+          tags$em("Get Info"), " to copy the full path. On Windows, Shift + right-click ",
+          "\u2192 ", tags$em("Copy as path"), "."),
         actionButton("apply_rdata", "Load Computed Data",
                      class = "btn-success w-100",
-                     icon  = icon("upload")),
+                     icon  = icon("folder-open")),
         br(), br(),
         uiOutput("rdata_status_ui")
       ),
@@ -2460,7 +2622,8 @@ server <- function(input, output, session) {
                    "max_gap_spread_prob","max_gap_daily_area","failure_sample_ratio",
                    "search_gap_sp","search_gap_da","search_max_samples",
                    "search_fail_ratio","search_neg_tol","search_w_auc","search_w_r2",
-                   "neg_growth_tol","cand_b0_min","cand_b0_max","cand_b0_step",
+                   "neg_growth_tol","max_growth_factor","fired_min_detection_days",
+                   "cand_b0_min","cand_b0_max","cand_b0_step",
                    "cand_b1_min","cand_b1_max","cand_b1_step","scf_runs_root",
                    "score_w_aab","score_w_size","val_cell_area_ha","val_events_path",
                    "events_log_path")
@@ -2605,6 +2768,68 @@ server <- function(input, output, session) {
       }, error = function(e) {
         output$shp_status <- renderUI(
           tags$span(class = "text-danger small", icon("xmark"), " ", conditionMessage(e))
+        )
+      })
+    })
+  })
+
+  # 1b) Load calibration boundary — US States via tigris
+  # ---------------------------------------------------------------------------
+
+  observeEvent(input$load_states, {
+    req(length(input$cal_states) > 0)
+
+    state_list <- input$cal_states
+
+    withProgress(message = "Downloading state boundaries...", {
+      tryCatch({
+        setProgress(0.1, detail = paste("Fetching", paste(state_list, collapse = ", ")))
+
+        if (!requireNamespace("tigris", quietly = TRUE))
+          stop("Package 'tigris' is not installed. Run install.packages('tigris').")
+
+        all_states <- tigris::states(cb = TRUE, year = 2020, progress_bar = FALSE)
+        matched    <- all_states[all_states$NAME %in% state_list, ]
+
+        missing_st <- setdiff(state_list, matched$NAME)
+        if (length(missing_st) > 0)
+          warning("State(s) not found in tigris: ",
+                  paste(missing_st, collapse = ", "),
+                  ". Check spelling — tigris uses full names, e.g. 'Oregon' not 'OR'.")
+
+        if (nrow(matched) == 0)
+          stop("No matching states found. Check state names.")
+
+        setProgress(0.6, detail = "Dissolving into single polygon...")
+
+        # Dissolve to one polygon; sf_use_s2(FALSE) for planar union stability
+        prev_s2 <- sf::sf_use_s2(FALSE)
+        on.exit(sf::sf_use_s2(prev_s2), add = TRUE)
+        dissolved <- sf::st_union(matched)
+        v <- terra::vect(dissolved)
+
+        rv$cal_vect       <- v
+        rv$cal_vect_wgs84 <- terra::project(v, "EPSG:4326")
+
+        if (!is.null(rv$working_crs)) {
+          rv$cal_vect_proj <- safe_project_vect(v, rv$working_crs)
+        }
+
+        setProgress(1.0)
+
+        output$shp_status <- renderUI(
+          tags$span(class = "text-success small",
+                    icon("check"),
+                    sprintf(" Loaded: %s (%d state%s dissolved) | CRS: %s",
+                            paste(sort(state_list), collapse = " + "),
+                            length(state_list),
+                            if (length(state_list) == 1) "" else "s",
+                            terra::crs(v, describe = TRUE)$name))
+        )
+      }, error = function(e) {
+        output$shp_status <- renderUI(
+          tags$span(class = "text-danger small", icon("xmark"),
+                    " State download error: ", conditionMessage(e))
         )
       })
     })
@@ -3820,7 +4045,11 @@ server <- function(input, output, session) {
   observeEvent(input$run_spread_fit, {
     req(rv$cal_vect_proj, rv$template_r,
         rv$era_fwi_daily, rv$wind_daily)
-    req(nchar(trimws(input$geomac_gdb_path)) > 0)
+    if (input$perimeter_source == "geomac") {
+      req(nchar(trimws(input$geomac_gdb_path)) > 0)
+    } else {
+      req(nchar(trimws(input$fired_gpkg_path)) > 0)
+    }
 
     output$spread_fit_status <- renderUI(
       tags$span(class = "text-warning small",
@@ -3830,20 +4059,35 @@ server <- function(input, output, session) {
 
     withProgress(message = "Spread fitting...", value = 0, {
 
-      setProgress(0.1, detail = "Loading GeoMAC perimeters...")
-      geomac_result <- tryCatch(
-        load_geomac_perimeters(
-          gdb_path    = input$geomac_gdb_path,
-          cal_vect    = rv$cal_vect_proj,
-          template_r  = rv$template_r,
-          working_crs = rv$working_crs,
-          cal_start   = as.Date(sprintf("%d-01-01", input$cal_years[1])),
-          cal_end     = as.Date(sprintf("%d-12-31", input$cal_years[2]))
-        ),
+      setProgress(0.1, detail = "Loading perimeters...")
+      geomac_result <- tryCatch({
+        if (input$perimeter_source == "geomac") {
+          load_geomac_perimeters(
+            gdb_path    = input$geomac_gdb_path,
+            cal_vect    = rv$cal_vect_proj,
+            template_r  = rv$template_r,
+            working_crs = rv$working_crs,
+            cal_start   = as.Date(sprintf("%d-01-01", input$cal_years[1])),
+            cal_end     = as.Date(sprintf("%d-12-31", input$cal_years[2]))
+          )
+        } else {
+          load_fired_perimeters(
+            fired_gpkg         = input$fired_gpkg_path,
+            cal_vect           = rv$cal_vect_proj,
+            working_crs        = rv$working_crs,
+            cal_start          = as.Date(sprintf("%d-01-01", input$cal_years[1])),
+            cal_end            = as.Date(sprintf("%d-12-31", input$cal_years[2])),
+            min_fire_ha        = input$fired_min_fire_ha,
+            min_detection_days = as.integer(input$fired_min_detection_days),
+            layer              = NULL,
+            n_cores            = if (is.na(input$n_cores)) NULL else as.integer(input$n_cores)
+          )
+        }
+      },
         error = function(e) {
           output$spread_fit_status <- renderUI(
             tags$span(class = "text-danger small", icon("xmark"),
-                      " GeoMAC error: ", conditionMessage(e))
+                      " Perimeter loading error: ", conditionMessage(e))
           )
           NULL
         }
@@ -3885,12 +4129,65 @@ server <- function(input, output, session) {
         max_gap_sp          = input$max_gap_spread_prob,
         max_gap_da          = input$max_gap_daily_area,
         neg_tol_ha          = input$neg_growth_tol,
+        max_growth_factor   = if (isTRUE(input$max_growth_factor > 0))
+                                input$max_growth_factor else NULL,
         combustion_buoyancy = as.numeric(input$combustion_buoyancy)
       )
       rv$pairs_clean <- climate_joined$pairs
 
       setProgress(0.5, detail = "Fitting max daily area model...")
-      da_fit             <- fit_max_daily_area(climate_joined$pairs)
+
+      # --- Load FIRED events for MaxSpreadArea when FIRED source selected -------
+      fired_events_dat <- NULL
+      if (input$perimeter_source == "fired" &&
+          nchar(trimws(input$fired_events_gpkg_path)) > 0) {
+        fired_events_dat <- tryCatch({
+          raw_events <- load_fired_events_for_max_area(
+            fired_events_gpkg = input$fired_events_gpkg_path,
+            cal_vect          = rv$cal_vect_proj,
+            working_crs       = rv$working_crs,
+            fwi_daily         = rv$era_fwi_daily,
+            wind_daily        = rv$wind_daily,
+            cal_start         = as.Date(sprintf("%d-01-01", input$cal_years[1])),
+            cal_end           = as.Date(sprintf("%d-12-31", input$cal_years[2])),
+            min_fire_ha       = input$fired_min_fire_ha
+          )
+          # Compute EWS using domain-mean slope/aspect if terrain is available
+          if (input$use_ews_maxarea && !is.null(rv$slope_r) && !is.null(rv$aspect_r) &&
+              "WindDir_deg" %in% names(raw_events)) {
+            mean_slope  <- mean(values(rv$slope_r),  na.rm = TRUE)
+            mean_aspect <- mean(values(rv$aspect_r), na.rm = TRUE)
+            raw_events <- raw_events %>%
+              mutate(EffectiveWind = compute_effective_wind(
+                wind_speed          = WindSpeed_kmh,
+                wind_dir            = WindDir_deg,
+                slope_deg           = mean_slope,
+                aspect_deg          = mean_aspect,
+                combustion_buoyancy = as.numeric(input$combustion_buoyancy)
+              ))
+            message(sprintf(
+              "FIRED events: EWS computed using domain-mean slope=%.1f°, aspect=%.1f°, Cb=%s.",
+              mean_slope, mean_aspect, input$combustion_buoyancy
+            ))
+          }
+          raw_events
+        }, error = function(e) {
+          warning("FIRED events load failed, falling back to pairs: ", conditionMessage(e))
+          NULL
+        })
+      }
+
+      cal_months_sel <- as.integer(input$cal_months_input)
+      if (length(cal_months_sel) == 12) cal_months_sel <- NULL  # all months = no filter
+
+      da_fit <- fit_max_daily_area(
+        pairs       = if (is.null(fired_events_dat)) climate_joined$pairs else NULL,
+        fired_dat   = fired_events_dat,
+        cal_months  = cal_months_sel,
+        fwi_min     = if (isTRUE(input$fwi_min > 0)) input$fwi_min else NULL,
+        use_ews     = input$use_ews_maxarea,
+        constrained = isTRUE(input$constrain_max_area)
+      )
       rv$max_area_fit    <- da_fit            # full fit object (coef + 3 models + data)
       rv$max_area_coef   <- da_fit$coef       # tibble (shown in DT)
       rv$spread_da_model <- da_fit$model_q75  # recommended 75th-pct model
@@ -3908,6 +4205,8 @@ server <- function(input, output, session) {
       spread_mask <- rasterize(rv$cal_vect_proj, spread_template,
                                field = 1, background = NA)
       spread_mask[!is.na(spread_mask)] <- 1
+      rv$spread_template <- spread_template   # cache for animation tab
+      rv$spread_mask     <- spread_mask
       message(sprintf(
         "Spread raster grid: %d x %d cells at %.0f m resolution over calibration boundary.",
         nrow(spread_template), ncol(spread_template), spread_res_m
@@ -3921,6 +4220,7 @@ server <- function(input, output, session) {
             cal_vect        = rv$cal_vect_proj,
             working_crs     = rv$working_crs,
             spread_template = spread_template,
+            normalize       = input$normalize_fine_fuels,
             progress_fn     = function(msg) setProgress(0.58, detail = msg)
           )
         } else if (input$fine_fuels_source == "local" &&
@@ -3928,7 +4228,8 @@ server <- function(input, output, session) {
           load_local_fine_fuels(
             path            = input$fine_fuels_path,
             working_crs     = rv$working_crs,
-            spread_template = spread_template
+            spread_template = spread_template,
+            normalize       = input$normalize_fine_fuels
           )
         } else {
           NULL   # placeholder — fit_spread_probability uses 1.0 everywhere
@@ -3951,15 +4252,24 @@ server <- function(input, output, session) {
 
       setProgress(0.6, detail = "Fitting spread probability (rasterizing perimeters)...")
       sp_fit <- fit_spread_probability(
-        pairs2        = climate_joined$spread_pairs,
-        geomac_v      = geomac_result,
-        template_r    = spread_template,
-        park_mask     = spread_mask,
-        fine_fuels_r  = fine_fuels_r,
-        failure_ratio = input$failure_sample_ratio,
-        max_samples   = input$max_samples_per_pair,
-        progress_fn   = function(i, n) setProgress(
-          0.6 + 0.35 * (i / n), detail = sprintf("Pair %d of %d...", i, n))
+        pairs2           = climate_joined$spread_pairs,
+        geomac_v         = geomac_result,
+        template_r       = spread_template,
+        park_mask        = spread_mask,
+        fine_fuels_r     = fine_fuels_r,
+        failure_ratio    = input$failure_sample_ratio,
+        max_samples      = input$max_samples_per_pair,
+        dil_kernel       = {
+          dc <- as.integer(input$dilation_cells)
+          r  <- 2 * dc + 1
+          outer(1:r, 1:r, function(i, j) as.integer(sqrt((i - dc - 1)^2 + (j - dc - 1)^2) <= dc))
+        },
+        min_pct_proximal = input$min_pct_proximal,
+        n_cores          = if (is.na(input$n_cores)) NULL else as.integer(input$n_cores),
+        progress_fn      = NULL,
+        cal_months       = cal_months_sel,
+        fwi_min          = if (isTRUE(input$fwi_min > 0)) input$fwi_min else NULL,
+        predictors       = input$sp_predictors
       )
       rv$spread_prob_fit     <- sp_fit           # full fit object (coef + model + samples + wind_predictor)
       rv$spread_prob_coef    <- sp_fit$coef
@@ -4027,6 +4337,255 @@ server <- function(input, output, session) {
       datatable(options = list(dom = "t", paging = FALSE, scrollX = TRUE),
                 rownames = FALSE, class = "table-sm table-striped")
   })
+
+  output$spread_model_comparison_table <- renderDT({
+    req(rv$spread_prob_fit)
+    comp <- rv$spread_prob_fit$model_comparison
+    req(!is.null(comp))
+    datatable(comp,
+              options  = list(dom = "t", paging = FALSE, scrollX = TRUE),
+              rownames = FALSE,
+              class    = "table-sm table-striped")
+  })
+
+  # ---------------------------------------------------------------------------
+  # Fire Growth Animation tab
+  # ---------------------------------------------------------------------------
+
+  # Render the animation controls / viewer UI (only when spread fit is done)
+  output$anim_tab_ui <- renderUI({
+    if (is.null(rv$spread_prob_fit) || is.null(rv$pairs_clean)) {
+      return(div(class = "text-muted text-center mt-4",
+                 icon("circle-info"), " Run Spread Fitting first to enable the animation tab."))
+    }
+
+    # Compute fire choices inline so the dropdown is pre-populated at render time.
+    # (updateSelectInput() cannot reach inputs inside renderUI reliably.)
+    fire_meta <- rv$pairs_clean %>%
+      dplyr::group_by(FIRE_ID) %>%
+      dplyr::summarise(
+        n_pairs    = dplyr::n(),
+        date_start = min(date,      na.rm = TRUE),
+        date_end   = max(date_next, na.rm = TRUE),
+        total_ha   = sum(pmax(delta_ha, 0), na.rm = TRUE),
+        max_fwi    = max(FWI, na.rm = TRUE),
+        .groups    = "drop"
+      ) %>%
+      dplyr::filter(n_pairs >= 1) %>%
+      dplyr::arrange(dplyr::desc(total_ha))
+
+    fire_choices <- setNames(
+      fire_meta$FIRE_ID,
+      sprintf("%s  |  %s – %s  |  %d pair%s  |  %.0f ha  |  max FWI %.1f",
+              fire_meta$FIRE_ID,
+              format(fire_meta$date_start, "%Y-%m-%d"),
+              format(fire_meta$date_end,   "%Y-%m-%d"),
+              fire_meta$n_pairs,
+              ifelse(fire_meta$n_pairs == 1, "", "s"),
+              fire_meta$total_ha,
+              fire_meta$max_fwi)
+    )
+
+    layout_columns(
+      col_widths = c(4, 8),
+
+      card(
+        card_header("Animation Controls"),
+
+        h6("Select Fire"),
+        selectizeInput("anim_fire_id", NULL,
+                       choices  = fire_choices,
+                       selected = fire_choices[1],
+                       width    = "100%",
+                       options  = list(placeholder  = "Search fires...",
+                                       openOnFocus  = TRUE)),
+        p(class = "text-muted small",
+          sprintf("%d fire%s available, sorted largest-first by total burned area.",
+                  nrow(fire_meta), if (nrow(fire_meta) == 1) "" else "s")),
+
+        hr(),
+        h6("Dilation Cells (frontier ring)"),
+        numericInput("anim_dil_cells",
+                     label    = NULL,
+                     value    = isolate(input$dilation_cells),
+                     min = 1, max = 15, step = 1, width = "100%"),
+        p(class = "text-muted small",
+          "Defaults to the main dilation setting. Changing here re-renders ",
+          "without re-running the full spread fit."),
+
+        hr(),
+        h6("Animation Speed"),
+        sliderInput("anim_fps", "Frames per second",
+                    min = 0.25, max = 4, value = 1, step = 0.25, width = "100%"),
+
+        hr(),
+        actionButton("anim_generate", "Generate Animation",
+                     class = "btn-success w-100", icon = icon("film")),
+        br(), br(),
+        uiOutput("anim_status_ui"),
+        br(),
+        uiOutput("anim_download_ui")
+      ),
+
+      card(
+        card_header("Animation Viewer"),
+        full_screen = TRUE,
+        uiOutput("anim_viewer_ui")
+      )
+    )
+  })
+
+  # Generate animation on button click
+  observeEvent(input$anim_generate, {
+    req(rv$spread_prob_fit, rv$pairs_clean, rv$geomac_result, input$anim_fire_id)
+
+    # Rebuild spread_template if not cached (e.g. loaded from old .RData)
+    template_to_use <- rv$spread_template
+    if (is.null(template_to_use)) {
+      if (is.null(rv$cal_vect_proj) || is.null(input$spread_res_m)) {
+        showNotification(
+          "Spread template not available. Please re-run the spread calibration first.",
+          type = "error", duration = 8
+        )
+        return()
+      }
+      spread_res_m    <- max(as.numeric(input$spread_res_m), 10)
+      template_to_use <- terra::rast(
+        terra::ext(rv$cal_vect_proj), resolution = spread_res_m,
+        crs = rv$working_crs
+      )
+    }
+
+    output$anim_status_ui <- renderUI(
+      tags$span(class = "text-warning small",
+                icon("spinner", class = "fa-spin"),
+                " Rendering frames...")
+    )
+    output$anim_viewer_ui <- renderUI(NULL)
+    output$anim_download_ui <- renderUI(NULL)
+
+    withProgress(message = "Generating fire animation...", value = 0, {
+      result <- tryCatch(
+        render_fire_animation(
+          fire_id         = input$anim_fire_id,
+          pairs           = rv$pairs_clean,
+          geomac_v        = rv$geomac_result,
+          spread_template = template_to_use,
+          dil_cells       = as.integer(input$anim_dil_cells),
+          dem_r           = rv$dem_r,
+          fps             = input$anim_fps,
+          progress_fn     = function(i, n) {
+            setProgress(i / n,
+                        detail = sprintf("Frame %d of %d", i, n))
+          }
+        ),
+        error = function(e) {
+          msg <- conditionMessage(e)
+          message("render_fire_animation ERROR: ", msg)
+          output$anim_status_ui <- renderUI(
+            tags$span(class = "text-danger small", icon("xmark"),
+                      " Animation error: ", msg)
+          )
+          list(n_frames = 0L, error_msg = msg)   # sentinel — not NULL so error msg survives
+        }
+      )
+
+      if (is.null(result)) {
+        output$anim_status_ui <- renderUI(
+          tags$span(class = "text-warning small", icon("triangle-exclamation"),
+                    " Animation returned NULL (unexpected). Check R console for details.")
+        )
+        return()
+      }
+
+      if (result$n_frames == 0) {
+        extra <- if (!is.null(result$error_msg)) result$error_msg else
+                   "Check that this fire ID has valid perimeter pairs and the R console for frame-level errors."
+        output$anim_status_ui <- renderUI(
+          tags$span(class = "text-warning small", icon("triangle-exclamation"),
+                    " No frames generated. ", extra)
+        )
+        return()
+      }
+
+      rv$anim_result <- result
+      setProgress(1.0)
+
+      n_frames <- result$n_frames
+      status_txt <- sprintf(
+        " %d frame%s rendered | dilation = %d cells",
+        n_frames, if (n_frames == 1) "" else "s",
+        result$dil_cells
+      )
+
+      output$anim_status_ui <- renderUI(
+        tags$span(class = "text-success small", icon("check"), status_txt)
+      )
+
+      # Download GIF button
+      output$anim_download_ui <- renderUI({
+        if (!is.null(result$gif_path) && file.exists(result$gif_path)) {
+          downloadButton("anim_dl_gif", "Download GIF",
+                         class = "btn-sm btn-outline-primary w-100",
+                         icon  = icon("download"))
+        }
+      })
+
+      # Viewer: slider + per-frame still image.
+      # The slider has a built-in play button (animationOptions) that steps through
+      # frames automatically. The animated GIF is available via the download button.
+      output$anim_viewer_ui <- renderUI({
+        tagList(
+          h6("Step through frames", class = "text-muted small mb-1"),
+          sliderInput("anim_frame_slider", NULL,
+                      min   = 1,
+                      max   = n_frames,
+                      value = 1,
+                      step  = 1,
+                      width = "100%",
+                      animate = animationOptions(interval    = round(1000 / input$anim_fps),
+                                                  loop        = TRUE,
+                                                  playButton  = icon("play"),
+                                                  pauseButton = icon("pause"))),
+          imageOutput("anim_frame_image", width = "100%", height = "auto")
+        )
+      })
+    })
+  })
+
+  # Serve GIF inline — width 100% of the container, height auto to preserve
+  # the 840×780 aspect ratio without the fixed-height cropping that occurred before.
+  output$anim_gif_image <- renderImage({
+    req(rv$anim_result, rv$anim_result$gif_path,
+        file.exists(rv$anim_result$gif_path))
+    list(src         = rv$anim_result$gif_path,
+         contentType = "image/gif",
+         style       = "width:100%; height:auto; display:block;",
+         alt         = sprintf("Animation for fire %s", rv$anim_result$fire_id))
+  }, deleteFile = FALSE)
+
+  # Serve individual frame on slider change
+  output$anim_frame_image <- renderImage({
+    req(rv$anim_result, input$anim_frame_slider)
+    idx  <- min(input$anim_frame_slider, rv$anim_result$n_frames)
+    path <- rv$anim_result$frame_pngs[idx]
+    req(file.exists(path))
+    list(src   = path, contentType = "image/png",
+         style = "width:100%; height:auto; display:block;",
+         alt   = sprintf("Frame %d", idx))
+  }, deleteFile = FALSE)
+
+  # GIF download handler
+  output$anim_dl_gif <- downloadHandler(
+    filename = function() {
+      paste0("fire_", gsub("[^A-Za-z0-9]", "_", rv$anim_result$fire_id), "_animation.gif")
+    },
+    content = function(file) {
+      req(rv$anim_result$gif_path, file.exists(rv$anim_result$gif_path))
+      file.copy(rv$anim_result$gif_path, file)
+    },
+    contentType = "image/gif"
+  )
 
   # ---------------------------------------------------------------------------
   # Calibration Health panel (shown above the coefficient tables)
@@ -4565,6 +5124,8 @@ server <- function(input, output, session) {
           max_gap_sp          = max(gap_sp_vals),
           max_gap_da          = max(gap_da_vals),
           neg_tol_ha          = max(neg_tol_vals),
+          max_growth_factor   = if (isTRUE(input$max_growth_factor > 0))
+                                  input$max_growth_factor else NULL,
           combustion_buoyancy = as.numeric(input$combustion_buoyancy)
         ),
         error = function(e) {
@@ -6734,6 +7295,7 @@ server <- function(input, output, session) {
     search_max_samples  = "number", search_fail_ratio = "number",
     search_neg_tol      = "number", search_w_auc      = "number",
     search_w_r2         = "number", neg_growth_tol    = "number",
+    max_growth_factor   = "number", fired_min_detection_days = "number",
     cand_b0_min         = "number", cand_b0_max       = "number",
     cand_b0_step        = "number", cand_b1_min       = "number",
     cand_b1_max         = "number", cand_b1_step      = "number",
@@ -6827,13 +7389,26 @@ server <- function(input, output, session) {
     }
   )
 
-  # Load: restore from .RData
+  # Load: restore from .RData (read directly by path — no upload, no size limit)
   observeEvent(input$apply_rdata, {
-    req(input$load_rdata_file)
+    path <- trimws(input$rdata_load_path)
+    if (nchar(path) == 0) {
+      showNotification("Enter the full path to the .RData file first.",
+                       type = "warning", duration = 6)
+      return()
+    }
+    if (!file.exists(path)) {
+      output$rdata_status_ui <- renderUI(
+        div(class = "alert alert-danger mt-2",
+            icon("xmark"),
+            sprintf(" File not found: %s", path))
+      )
+      return()
+    }
     withProgress(message = "Loading .RData cache...", {
       result <- tryCatch({
         local_env <- new.env(parent = emptyenv())
-        load(input$load_rdata_file$datapath, envir = local_env)
+        load(path, envir = local_env)
         if (!exists("cache", envir = local_env))
           stop("File does not contain a 'cache' object — was it saved by this app?")
         cache <- local_env$cache
