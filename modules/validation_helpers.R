@@ -92,6 +92,18 @@ load_scf_events_full <- function(path, cell_area_ha = 1.0) {
   dnbr_col <- intersect(c("MeanDNBR", "DNBR", "dNBR", "MeanDnbr"), names(df))[1]
   if (!is.na(dnbr_col)) df$MeanDNBR <- df[[dnbr_col]]
 
+  # Normalise effective wind speed.  SCF logs this as "MeanEffectiveWindSpeed"
+  # (km/h).  It is the only fire-weather variable that enters the site-mortality
+  # / dNBR model (FireEvent.cs::CalculateDNBR -> SiteMortalityB3), so it is the
+  # predictor to validate severity against.
+  ews_col <- intersect(c("MeanEffectiveWindSpeed", "EffectiveWindSpeed",
+                          "MeanEffectiveWind", "EWS"), names(df))[1]
+  if (!is.na(ews_col)) df$EWS_event <- suppressWarnings(as.numeric(df[[ews_col]]))
+
+  # Raw (non-slope-adjusted) wind, kept for reference
+  ws_col <- intersect(c("MeanWindSpeed", "WindSpeed"), names(df))[1]
+  if (!is.na(ws_col)) df$WindSpeed_event <- suppressWarnings(as.numeric(df[[ws_col]]))
+
   # Normalise duration column
   dur_col <- intersect(c("NumberOfDays", "FireDuration", "Duration",
                           "FireDays", "TotalDays"), names(df))[1]
@@ -258,6 +270,137 @@ plot_val_size_ecdf <- function(fpa_sizes_ha, sim_events_df,
     ) +
     .pub_theme() +
     theme(panel.grid.major.x = element_line(colour = "grey90", linewidth = 0.35))
+}
+
+
+# -----------------------------------------------------------------------------
+# plot_val_fire_size
+#
+# Boxplot of INDIVIDUAL fire sizes, observed vs simulated.
+#
+# Why this rather than annual area burned: annual area burned scales with
+# landscape area, so a calibration boundary of several million hectares and a
+# park-sized LANDIS landscape can never produce comparable totals even when the
+# fire regime is identical.  The fire SIZE distribution is scale-free — a
+# 5,000 ha fire is a 5,000 ha fire regardless of how big the surrounding
+# landscape is — which makes it the right target for spread calibration.
+#
+# Two adjustments make the comparison fair:
+#   min_ha  — SCF cannot produce a fire smaller than one cell, but FPA FOD
+#             contains thousands of sub-hectare records.  Default is the LANDIS
+#             cell area so both distributions share the same lower bound.
+#   landscape_ha — drawn as a reference line.  A bounded landscape truncates the
+#             upper tail (no fire can exceed the landscape), so simulated fires
+#             will fall short of the observed maximum by construction.
+#
+# obs_sizes_ha accepts either a bare numeric vector (one observed series) or a
+# NAMED LIST of numeric vectors, which lets the calibration-boundary and
+# LANDIS-landscape observed fire populations be shown side by side.  The
+# landscape series is the like-for-like comparison (same spatial domain as the
+# simulation); the calibration-boundary series gives a much larger sample.
+#
+# Returns a ggplot; log10 y-axis because fire sizes are heavy-tailed.
+# -----------------------------------------------------------------------------
+
+plot_val_fire_size <- function(obs_sizes_ha, sim_events_df,
+                                min_ha       = 0.81,
+                                landscape_ha = NULL,
+                                obs_label    = "Observed \u2014 FPA FOD",
+                                plot_title   = "Fire Size Distribution") {
+
+  if (is.null(sim_events_df)) return(NULL)
+  if (!"fire_size_ha" %in% names(sim_events_df)) return(NULL)
+
+  sim_fires <- sim_events_df$fire_size_ha[
+    is.finite(sim_events_df$fire_size_ha) & sim_events_df$fire_size_ha >= min_ha]
+  if (length(sim_fires) == 0) return(NULL)
+
+  # Normalise the observed argument to a named list so one or many observed
+  # series are handled by the same code path.
+  obs_list <- if (is.null(obs_sizes_ha)) list() else
+              if (is.list(obs_sizes_ha))  obs_sizes_ha else
+              setNames(list(obs_sizes_ha), obs_label)
+
+  obs_list <- obs_list[!vapply(obs_list, is.null, logical(1))]
+  obs_list <- lapply(obs_list, function(v) v[is.finite(v) & v >= min_ha])
+  obs_list <- obs_list[vapply(obs_list, length, integer(1)) > 0]
+
+  .q  <- function(x, p) as.numeric(stats::quantile(x, p, na.rm = TRUE))
+  fmt <- function(x) scales::comma(round(x))
+  .stat_line <- function(v, lab) sprintf(
+    "%s: n=%s  median=%s  IQR=%s\u2013%s  p90=%s  max=%s ha",
+    lab, scales::comma(length(v)), fmt(median(v)),
+    fmt(.q(v, .25)), fmt(.q(v, .75)), fmt(.q(v, .90)), fmt(max(v)))
+
+  sim_lab <- "Simulated \u2014 SCF"
+
+  # Observed series first (in supplied order), simulated last.
+  # Palette: dark navy / green for observed, red for simulated.
+  obs_cols <- c(.COL_OBS, .COL_EXP, "#7f8c8d")
+  fill_vals <- c(
+    setNames(obs_cols[seq_along(obs_list)], names(obs_list)),
+    setNames(.COL_SIM, sim_lab)
+  )
+
+  plot_df <- bind_rows(
+    bind_rows(lapply(names(obs_list), function(nm)
+      tibble(fire_size_ha = obs_list[[nm]], source = nm))),
+    tibble(fire_size_ha = sim_fires, source = sim_lab)
+  )
+
+  subtitle <- paste(c(
+    vapply(names(obs_list), function(nm) .stat_line(obs_list[[nm]], nm), character(1)),
+    .stat_line(sim_fires, sim_lab)
+  ), collapse = "\n")
+
+  # Ratio line against the most spatially comparable observed series (the last
+  # one supplied — callers pass the LANDIS-landscape series last for this reason).
+  if (length(obs_list) > 0) {
+    ref     <- obs_list[[length(obs_list)]]
+    ref_nm  <- names(obs_list)[length(obs_list)]
+    subtitle <- paste0(subtitle, sprintf(
+      "\nSimulated vs %s \u2014 median %.2f\u00d7   |   p90 %.2f\u00d7",
+      ref_nm, median(sim_fires) / max(median(ref), 1e-9),
+      .q(sim_fires, .90) / max(.q(ref, .90), 1e-9)))
+  } else {
+    subtitle <- paste0(subtitle,
+      "\nLoad FPA FOD on the Ignition tab to add the observed comparison.")
+  }
+
+  plot_df$source <- factor(plot_df$source, levels = names(fill_vals))
+
+  p <- ggplot(plot_df, aes(x = source, y = fire_size_ha, fill = source)) +
+    geom_boxplot(width = 0.45, outlier.shape = 21, outlier.size = 1.6,
+                 outlier.alpha = 0.45, alpha = 0.65)
+
+  if (nrow(plot_df) <= 4000)
+    p <- p + geom_jitter(width = 0.10, size = 1.1, alpha = 0.25, colour = "grey25")
+
+  cap <- sprintf(paste0("Fires \u2265 %.2f ha (one LANDIS cell) only \u2014 ",
+                        "SCF cannot produce smaller fires."), min_ha)
+
+  if (!is.null(landscape_ha) && is.finite(landscape_ha) && landscape_ha > 0) {
+    p <- p +
+      geom_hline(yintercept = landscape_ha, linetype = "dashed",
+                 colour = "#a0522d", linewidth = 0.6) +
+      annotate("text", x = 0.55, y = landscape_ha, vjust = -0.6, hjust = 0,
+               size = 3, colour = "#a0522d",
+               label = sprintf("LANDIS landscape = %s ha", fmt(landscape_ha)))
+    cap <- paste0(cap, "\nDashed line = LANDIS landscape area (from your template ",
+                  "raster); simulated fires cannot exceed it, so the upper tail ",
+                  "is truncated by construction.")
+  }
+
+  p +
+    scale_fill_manual(values = fill_vals) +
+    scale_y_log10(labels = scales::label_comma()) +
+    labs(title = plot_title,
+         subtitle = subtitle,
+         x = NULL, y = "Fire size (ha, log scale)",
+         caption = cap) +
+    .pub_theme() +
+    theme(legend.position = "none",
+          axis.text.x = element_text(size = 9))
 }
 
 
@@ -990,6 +1133,304 @@ plot_val_duration <- function(sim_events_df) {
       caption  = "Source: SCF socialclimatefire-events-log.csv"
     ) +
     .pub_theme()
+}
+
+
+# -----------------------------------------------------------------------------
+# plot_val_duration_compare
+#
+# Observed vs simulated fire duration, as boxplots faceted by ignition type.
+#
+# OBSERVED DURATION comes from FPA FOD: CONT_DATE - DISCOVERY_DATE, available
+# for ~89% of records (both are already parsed and sanity-clamped by
+# load_fpa_fod(), which rejects containment before discovery or > 365 days out).
+#
+# Three things make the comparison defensible:
+#   * Inclusive day count.  A fire discovered and contained the same day has
+#     cont_date - date = 0 but burned for one day, so 1 is added.  This puts
+#     both series on the same footing, since SCF's NumberOfDays starts at 1.
+#   * Size matching.  78% of FPA FOD records are under 1 ha — smaller than a
+#     single LANDIS cell, and they drag the observed median to 0 days.  Both
+#     series are therefore restricted to fires of at least min_ha.
+#   * Containment is an UPPER BOUND on active spread.  A fire can be declared
+#     contained long after it stopped advancing, and mop-up inflates the tail.
+#     Expect observed duration to run longer than SCF's spread duration; treat
+#     a simulated median in the right ballpark as success, not an exact match.
+# -----------------------------------------------------------------------------
+
+plot_val_duration_compare <- function(obs_df, sim_events_df, min_ha = 0.81) {
+
+  if (is.null(sim_events_df)) return(NULL)
+  if (!"duration_days" %in% names(sim_events_df)) return(NULL)
+
+  sim_df <- sim_events_df %>%
+    filter(is.finite(duration_days), duration_days > 0)
+  if (!"fire_size_ha" %in% names(sim_df)) sim_df$fire_size_ha <- NA_real_
+  sim_df <- sim_df %>%
+    filter(is.na(fire_size_ha) | fire_size_ha >= min_ha) %>%
+    transmute(duration_days = as.numeric(duration_days),
+              ignition_type = as.character(ignition_type),
+              source        = "Simulated \u2014 SCF")
+  if (nrow(sim_df) == 0) return(NULL)
+
+  plot_df   <- sim_df
+  fill_vals <- setNames(.COL_SIM, "Simulated \u2014 SCF")
+  have_obs  <- FALSE
+
+  if (!is.null(obs_df) &&
+      all(c("date", "cont_date") %in% names(obs_df))) {
+    obs_use <- obs_df
+    if (!"FIRE_SIZE_HA" %in% names(obs_use)) obs_use$FIRE_SIZE_HA <- NA_real_
+    obs_use <- obs_use %>%
+      filter(!is.na(cont_date), !is.na(date),
+             is.na(FIRE_SIZE_HA) | FIRE_SIZE_HA >= min_ha) %>%
+      mutate(duration_days = as.numeric(cont_date - date) + 1) %>%
+      filter(is.finite(duration_days), duration_days > 0) %>%
+      transmute(duration_days,
+                ignition_type = as.character(ignition_type),
+                source        = "Observed \u2014 FPA FOD")
+    if (nrow(obs_use) > 0) {
+      plot_df   <- bind_rows(obs_use, sim_df)
+      fill_vals <- c(setNames(.COL_OBS, "Observed \u2014 FPA FOD"), fill_vals)
+      have_obs  <- TRUE
+    }
+  }
+
+  # Keep only ignition types SCF actually simulates
+  keep_types <- intersect(unique(sim_df$ignition_type), unique(plot_df$ignition_type))
+  plot_df <- plot_df %>% filter(ignition_type %in% keep_types)
+  if (nrow(plot_df) == 0) return(NULL)
+
+  plot_df$source <- factor(plot_df$source, levels = names(fill_vals))
+
+  stat_df <- plot_df %>%
+    group_by(ignition_type, source) %>%
+    summarise(n = n(), med = median(duration_days),
+              p90 = quantile(duration_days, 0.90), .groups = "drop")
+
+  subtitle <- paste(
+    apply(stat_df, 1, function(r) sprintf(
+      "%s / %s: n=%s  median=%.0f d  p90=%.0f d",
+      r[["ignition_type"]], r[["source"]],
+      scales::comma(as.numeric(r[["n"]])),
+      as.numeric(r[["med"]]), as.numeric(r[["p90"]]))),
+    collapse = "\n")
+
+  cap <- sprintf(paste0(
+    "Fires \u2265 %.2f ha (one LANDIS cell) only. Observed duration = ",
+    "containment \u2212 discovery date + 1 day (FPA FOD)."), min_ha)
+  if (have_obs)
+    cap <- paste0(cap, "\nContainment is an upper bound on active spread \u2014 ",
+                  "mop-up inflates the observed tail, so observed will read longer.")
+  else
+    cap <- paste0(cap, "\nNo observed containment dates available; ",
+                  "load FPA FOD on the Ignition tab to add the comparison.")
+
+  ggplot(plot_df, aes(x = source, y = duration_days, fill = source)) +
+    geom_boxplot(width = 0.45, outlier.shape = 21, outlier.size = 1.5,
+                 outlier.alpha = 0.35, alpha = 0.65) +
+    facet_wrap(~ignition_type) +
+    scale_fill_manual(values = fill_vals) +
+    scale_y_log10(labels = scales::label_comma()) +
+    labs(title = "Fire Duration \u2014 Observed vs Simulated",
+         subtitle = subtitle,
+         x = NULL, y = "Fire duration (days, log scale)",
+         caption = cap) +
+    .pub_theme() +
+    theme(legend.position = "none",
+          axis.text.x = element_text(size = 9))
+}
+
+
+# -----------------------------------------------------------------------------
+# add_mtbs_climate
+#
+# Attaches effective wind speed and FWI to MTBS observed fires so severity can
+# be validated against fire weather.
+#
+#   EWS : MTBS burn-boundary lat/lon -> project to working_crs -> extract slope
+#         and aspect -> combine with wind on the ignition date via the same
+#         Nelson (2002) formula SCF uses internally.
+#   FWI : joined from the daily FWI series on the ignition date.
+#
+# Returns the input tibble with EWS_obs and FWI_obs columns added (NA where the
+# ignition date falls outside the climate series or coordinates are missing).
+# -----------------------------------------------------------------------------
+
+add_mtbs_climate <- function(mtbs_df, wind_daily = NULL, fwi_daily = NULL,
+                              slope_r = NULL, aspect_r = NULL,
+                              working_crs = NULL,
+                              combustion_buoyancy = 10) {
+
+  if (is.null(mtbs_df) || nrow(mtbs_df) == 0) return(mtbs_df)
+  out <- mtbs_df
+  out$EWS_obs <- NA_real_
+  out$FWI_obs <- NA_real_
+  if (!"Ig_Date" %in% names(out)) return(out)
+
+  # ---- FWI on the ignition date ---------------------------------------------
+  if (!is.null(fwi_daily) && all(c("date", "value") %in% names(fwi_daily))) {
+    idx <- match(as.Date(out$Ig_Date), as.Date(fwi_daily$date))
+    out$FWI_obs <- fwi_daily$value[idx]
+  }
+
+  # ---- Effective wind speed --------------------------------------------------
+  lat_col <- intersect(c("burnbndlat", "latitude", "lat"), names(out))[1]
+  lon_col <- intersect(c("burnbndlon", "longitude", "lon"), names(out))[1]
+
+  if (!is.null(wind_daily) && "WindSpeed_kmh" %in% names(wind_daily)) {
+    widx <- match(as.Date(out$Ig_Date), as.Date(wind_daily$date))
+    ws   <- wind_daily$WindSpeed_kmh[widx]
+    wd   <- if ("WindDir_deg" %in% names(wind_daily))
+              wind_daily$WindDir_deg[widx] else rep(NA_real_, nrow(out))
+
+    slope_deg <- rep(NA_real_, nrow(out))
+    aspect_deg <- rep(NA_real_, nrow(out))
+
+    if (!is.na(lat_col) && !is.na(lon_col) &&
+        !is.null(slope_r) && !is.null(aspect_r) && !is.null(working_crs)) {
+      lats <- suppressWarnings(as.numeric(out[[lat_col]]))
+      lons <- suppressWarnings(as.numeric(out[[lon_col]]))
+      ok   <- is.finite(lats) & is.finite(lons)
+      if (any(ok)) {
+        pts <- tryCatch({
+          v <- terra::vect(data.frame(lon = lons[ok], lat = lats[ok]),
+                           geom = c("lon", "lat"), crs = "EPSG:4326")
+          terra::project(v, working_crs)
+        }, error = function(e) NULL)
+        if (!is.null(pts)) {
+          sv <- tryCatch(terra::extract(slope_r,  pts)[, 2], error = function(e) NULL)
+          av <- tryCatch(terra::extract(aspect_r, pts)[, 2], error = function(e) NULL)
+          if (!is.null(sv)) slope_deg[ok]  <- as.numeric(sv)
+          if (!is.null(av)) aspect_deg[ok] <- as.numeric(av)
+        }
+      }
+    }
+
+    out$EWS_obs <- tryCatch(
+      compute_effective_wind(wind_speed = ws, wind_dir = wd,
+                             slope_deg = slope_deg, aspect_deg = aspect_deg,
+                             combustion_buoyancy = combustion_buoyancy),
+      error = function(e) ws   # fall back to raw wind if terrain unavailable
+    )
+  }
+
+  out
+}
+
+
+# -----------------------------------------------------------------------------
+# plot_val_severity_climate
+#
+# Severity-climate relationship: binned median dNBR (IQR bar) against effective
+# wind speed and against FWI, observed vs simulated.
+#
+# WHY EWS IS THE PANEL THAT MATTERS: SCF's dNBR comes from the site-mortality
+# sub-model (FireEvent.cs::CalculateDNBR), a gamma GLM with inverse link over
+# Clay, previous-year PET, EFFECTIVE WIND SPEED, climatic water deficit, fine
+# fuels and ladder fuels.  Effective wind speed is the ONLY fire-weather term in
+# that equation, so SiteMortalityB3 is the single lever for the severity-weather
+# relationship.  The FWI panel is diagnostic only — FWI never enters the dNBR
+# calculation, so a mismatch there cannot be tuned away directly and will
+# instead reflect how FWI and EWS covary in the climate record.
+#
+# Rendered as a single two-facet ggplot (not patchwork) so both panels always
+# appear and share one legend.
+# -----------------------------------------------------------------------------
+
+plot_val_severity_climate <- function(sim_events_df, mtbs_df,
+                                       ews_breaks = c(0, 5, 10, 15, 20, 25, 30, Inf),
+                                       fwi_breaks = c(0, 10, 20, 30, 40, 55, Inf),
+                                       min_n      = 3) {
+
+  if (is.null(sim_events_df) || !"MeanDNBR" %in% names(sim_events_df)) return(NULL)
+
+  LBL_OBS <- "Observed \u2014 MTBS"
+  LBL_SIM <- "Simulated \u2014 SCF"
+  PAN_EWS <- "A. vs Effective Wind Speed  \u2014  TUNABLE (SiteMortalityB3)"
+  PAN_FWI <- "B. vs FWI  \u2014  DIAGNOSTIC ONLY (not in SCF's dNBR model)"
+
+  .mk_labs <- function(b) paste0(
+    b[-length(b)], "\u2013",
+    ifelse(is.finite(b[-1]), as.character(b[-1]), "+"))
+
+  .bin <- function(x, y, brks, labs, src, panel) {
+    if (is.null(x) || is.null(y)) return(NULL)
+    n <- min(length(x), length(y))
+    d <- tibble(x = suppressWarnings(as.numeric(x[seq_len(n)])),
+                y = suppressWarnings(as.numeric(y[seq_len(n)]))) %>%
+      filter(is.finite(x), is.finite(y), y > 0) %>%
+      mutate(bin = cut(x, breaks = brks, labels = labs,
+                       right = FALSE, include.lowest = TRUE)) %>%
+      filter(!is.na(bin)) %>%
+      group_by(bin) %>%
+      summarise(med = median(y), q25 = quantile(y, .25),
+                q75 = quantile(y, .75), n = n(), .groups = "drop") %>%
+      filter(n >= min_n)
+    if (nrow(d) == 0) return(NULL)
+    d$source <- src
+    d$panel  <- panel
+    d$bin    <- as.character(d$bin)
+    d
+  }
+
+  has_obs   <- !is.null(mtbs_df) && "MeanDNBR_obs" %in% names(mtbs_df)
+  ews_labs  <- .mk_labs(ews_breaks)
+  fwi_labs  <- .mk_labs(fwi_breaks)
+
+  parts <- list(
+    .bin(if (has_obs && "EWS_obs" %in% names(mtbs_df)) mtbs_df$EWS_obs else NULL,
+         if (has_obs) mtbs_df$MeanDNBR_obs else NULL,
+         ews_breaks, ews_labs, LBL_OBS, PAN_EWS),
+    .bin(if ("EWS_event" %in% names(sim_events_df)) sim_events_df$EWS_event else NULL,
+         sim_events_df$MeanDNBR, ews_breaks, ews_labs, LBL_SIM, PAN_EWS),
+    .bin(if (has_obs && "FWI_obs" %in% names(mtbs_df)) mtbs_df$FWI_obs else NULL,
+         if (has_obs) mtbs_df$MeanDNBR_obs else NULL,
+         fwi_breaks, fwi_labs, LBL_OBS, PAN_FWI),
+    .bin(if ("FWI_event" %in% names(sim_events_df)) sim_events_df$FWI_event else NULL,
+         sim_events_df$MeanDNBR, fwi_breaks, fwi_labs, LBL_SIM, PAN_FWI)
+  )
+  parts <- parts[!vapply(parts, is.null, logical(1))]
+  if (length(parts) == 0) return(NULL)
+
+  dd <- bind_rows(parts)
+  # Bin order differs per facet, so order the union with EWS labels first.
+  dd$bin    <- factor(dd$bin, levels = unique(c(ews_labs, fwi_labs)))
+  dd$source <- factor(dd$source, levels = c(LBL_OBS, LBL_SIM))
+  dd$panel  <- factor(dd$panel,  levels = c(PAN_EWS, PAN_FWI))
+
+  # Totals per series (Panel A), so coverage is stated rather than inferred from
+  # how long each line happens to look.
+  n_tot <- dd %>% filter(panel == PAN_EWS) %>%
+    group_by(source) %>% summarise(n = sum(n), .groups = "drop")
+  n_txt <- paste(sprintf("%s n=%s", n_tot$source, scales::comma(n_tot$n)),
+                 collapse = "   |   ")
+
+  ggplot(dd, aes(bin, med, colour = source, group = source)) +
+    geom_linerange(aes(ymin = q25, ymax = q75), linewidth = 3.2, alpha = 0.25) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2.6) +
+    geom_text(aes(y = q75, label = n), vjust = -0.7, size = 2.5,
+              show.legend = FALSE) +
+    facet_wrap(~panel, ncol = 1, scales = "free_x") +
+    scale_colour_manual(values = setNames(c(.COL_OBS, .COL_SIM),
+                                          c(LBL_OBS, LBL_SIM)),
+                        drop = FALSE) +
+    labs(
+      title    = "Severity \u2013 Climate Relationship",
+      subtitle = paste0("Median dNBR per weather bin (IQR = thick bar); n above each point.  ",
+                        n_txt),
+      x = "Weather bin (km/h for EWS, index for FWI)",
+      y = "Median dNBR (IQR bar)", colour = NULL,
+      caption = paste0(
+        "Observed: MTBS per-fire mean dNBR; EWS from wind on the ignition date + ",
+        "terrain at the burn centroid (Nelson 2002).\n",
+        "Simulated: SCF MeanDNBR vs MeanEffectiveWindSpeed / FWI per event.  ",
+        "EWS is the only weather term in SCF's dNBR equation.")
+    ) +
+    .pub_theme() +
+    theme(axis.text.x = element_text(angle = 40, hjust = 1, size = 9),
+          strip.text  = element_text(face = "bold", size = 10))
 }
 
 

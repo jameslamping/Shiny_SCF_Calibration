@@ -45,7 +45,6 @@ source("modules/era_helpers.R")
 source("modules/ignition_helpers.R")
 source("modules/spread_helpers.R")
 source("modules/species_helpers.R")
-source("modules/ui_helpers.R")
 source("modules/validation_helpers.R")
 source("modules/mortality_helpers.R")
 source("modules/tuning_helpers.R")
@@ -135,8 +134,137 @@ ui <- page_navbar(
 
     hr(),
 
-    # -- ERA-Interim NetCDF files
-    h6("3. ERA-Interim FWI Files"),
+    # -- FWI source: ERA-Interim NetCDF or GRIDMET-derived
+    h6("3. Fire Weather Index (FWI)"),
+    radioButtons("fwi_source", NULL,
+      choices = c("ERA-Interim NetCDF (1980-2018)"    = "era",
+                  "GRIDMET-derived (1979-present)"    = "gridmet"),
+      selected = "era"),
+    p(class = "text-muted small",
+      tags$b("ERA-Interim"), " is a pre-computed FWI product but ends in 2018. ",
+      tags$b("GRIDMET-derived"), " computes FFMC/DMC/DC/FWI from GRIDMET ",
+      "meteorology using the Canadian FWI System (cffdrs), covering ",
+      "1979-present — required for NIROPS perimeters (2020-2024). ",
+      "SCF applies one FWI stream at runtime, so ignition and spread should ",
+      "be calibrated on the same source."),
+
+    conditionalPanel(
+      "input.fwi_source == 'gridmet'",
+      div(class = "alert alert-warning py-2 small",
+        icon("clock"), " ", tags$b("Slow first run."), " GRIDMET is fetched over ",
+        "OPeNDAP — roughly 30-45 minutes per year. Each year is cached to disk, ",
+        "so re-runs and later sessions are fast. Fetch the years you need once, ",
+        "then save the .RData cache."),
+      textInput("gridmet_cache_dir", "GRIDMET cache directory",
+                value = "gridmet_cache",
+                placeholder = "gridmet_cache"),
+      p(class = "text-muted small",
+        "Per-year raw meteorology is cached here as .rds so an interrupted ",
+        "multi-year fetch resumes without re-downloading. Relative paths are ",
+        "resolved against the app directory. The computed FWI series themselves ",
+        "ride along in the .RData cache."),
+      numericInput("gridmet_agg_fact", "Spatial aggregation factor",
+                   value = 6, min = 1, max = 20, step = 1),
+      p(class = "text-muted small",
+        "GRIDMET is ~4 km; a factor of 6 gives ~24 km cells. FWI is nonlinear ",
+        "and its moisture codes carry day-to-day memory, so FWI is computed ",
+        "per cell and then averaged — preserving that behaviour without paying ",
+        "the full 4 km cost. Set to 1 for native resolution (much slower)."),
+      radioButtons("gridmet_convention", "FWI convention",
+        choices = c("LANDIS Climate Library (mean temp / mean RH)" = "landis",
+                    "Peak burning (max temp / min RH)"             = "peak"),
+        selected = "landis"),
+      div(class = "alert alert-warning py-2 small",
+        icon("triangle-exclamation"), " ",
+        tags$b("This must match what SCF consumes at runtime."),
+        " The LANDIS Climate Library computes FWI from ",
+        tags$code("Temp = 0.5*(MinTemp+MaxTemp)"), " and ",
+        tags$code("RH = 0.5*(MinRH+MaxRH)"),
+        " (ClimateDataParser.cs:314, :329). Calibrating on the peak convention ",
+        "and simulating on the mean convention applies your fitted coefficients ",
+        "to a systematically higher predictor than SCF ever sees."),
+      textInput("gridmet_reset_mmdd", "Annual moisture-code reset (MM-DD)",
+                value = "04-01"),
+      radioButtons("climlib_version", "LANDIS Climate Library version",
+        choices = c("Fixed / post-patch (recommended)" = "fixed",
+                    "Pre-patch (precip cm bug present)" = "prepatch",
+                    "Manual"                            = "manual"),
+        selected = "fixed"),
+      p(class = "text-muted small",
+        tags$b("Fixed:"), " precipitation converted to mm, FFMC rainfall routine ",
+        "present, DC day-length signs corrected. ",
+        tags$b("Pre-patch:"), " replicates the cm-as-mm precipitation bug by scaling ",
+        "precipitation \u00d7 0.1, so calibration FWI matches what an unpatched ",
+        "library produces at runtime. Note the pre-patch library also omits the ",
+        "FFMC rain routine entirely, which this app cannot replicate \u2014 so ",
+        "pre-patch FWI here will still run somewhat lower than the library's."),
+      conditionalPanel(
+        "input.climlib_version == 'manual'",
+        numericInput("gridmet_precip_scale", "Precipitation scale factor", value = 1,
+                     min = 0.01, max = 10, step = 0.05),
+        p(class = "text-muted small",
+          "1.0 = precipitation in mm (correct). 0.1 replicates a climate file in ",
+          "cm being read by an unpatched library, which feeds ",
+          tags$code("Precip"), " straight into the Van Wagner rain equations ",
+          "(FireClimate.cs:95, :122) that expect mm.")
+      ),
+      fluidRow(
+        column(4, numericInput("gridmet_init_ffmc", "Startup FFMC", value = 85, min = 0, max = 101)),
+        column(4, numericInput("gridmet_init_dmc",  "Startup DMC",  value = 6,  min = 0)),
+        column(4, numericInput("gridmet_init_dc",   "Startup DC",   value = 15, min = 0))
+      ),
+      p(class = "text-muted small",
+        "FFMC/DMC/DC accumulate and are re-initialised each year at the reset ",
+        "date. Match these to your LANDIS climate-config file, which sets them ",
+        "via ", tags$code("FineFuelMoistureCode"), " / ", tags$code("DuffMoistureCode"),
+        " / ", tags$code("DroughtCode"), ", and the reset date to ",
+        tags$code("FirstDayFire"), ". Van Wagner's standard spring startup is ",
+        "85 / 6 / 15, but LANDIS configs often differ."),
+      actionButton("compute_gridmet_fwi_btn", "Compute GRIDMET FWI",
+                   class = "btn-sm btn-secondary w-100",
+                   icon  = icon("cloud-arrow-down")),
+      uiOutput("gridmet_fwi_status")
+    ),
+
+    hr(),
+    h6("Runtime FWI check (LANDIS climate file)"),
+    p(class = "text-muted small",
+      "Optional but strongly recommended. Computes FWI directly from your ",
+      "LANDIS daily climate file using the Climate Library's own conventions \u2014 ",
+      "this is the FWI SCF actually consumes at runtime. Comparing it against ",
+      "the calibration FWI catches the case where coefficients are fit to one ",
+      "variable and applied to another, which no amount of tuning can fix."),
+    textInput("landis_climate_path", label = NULL,
+              placeholder = "/path/to/daily_climate.csv"),
+    fluidRow(
+      column(6, radioButtons("landis_precip_units", "File precip units",
+                             choices = c("cm" = "cm", "mm" = "mm"), selected = "cm",
+                             inline = TRUE)),
+      column(6, radioButtons("landis_patched", "Climate Library",
+                             choices = c("Patched" = "yes", "Unpatched" = "no"),
+                             selected = "yes", inline = TRUE))
+    ),
+    fluidRow(
+      column(4, numericInput("landis_ffmc", "FFMC", value = 85, min = 0, max = 101)),
+      column(4, numericInput("landis_dmc",  "DMC",  value = 6,  min = 0)),
+      column(4, numericInput("landis_dc",   "DC",   value = 15, min = 0))
+    ),
+    fluidRow(
+      column(6, numericInput("landis_firstday", "FirstDayFire", value = 1, min = 0, max = 365)),
+      column(6, numericInput("landis_lastday",  "LastDayFire",  value = 365, min = 1, max = 365))
+    ),
+    p(class = "text-muted small",
+      "Match these to your ", tags$code("climate-generator"), " config: ",
+      tags$code("FineFuelMoistureCode"), " / ", tags$code("DuffMoistureCode"), " / ",
+      tags$code("DroughtCode"), " / ", tags$code("FirstDayFire"), " / ",
+      tags$code("LastDayFire"), "."),
+    actionButton("load_landis_fwi", "Compute Runtime FWI",
+                 class = "btn-sm btn-outline-secondary w-100",
+                 icon  = icon("file-import")),
+    uiOutput("landis_fwi_status"),
+
+    conditionalPanel(
+      "input.fwi_source == 'era'",
     p(class = "text-muted small",
       tags$a("Download from Zenodo", href = "https://doi.org/10.5281/zenodo.1065400",
              target = "_blank"),
@@ -150,7 +278,8 @@ ui <- page_navbar(
     textInput("era_dc_path",   "dc.nc",
               value = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/Climate/ERA-Interim/data/dc.nc"),
     actionButton("load_era_fwi", "Load FWI Files", class = "btn-sm btn-secondary w-100"),
-    uiOutput("era_fwi_status"),
+    uiOutput("era_fwi_status")
+    ),
 
     hr(),
 
@@ -172,8 +301,11 @@ ui <- page_navbar(
     # -- Calibration date range
     h6("5. Calibration Period"),
     sliderInput("cal_years", label = NULL,
-                min = 1980, max = 2018,
+                min = 1980, max = 2024,
                 value = c(1992, 2018), step = 1, sep = ""),
+    p(class = "text-muted small",
+      "ERA-Interim FWI covers 1980-2018; GRIDMET 1979-present. ",
+      "NIROPS perimeters require 2020-2024."),
 
     hr(),
     uiOutput("landscape_preview_ui")
@@ -357,20 +489,20 @@ ui <- page_navbar(
                       tags$tbody(
                         tags$tr(
                           tags$td("b0"), tags$td("Log baseline rate"),
-                          tags$td(tags$code("LightningIgnitionB0")),
+                          tags$td(tags$code("LightningIgnitionsB0")),
                           tags$td("any")
                         ),
                         tags$tr(
                           tags$td("b1"), tags$td("FWI slope"),
-                          tags$td(tags$code("LightningIgnitionB1")),
+                          tags$td(tags$code("LightningIgnitionsB1")),
                           tags$td(tags$span(class = "text-success", "+ (higher FWI → more fires)"))
                         )
                       )
                     ),
                     tags$p(class = "text-muted small mt-2 mb-0",
                       "Same structure for Accidental: ",
-                      tags$code("AccidentalIgnitionB0"), " / ",
-                      tags$code("AccidentalIgnitionB1"), ".")
+                      tags$code("AccidentalIgnitionsB0"), " / ",
+                      tags$code("AccidentalIgnitionsB1"), ".")
                   )
                 ),
                 tags$div(class = "card mb-3 border-warning",
@@ -397,13 +529,13 @@ ui <- page_navbar(
                       )),
                       tags$tbody(
                         tags$tr(tags$td("b0"),  tags$td("Count log-baseline"),
-                          tags$td(tags$code("LightningIgnitionB0"))),
+                          tags$td(tags$code("LightningIgnitionsB0"))),
                         tags$tr(tags$td("b1"),  tags$td("Count FWI slope"),
-                          tags$td(tags$code("LightningIgnitionB1"))),
+                          tags$td(tags$code("LightningIgnitionsB1"))),
                         tags$tr(tags$td("bz0"), tags$td("Zero-inflation intercept"),
-                          tags$td(tags$code("LightningIgnitionBZ0"))),
+                          tags$td(tags$code("LightningIgnitionsBinomialB0"))),
                         tags$tr(tags$td("bz1"), tags$td("Zero-inflation FWI slope"),
-                          tags$td(tags$code("LightningIgnitionBZ1")))
+                          tags$td(tags$code("LightningIgnitionsBinomialB1")))
                       )
                     ),
                     tags$p(class = "text-muted small mt-2 mb-0",
@@ -458,12 +590,25 @@ ui <- page_navbar(
           ),
           nav_panel("Coefficients",
             br(),
-            p(class = "text-muted",
-              "Fitted ignition model coefficients (b0, b1, bz0, bz1) by ignition type."),
+            div(class = "alert alert-warning py-2 small",
+              icon("triangle-exclamation"), " ",
+              strong("These are regional (calibration boundary) coefficients."),
+              " b0 reflects ignition rate across the entire calibration region and ",
+              "must be scaled down before entering into SCF. ",
+              "See the ", strong("Scale Adjustment"), " tab for the landscape-scaled ",
+              "values to use in the SCF parameter file."
+            ),
+            p(class = "text-muted small",
+              "Fitted ignition model coefficients by ignition type. ",
+              "b1, bz0, and bz1 transfer directly to SCF unchanged; ",
+              "only b0 requires landscape-scale adjustment."),
             DTOutput("ign_coef_table"),
             br(),
-            downloadButton("dl_ign_coef", "Download Coefficients CSV",
-                           class = "btn-sm btn-outline-primary")
+            downloadButton("dl_ign_coef", "Download Regional Coefficients CSV",
+                           class = "btn-sm btn-outline-secondary"),
+            p(class = "text-muted small mt-1",
+              "Downloads the unadjusted regional coefficients for reference. ",
+              "Use the download on the Scale Adjustment tab for SCF-ready values.")
           ),
 
           nav_panel("Scale Adjustment",
@@ -506,14 +651,17 @@ ui <- page_navbar(
                 )
               ),
               column(7,
-                h6("Adjusted Coefficients"),
+                h6("Landscape-Scaled Coefficients (for SCF)"),
                 p(class = "text-muted small",
-                  "Coefficients to enter into the SCF parameter file. ",
-                  "b0 has been adjusted; all other values are unchanged."),
+                  "Enter these values into the SCF parameter file. ",
+                  tags$b("Only b0 changes"), " — it is shifted by ",
+                  tags$code("log(landscape area / calibration area)"),
+                  " to account for the smaller LANDIS landscape. ",
+                  "b0_regional is shown for comparison; b1, bz0, and bz1 are identical to the Coefficients tab."),
                 DTOutput("adjusted_coef_table"),
                 br(),
                 downloadButton("dl_adjusted_coef",
-                               "Download Adjusted Coefficients CSV",
+                               "Download SCF-Ready Coefficients CSV",
                                class = "btn-sm btn-outline-primary")
               )
             ),
@@ -863,9 +1011,42 @@ ui <- page_navbar(
 
         h6("Perimeter Data Source"),
         selectInput("perimeter_source", NULL,
-          choices = c("FIRED (MODIS daily, recommended)" = "fired",
-                      "GeoMAC (historic, 2000-2018)"     = "geomac"),
-          selected = "fired"),
+          choices = c("NIROPS (airborne IR, 2020-2024, recommended)" = "nirops",
+                      "FIRED (MODIS daily, 2001-2019)"               = "fired",
+                      "GeoMAC (historic, 2000-2018)"                 = "geomac"),
+          selected = "nirops"),
+
+        conditionalPanel(
+          "input.perimeter_source == 'nirops'",
+          h6("NIROPS Perimeter Shapefile"),
+          p(class = "text-muted small",
+            "Airborne infrared perimeters interpreted by trained IR specialists ",
+            "(Magstadt et al. 2026). Far more accurate fire-edge geometry than ",
+            "500 m MODIS products, and perimeters are already cumulative. ",
+            tags$a("Mendeley Data",
+                   href = "https://data.mendeley.com/datasets/95rj5d379g/1",
+                   target = "_blank"),
+            " — NIROPS_2020_2024_R1_R6.shp"),
+          textInput("nirops_shp_path", label = NULL,
+                    placeholder = "/path/to/NIROPS_2020_2024_R1_R6.shp"),
+          div(class = "alert alert-info py-2 small",
+            icon("circle-info"), " Covers western CONUS (USFS Regions 1-6), ",
+            tags$b("2020-05-12 to 2024-12-17"), ". Set the Calibration Period to ",
+            "overlap this window, and use a GRIDMET-derived FWI source ",
+            "(ERA-Interim FWI ends in 2018)."),
+          numericInput("nirops_min_fire_ha", "Min Fire Size (ha)",
+                       value = 100, min = 1),
+          numericInput("nirops_min_detection_days", "Min Detection Days",
+                       value = 3, min = 1, max = 30, step = 1),
+          numericInput("nirops_simplify_m", "Geometry Simplify Tolerance (m)",
+                       value = 45, min = 0, max = 500, step = 5),
+          p(class = "text-muted small",
+            "NIROPS polygons average ~40,000 vertices (max 255,000) — far finer ",
+            "than the spread grid. Simplifying at roughly half the cell size ",
+            "removes ~97% of vertices with no meaningful loss after ",
+            "rasterization, and is what keeps memory use manageable. ",
+            "Set to 0 to disable.")
+        ),
 
         conditionalPanel(
           "input.perimeter_source == 'geomac'",
@@ -1046,6 +1227,25 @@ ui <- page_navbar(
                      value = 0, min = 0, max = 60, step = 1),
         p(class = "text-muted small",
           "Pairs/events with FWI below this threshold are excluded before fitting."),
+
+        hr(),
+        h6("Spread Probability — Calibration Level"),
+        radioButtons(
+          "sp_aggregation_level",
+          NULL,
+          choices  = c("Fire-day aggregate (recommended)" = "fire_day",
+                       "Cell-level (original)"            = "cell"),
+          selected = "fire_day"
+        ),
+        p(class = "text-muted small",
+          tags$b("Fire-day:"), " For each perimeter pair, model the fraction of ",
+          "candidate cells that burned using a weighted binomial GLM. Reduces noise ",
+          "from 2M+ binary samples to ~1 observation per fire-day. EDA showed cell-level ",
+          "AUC ≈ 0.50 (no signal); fire-day aggregation is expected to reveal real ",
+          "FWI and EWS effects. B2 (FineFuels) is always 0 in this mode. ",
+          tags$b("Cell-level:"), " Original method — millions of binary raster samples ",
+          "per pair. Use if you need B2 from LANDFIRE fine fuels data."
+        ),
 
         hr(),
         h6("Predictor Selection — Spread Probability"),
@@ -1347,6 +1547,41 @@ ui <- page_navbar(
 
           nav_panel("Diagnostics",
             br(),
+            div(class = "alert alert-info py-2 small",
+              icon("circle-info"), " ",
+              tags$b("Start with the percolation panel below."),
+              " SCF spread is a single-trial percolation process — each cell gets ",
+              "exactly one spread test per fire event (FireEvent.cs:495). Fires only ",
+              "propagate when P clears the lattice threshold, so a coefficient set can ",
+              "look statistically fine while placing the crossing outside the FWI range ",
+              "your landscape ever experiences."),
+            plotOutput("spread_percolation_plot", height = "460px"),
+            br(),
+            downloadButton("dl_spread_percolation", "Download PNG (300 dpi)",
+                           class = "btn-sm btn-outline-secondary"),
+            hr(),
+            h6(icon("calculator"), " B0 Target Calculator"),
+            p(class = "text-muted small",
+              "B0 is not identifiable from the regression — case-control sampling ",
+              "biases the intercept (only slopes are consistent), and the observable ",
+              "(daily perimeter change) is jointly set by P and MaximumSpreadArea. ",
+              "Pick what fraction of fire-days should propagate and solve for B0, ",
+              "keeping the fitted slopes."),
+            fluidRow(
+              column(4,
+                numericInput("b0_target_pct", "% of fire-days supercritical",
+                             value = 10, min = 0.5, max = 50, step = 0.5)),
+              column(4,
+                radioButtons("b0_fwi_source", "FWI distribution to target",
+                  choices = c("Calibration FWI" = "cal", "Runtime FWI (LANDIS)" = "runtime"),
+                  selected = "cal")),
+              column(4,
+                div(style = "padding-top:28px;",
+                    actionButton("calc_b0", "Calculate B0",
+                                 class = "btn-sm btn-outline-primary w-100")))
+            ),
+            uiOutput("b0_calc_result"),
+            hr(),
             fluidRow(
               column(6,
                 h6("Spread Probability vs FWI"),
@@ -1900,12 +2135,36 @@ ui <- page_navbar(
 
           nav_panel("Fire Size Distribution",
             br(),
+            div(class = "alert alert-info py-2 small",
+              icon("circle-info"), " ",
+              tags$b("This is the primary spread calibration target."),
+              " Fire size is scale-free — a 5,000 ha fire is a 5,000 ha fire ",
+              "regardless of surrounding landscape size — so unlike annual area ",
+              "burned it compares directly between the large calibration boundary ",
+              "and a park-sized LANDIS landscape."),
+            h6(class = "mt-2", icon("chart-simple"), " Fire Size Boxplot"),
             p(class = "text-muted small",
-              "Empirical cumulative distribution functions (ECDF) of individual ",
-              "fire sizes.  Observed = FPA FOD fires within the calibration boundary. ",
-              "Simulated = all SCF events across all simulation years converted to ha. ",
-              "Curves that overlap indicate the model reproduces the observed fire ",
-              "size distribution."),
+              "Individual fire sizes on a log scale. Up to three boxes are shown: ",
+              tags$b("Cal. boundary"), " = every FPA FOD fire inside the calibration ",
+              "boundary (large sample); ", tags$b("LANDIS extent"), " = only fires ",
+              "inside your template raster — the like-for-like comparison, but a much ",
+              "smaller sample (load it on the Ignition tab under Option B); ",
+              tags$b("Simulated"), " = SCF events. The ratio line compares the ",
+              "simulation against the LANDIS-extent fires when available. ",
+              "All series are restricted to fires at least one cell in size, since ",
+              "SCF cannot produce anything smaller and FPA FOD contains many ",
+              "sub-hectare records. Match the median and IQR first, then p90 — the ",
+              "maximum is bounded by landscape area and will always fall short."),
+            plotOutput("val_size_box_plot", height = "460px"),
+            br(),
+            downloadButton("dl_val_size_box", "Download PNG (300 dpi)",
+                           class = "btn-sm btn-outline-secondary"),
+            hr(),
+            h6(class = "mt-2", icon("chart-line"), " Cumulative Distribution (ECDF)"),
+            p(class = "text-muted small",
+              "Empirical cumulative distribution functions of the same fire sizes. ",
+              "Curves that overlap indicate the model reproduces the observed ",
+              "size distribution across its whole range, not just at the median."),
             plotOutput("val_ecdf_plot", height = "450px"),
             br(),
             downloadButton("dl_val_ecdf", "Download PNG (300 dpi)",
@@ -1914,6 +2173,15 @@ ui <- page_navbar(
 
           nav_panel("Annual Area Burned",
             br(),
+            div(class = "alert alert-warning py-2 small",
+              icon("triangle-exclamation"), " ",
+              tags$b("Annual area burned does not transfer across spatial scales."),
+              " It scales with landscape area, so the calibration boundary and the ",
+              "LANDIS landscape cannot produce comparable totals even when the fire ",
+              "regime is identical. Use the ", tags$b("Calibration Boundary"),
+              " panel only for observed context; the ", tags$b("LANDIS Landscape"),
+              " panel below is the like-for-like comparison. For tuning spread ",
+              "parameters, prefer the ", tags$b("Fire Size Distribution"), " tab."),
             p(class = "text-muted small",
               "Two separate comparisons at different spatial scales.  ",
               tags$b("Top:"), " observed fires across the full calibration boundary (all FPA FOD ",
@@ -2004,11 +2272,50 @@ ui <- page_navbar(
             ),
             br(),
             downloadButton("dl_val_severity", "Download PNG (300 dpi)",
+                           class = "btn-sm btn-outline-secondary"),
+            hr(),
+            h6(class = "mt-2", icon("wind"), " Severity – Climate Relationship"),
+            p(class = "text-muted small",
+              tags$b("Panel A (effective wind speed) is the one to calibrate to."),
+              " SCF derives dNBR from its site-mortality sub-model, a gamma GLM over ",
+              "clay, previous-year PET, effective wind speed, climatic water deficit, ",
+              "fine fuels and ladder fuels. Effective wind speed is the ",
+              tags$b("only fire-weather term in that equation"), ", so ",
+              tags$code("SiteMortalityB3"), " is the single lever controlling how ",
+              "severity responds to weather."),
+            p(class = "text-muted small",
+              tags$b("Panel B (FWI) is diagnostic only."), " FWI never enters the dNBR ",
+              "calculation, so a mismatch there cannot be tuned away directly — it ",
+              "reflects how FWI and effective wind covary in the climate record, and ",
+              "how well the spread model is placing fires in the right weather. ",
+              "Observed EWS is computed from wind on the MTBS ignition date plus ",
+              "terrain at the burn centroid, using the same Nelson (2002) formula SCF ",
+              "applies internally, so requires wind and terrain to be loaded."),
+            plotOutput("val_severity_climate_plot", height = "620px"),
+            br(),
+            downloadButton("dl_val_severity_climate", "Download PNG (300 dpi)",
                            class = "btn-sm btn-outline-secondary")
           ),
 
           nav_panel("Fire Duration",
             br(),
+            h6(class = "mt-2", icon("code-compare"), " Observed vs Simulated"),
+            p(class = "text-muted small",
+              "Observed duration comes from FPA FOD as ",
+              tags$code("CONT_DATE - DISCOVERY_DATE + 1"),
+              " (available for ~89% of records). Both series are restricted to fires ",
+              "of at least one LANDIS cell, because ~78% of FPA FOD records are under ",
+              "1 ha and would otherwise pull the observed median to zero. ",
+              tags$b("Read this as a ballpark check, not an exact match:"),
+              " containment date is an upper bound on active spread — mop-up and ",
+              "administrative closure inflate the observed tail — so observed ",
+              "durations should run somewhat longer than SCF's spread duration."),
+            plotOutput("val_duration_compare_plot", height = "430px"),
+            br(),
+            downloadButton("dl_val_duration_compare", "Download PNG (300 dpi)",
+                           class = "btn-sm btn-outline-secondary"),
+            hr(),
+            h6(class = "mt-2", icon("chart-column"), " Simulated Distribution"),
             p(class = "text-muted small",
               "Distribution of fire duration (days) from SCF events, faceted by ",
               "ignition type.  Green line = median; orange dashed = 90th percentile. ",
@@ -2615,10 +2922,18 @@ server <- function(input, output, session) {
   # Helper: map input ID to its tab name for the session preview table
   tab_for_input <- function(id) {
     landscape <- c("tif_path","shp_path","cal_years","era_fwi_path","era_ffmc_path",
-                   "era_dmc_path","era_dc_path")
+                   "era_dmc_path","era_dc_path","fwi_source","gridmet_cache_dir",
+                   "gridmet_agg_fact","gridmet_reset_mmdd","gridmet_convention",
+                   "gridmet_init_ffmc","gridmet_init_dmc","gridmet_init_dc",
+                   "gridmet_precip_scale","climlib_version","landis_climate_path",
+                   "landis_precip_units","landis_patched","landis_ffmc","landis_dmc",
+                   "landis_dc","landis_firstday","landis_lastday")
     ignition  <- c("fpa_gdb_path","ign_distribution","kernel_bw","kernel_maxdist",
                    "scale_method")
-    spread    <- c("geomac_gdb_path","spread_res_m","max_samples_per_pair",
+    spread    <- c("geomac_gdb_path","perimeter_source","nirops_shp_path",
+                   "nirops_min_fire_ha","nirops_min_detection_days",
+                   "nirops_simplify_m",
+                   "spread_res_m","max_samples_per_pair",
                    "max_gap_spread_prob","max_gap_daily_area","failure_sample_ratio",
                    "search_gap_sp","search_gap_da","search_max_samples",
                    "search_fail_ratio","search_neg_tol","search_w_auc","search_w_r2",
@@ -2689,6 +3004,7 @@ server <- function(input, output, session) {
     spread_prob_coef    = NULL,
     spread_prob_model   = NULL,
     spread_prob_samples = NULL,
+    landis_fwi          = NULL,   # runtime FWI from the LANDIS climate file
     max_area_fit        = NULL,   # full fit object from fit_max_daily_area()
     max_area_coef       = NULL,
     spread_da_model     = NULL,
@@ -2890,6 +3206,28 @@ server <- function(input, output, session) {
     req(rv$cal_vect)
     req(nchar(trimws(input$era_fwi_path)) > 0)
 
+    # The cal_years slider spans 1980-2024 to accommodate GRIDMET, but the
+    # ERA-Interim FWI product (Vitolo et al. 2019) ends in 2018.  Without this
+    # guard, selecting a post-2018 range silently yields no usable layers.
+    ERA_LAST_YEAR <- 2018L
+    if (input$cal_years[1] > ERA_LAST_YEAR) {
+      output$era_fwi_status <- renderUI(
+        tags$span(class = "text-danger small", icon("xmark"),
+          sprintf(" Calibration period starts in %d but ERA-Interim FWI ends in %d. ",
+                  input$cal_years[1], ERA_LAST_YEAR),
+          "Switch the FWI source to GRIDMET-derived, or move the period back.")
+      )
+      return()
+    }
+    if (input$cal_years[2] > ERA_LAST_YEAR) {
+      showNotification(
+        sprintf(paste("ERA-Interim FWI ends in %d — years %d-%d will have no FWI data.",
+                      "Use the GRIDMET-derived source to cover them."),
+                ERA_LAST_YEAR, ERA_LAST_YEAR + 1L, input$cal_years[2]),
+        type = "warning", duration = 12
+      )
+    }
+
     paths <- list(FWI  = input$era_fwi_path,
                   FFMC = input$era_ffmc_path,
                   DMC  = input$era_dmc_path,
@@ -2924,6 +3262,74 @@ server <- function(input, output, session) {
       }, error = function(e) {
         output$era_fwi_status <- renderUI(
           tags$span(class = "text-danger small", icon("xmark"), " ", conditionMessage(e))
+        )
+      })
+    })
+  })
+
+  # ---------------------------------------------------------------------------
+  # 3b) Compute GRIDMET-derived FWI (cffdrs) — covers 1979-present
+  # ---------------------------------------------------------------------------
+
+  observeEvent(input$compute_gridmet_fwi_btn, {
+    req(rv$cal_vect)
+
+    cal_start <- as.Date(sprintf("%d-01-01", input$cal_years[1]))
+    cal_end   <- as.Date(sprintf("%d-12-31", input$cal_years[2]))
+    n_years   <- input$cal_years[2] - input$cal_years[1] + 1
+
+    output$gridmet_fwi_status <- renderUI(
+      tags$span(class = "text-warning small",
+                icon("spinner", class = "fa-spin"),
+                sprintf(" Fetching + computing FWI for %d year(s). Cached years are fast; new years take ~30-45 min each.",
+                        n_years))
+    )
+
+    # Resolve cache dir relative to the app directory when not absolute
+    cdir <- trimws(input$gridmet_cache_dir)
+    if (nchar(cdir) == 0) cdir <- "gridmet_cache"
+    if (!grepl("^(/|~|[A-Za-z]:)", cdir)) cdir <- file.path(getwd(), cdir)
+
+    withProgress(message = "GRIDMET FWI...", value = 0, {
+      tryCatch({
+        res <- compute_gridmet_fwi(
+          cal_vect    = rv$cal_vect,
+          cal_start   = cal_start,
+          cal_end     = cal_end,
+          agg_fact    = as.integer(input$gridmet_agg_fact),
+          reset_mmdd  = trimws(input$gridmet_reset_mmdd),
+          init_ffmc   = as.numeric(input$gridmet_init_ffmc),
+          init_dmc    = as.numeric(input$gridmet_init_dmc),
+          init_dc     = as.numeric(input$gridmet_init_dc),
+          convention  = input$gridmet_convention,
+          precip_scale = switch(input$climlib_version,
+                                 fixed    = 1.0,
+                                 prepatch = 0.1,
+                                 manual   = as.numeric(input$gridmet_precip_scale),
+                                 1.0),
+          cache_dir   = cdir,
+          progress_fn = function(i, n, yr) {
+            setProgress(i / n, detail = sprintf("Year %d (%d of %d)", yr, i, n))
+          }
+        )
+
+        rv$era_fwi_daily  <- res$FWI
+        rv$era_ffmc_daily <- res$FFMC
+        rv$era_dmc_daily  <- res$DMC
+        rv$era_dc_daily   <- res$DC
+
+        output$gridmet_fwi_status <- renderUI(
+          tags$span(class = "text-success small", icon("check"),
+                    sprintf(" %d daily FWI values | range %.1f - %.1f | cache: %s",
+                            nrow(res$FWI),
+                            min(res$FWI$value, na.rm = TRUE),
+                            max(res$FWI$value, na.rm = TRUE),
+                            cdir))
+        )
+      }, error = function(e) {
+        output$gridmet_fwi_status <- renderUI(
+          tags$span(class = "text-danger small", icon("xmark"), " ",
+                    conditionMessage(e))
         )
       })
     })
@@ -3164,10 +3570,19 @@ server <- function(input, output, session) {
   # Scale Adjustment — auto-compute Option A whenever calibration completes
   # ---------------------------------------------------------------------------
 
+  # Landscape areas depend only on the boundary + template, so compute them as
+  # soon as both exist.  They were previously derived only inside the ignition
+  # observer below, which meant the Model Validation landscape-area reference
+  # line silently went missing for anyone who had not run ignition calibration.
+  observeEvent(list(rv$cal_vect_proj, rv$template_r), {
+    req(rv$cal_vect_proj, rv$template_r)
+    rv$landscape_areas <- compute_landscape_areas(rv$cal_vect_proj, rv$template_r)
+  }, ignoreInit = TRUE)
+
   observeEvent(rv$ign_coef, {
     req(rv$cal_vect_proj, rv$template_r, rv$ign_coef, rv$era_fwi_daily)
 
-    # Landscape areas (used by both options)
+    # Landscape areas (recomputed here too so Option A/B always see fresh values)
     rv$landscape_areas <- compute_landscape_areas(rv$cal_vect_proj, rv$template_r)
 
     # Default adjusted coef = Option A (area offset)
@@ -3278,12 +3693,26 @@ server <- function(input, output, session) {
 
   # -- Adjusted coefficients table --------------------------------------------
   output$adjusted_coef_table <- renderDT({
-    req(rv$ign_coef_adjusted)
+    req(rv$ign_coef_adjusted, rv$ign_coef)
+    # Join regional b0 so user can see exactly what changed
+    regional_b0 <- rv$ign_coef %>%
+      select(ignition_type, b0_regional = b0)
+
     rv$ign_coef_adjusted %>%
-      select(ignition_type, distribution, b0, b1, bz0, bz1) %>%
+      select(ignition_type, distribution, b0_adjusted = b0, b1, bz0, bz1) %>%
+      left_join(regional_b0, by = "ignition_type") %>%
+      select(ignition_type, distribution, b0_regional, b0_adjusted, b1, bz0, bz1) %>%
       mutate(across(where(is.numeric), ~round(.x, 6))) %>%
-      datatable(options = list(dom = "t", paging = FALSE),
-                rownames = FALSE, class = "table-sm table-striped")
+      datatable(
+        options = list(dom = "t", paging = FALSE),
+        rownames = FALSE,
+        class    = "table-sm table-striped"
+      ) %>%
+      formatStyle(
+        "b0_adjusted",
+        backgroundColor = "#fff3cd",   # yellow highlight — this column changed
+        fontWeight = "bold"
+      )
   })
 
   output$dl_adjusted_coef <- downloadHandler(
@@ -3467,6 +3896,52 @@ server <- function(input, output, session) {
     plot_val_ignitions(exp_df, rv$simulated_events)
   })
 
+  # Fire size distribution — the scale-free spread calibration target.
+  # Unlike annual area burned, this compares directly between the large
+  # calibration boundary and the much smaller LANDIS landscape.
+  .val_size_plot <- reactive({
+    req(rv$simulated_events)
+
+    # Two observed populations where available:
+    #   cal boundary  \u2014 every FPA FOD fire inside cal_vect (large sample)
+    #   LANDIS extent \u2014 only fires inside the template raster (like-for-like
+    #                   with the simulation, but a much smaller sample)
+    # The landscape series is passed LAST so the ratio line in the subtitle
+    # compares the simulation against the spatially matched population.
+    obs_list <- list()
+    if (!is.null(rv$ign_df) && "FIRE_SIZE_HA" %in% names(rv$ign_df))
+      obs_list[["Observed \u2014 Cal. boundary"]] <- rv$ign_df$FIRE_SIZE_HA
+    if (!is.null(rv$park_ign_df) && "FIRE_SIZE_HA" %in% names(rv$park_ign_df))
+      obs_list[["Observed \u2014 LANDIS extent"]] <- rv$park_ign_df$FIRE_SIZE_HA
+
+    # SCF's smallest possible fire is one cell; match the observed lower bound
+    # to it so the distributions start from the same place.  Driven by the
+    # template raster resolution, overridable via the Cell Area input.
+    cell_ha <- if (!is.null(input$val_cell_area_ha) &&
+                   !is.na(input$val_cell_area_ha) && input$val_cell_area_ha > 0)
+      input$val_cell_area_ha
+    else if (!is.null(rv$cell_area_ha)) rv$cell_area_ha else 0.81
+
+    plot_val_fire_size(
+      obs_sizes_ha  = if (length(obs_list)) obs_list else NULL,
+      sim_events_df = rv$simulated_events,
+      min_ha        = cell_ha,
+      landscape_ha  = if (!is.null(rv$landscape_areas))
+                        rv$landscape_areas$tmpl_area_ha else NULL,
+      plot_title    = "Fire Size Distribution \u2014 Observed vs Simulated"
+    )
+  })
+
+  output$val_size_box_plot <- renderPlot({ .val_size_plot() })
+
+  output$dl_val_size_box <- downloadHandler(
+    filename = "validation_fire_size_distribution.png",
+    content  = function(f) {
+      p <- .val_size_plot(); req(p)
+      ggsave(f, p, width = 9, height = 6.5, dpi = 300, bg = "white")
+    }
+  )
+
   output$val_ecdf_plot <- renderPlot({
     req(rv$simulated_events)
     fpa_sizes <- if (!is.null(rv$ign_df)) rv$ign_df$FIRE_SIZE_HA else NULL
@@ -3508,23 +3983,23 @@ server <- function(input, output, session) {
 
   output$val_fwi_size_plot <- renderPlot({
     req(rv$simulated_events)
-    # Pass landscape areas so fire sizes are normalised to % of landscape —
-    # this removes the spatial scale mismatch between FPA FOD (14M ha) and LANDIS
-    cal_ha  <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$cal_area_ha  else NULL
-    tmpl_ha <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$tmpl_area_ha else NULL
+    # Plot raw hectares.  This previously normalised observed by the calibration
+    # boundary area and simulated by the (much smaller) template area — two
+    # DIFFERENT divisors, which inflated the simulated series by the ratio
+    # between them (~79x here) and made the comparison meaningless.  Fire size
+    # in hectares is directly comparable regardless of landscape size.
     plot_val_fire_climate(rv$ign_df, rv$simulated_events,
                           rv$era_fwi_daily,
-                          cal_area_ha  = cal_ha,
-                          tmpl_area_ha = tmpl_ha,
+                          cal_area_ha  = NULL,
+                          tmpl_area_ha = NULL,
                           min_ha       = 4,
                           plot_title   = "Fire Size – Climate Relationship (Calibration Boundary)")
   })
 
-  # LANDIS-landscape-scale fire-climate: observed from park_ign_df,
-  # both obs and sim normalised to template area for a direct comparison.
+  # LANDIS-landscape-scale fire-climate: observed from park_ign_df.
+  # Both series in hectares — same spatial domain, so no normalisation needed.
   output$val_fwi_size_park_plot <- renderPlot({
     req(rv$simulated_events)
-    tmpl_ha <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$tmpl_area_ha else NULL
     # Fall back to a placeholder if park fires not yet loaded
     if (is.null(rv$park_ign_df)) {
       return(ggplot() +
@@ -3535,11 +4010,10 @@ server <- function(input, output, session) {
                labs(title = "Fire Size – Climate Relationship (LANDIS Landscape)") +
                theme_void() + theme(plot.title = element_text(size = 13, face = "bold")))
     }
-    # Both observed and simulated normalised to the same template area
     plot_val_fire_climate(rv$park_ign_df, rv$simulated_events,
                           rv$era_fwi_daily,
-                          cal_area_ha  = tmpl_ha,   # obs normalised to template area
-                          tmpl_area_ha = tmpl_ha,
+                          cal_area_ha  = NULL,
+                          tmpl_area_ha = NULL,
                           min_ha       = 4,
                           plot_title   = "Fire Size – Climate Relationship (LANDIS Landscape)")
   })
@@ -3573,6 +4047,24 @@ server <- function(input, output, session) {
         cache_dir   = tempdir(),
         progress_fn = function(msg) message(msg)
       )
+      # Attach EWS + FWI to observed fires so severity can be validated against
+      # fire weather.  EWS uses the burn-boundary centroid terrain and the wind
+      # on the ignition date, matching how SCF derives it internally.
+      mtbs <- tryCatch(
+        add_mtbs_climate(
+          mtbs,
+          wind_daily  = rv$wind_daily,
+          fwi_daily   = rv$era_fwi_daily,
+          slope_r     = rv$slope_r,
+          aspect_r    = rv$aspect_r,
+          working_crs = rv$working_crs,
+          combustion_buoyancy = as.numeric(input$combustion_buoyancy)
+        ),
+        error = function(e) {
+          message("add_mtbs_climate failed: ", conditionMessage(e)); mtbs
+        }
+      )
+
       rv$mtbs_fires <- mtbs
       n_fires   <- nrow(mtbs)
       has_dnbr  <- "MeanDNBR_obs" %in% names(mtbs) &&
@@ -3608,6 +4100,36 @@ server <- function(input, output, session) {
     plotOutput("val_severity_plot", height = h)
   })
 
+  # Severity vs fire weather.  Panel A (EWS) is the calibratable relationship —
+  # effective wind speed is the only weather term in SCF's dNBR model, tuned via
+  # SiteMortalityB3.  Panel B (FWI) is diagnostic; FWI never enters that equation.
+  .val_sev_climate <- reactive({
+    req(rv$simulated_events)
+    plot_val_severity_climate(rv$simulated_events, rv$mtbs_fires)
+  })
+
+  output$val_severity_climate_plot <- renderPlot({
+    p <- .val_sev_climate()
+    if (is.null(p)) {
+      return(ggplot() +
+        annotate("text", x = 0.5, y = 0.5, size = 4.5, hjust = 0.5,
+                 label = paste0(
+                   "Severity-climate comparison unavailable.\n\n",
+                   "Needs MeanDNBR + MeanEffectiveWindSpeed in the SCF events log,\n",
+                   "and (for the observed series) MTBS fetched with wind and terrain loaded.")) +
+        theme_void())
+    }
+    p
+  })
+
+  output$dl_val_severity_climate <- downloadHandler(
+    filename = "validation_severity_climate.png",
+    content  = function(f) {
+      p <- .val_sev_climate(); req(p)
+      ggsave(f, p, width = 9, height = 9, dpi = 300, bg = "white")
+    }
+  )
+
   output$val_severity_plot <- renderPlot({
     req(rv$simulated_events)
     plot_val_severity(rv$simulated_events, rv$mtbs_fires)
@@ -3617,6 +4139,28 @@ server <- function(input, output, session) {
     req(rv$simulated_events)
     plot_val_duration(rv$simulated_events)
   })
+
+  # Observed vs simulated duration.  Observed comes from FPA FOD containment
+  # dates; both series are size-matched to one LANDIS cell so the 78% of FPA FOD
+  # records under 1 ha (which SCF cannot represent) do not skew the comparison.
+  .val_duration_cmp <- reactive({
+    req(rv$simulated_events)
+    cell_ha <- if (!is.null(input$val_cell_area_ha) &&
+                   !is.na(input$val_cell_area_ha) && input$val_cell_area_ha > 0)
+      input$val_cell_area_ha
+    else if (!is.null(rv$cell_area_ha)) rv$cell_area_ha else 0.81
+    plot_val_duration_compare(rv$ign_df, rv$simulated_events, min_ha = cell_ha)
+  })
+
+  output$val_duration_compare_plot <- renderPlot({ .val_duration_cmp() })
+
+  output$dl_val_duration_compare <- downloadHandler(
+    filename = "validation_fire_duration_comparison.png",
+    content  = function(f) {
+      p <- .val_duration_cmp(); req(p)
+      ggsave(f, p, width = 9, height = 6, dpi = 300, bg = "white")
+    }
+  )
 
   # -- Individual panel downloads (PNG 300 dpi) --------------------------------
 
@@ -3669,12 +4213,10 @@ server <- function(input, output, session) {
   output$dl_val_fwi_size <- .make_val_png_handler(
     function() {
       req(rv$simulated_events)
-      cal_ha  <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$cal_area_ha  else NULL
-      tmpl_ha <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$tmpl_area_ha else NULL
       plot_val_fire_climate(rv$ign_df, rv$simulated_events,
                             rv$era_fwi_daily,
-                            cal_area_ha  = cal_ha,
-                            tmpl_area_ha = tmpl_ha,
+                            cal_area_ha  = NULL,
+                            tmpl_area_ha = NULL,
                             min_ha       = 4)
     },
     "validation_fire_climate_relationship.png"
@@ -3967,11 +4509,9 @@ server <- function(input, output, session) {
                                         year_max   = input$cal_years[2]),
                    error = function(e) NULL),
         "04_fire_climate"           = {
-          cal_ha  <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$cal_area_ha  else NULL
-          tmpl_ha <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$tmpl_area_ha else NULL
           tryCatch(plot_val_fire_climate(rv$ign_df, rv$simulated_events,
                                          rv$era_fwi_daily,
-                                         cal_area_ha = cal_ha, tmpl_area_ha = tmpl_ha,
+                                         cal_area_ha = NULL, tmpl_area_ha = NULL,
                                          min_ha = 4),
                    error = function(e) NULL)
         },
@@ -4047,6 +4587,8 @@ server <- function(input, output, session) {
         rv$era_fwi_daily, rv$wind_daily)
     if (input$perimeter_source == "geomac") {
       req(nchar(trimws(input$geomac_gdb_path)) > 0)
+    } else if (input$perimeter_source == "nirops") {
+      req(nchar(trimws(input$nirops_shp_path)) > 0)
     } else {
       req(nchar(trimws(input$fired_gpkg_path)) > 0)
     }
@@ -4069,6 +4611,18 @@ server <- function(input, output, session) {
             working_crs = rv$working_crs,
             cal_start   = as.Date(sprintf("%d-01-01", input$cal_years[1])),
             cal_end     = as.Date(sprintf("%d-12-31", input$cal_years[2]))
+          )
+        } else if (input$perimeter_source == "nirops") {
+          load_nirops_perimeters(
+            nirops_shp         = input$nirops_shp_path,
+            cal_vect           = rv$cal_vect_proj,
+            working_crs        = rv$working_crs,
+            cal_start          = as.Date(sprintf("%d-01-01", input$cal_years[1])),
+            cal_end            = as.Date(sprintf("%d-12-31", input$cal_years[2])),
+            min_fire_ha        = input$nirops_min_fire_ha,
+            min_detection_days = as.integer(input$nirops_min_detection_days),
+            simplify_m         = if (isTRUE(input$nirops_simplify_m > 0))
+                                   input$nirops_simplify_m else NULL
           )
         } else {
           load_fired_perimeters(
@@ -4267,9 +4821,10 @@ server <- function(input, output, session) {
         min_pct_proximal = input$min_pct_proximal,
         n_cores          = if (is.na(input$n_cores)) NULL else as.integer(input$n_cores),
         progress_fn      = NULL,
-        cal_months       = cal_months_sel,
-        fwi_min          = if (isTRUE(input$fwi_min > 0)) input$fwi_min else NULL,
-        predictors       = input$sp_predictors
+        cal_months        = cal_months_sel,
+        fwi_min           = if (isTRUE(input$fwi_min > 0)) input$fwi_min else NULL,
+        predictors        = input$sp_predictors,
+        aggregation_level = input$sp_aggregation_level
       )
       rv$spread_prob_fit     <- sp_fit           # full fit object (coef + model + samples + wind_predictor)
       rv$spread_prob_coef    <- sp_fit$coef
@@ -4277,10 +4832,19 @@ server <- function(input, output, session) {
       rv$spread_prob_samples <- sp_fit$samples
 
       setProgress(1.0)
+      agg_lv  <- sp_fit$aggregation_level
+      fit_r2  <- sp_fit$r2
+      fit_auc <- sp_fit$auc
+      fit_n   <- sp_fit$n_obs
+      fit_np  <- sp_fit$n_pairs
+      metric_lbl <- if (agg_lv == "fire_day")
+        sprintf("Weighted R² = %.3f | %d fire-days", fit_r2, fit_np)
+      else
+        sprintf("AUC = %.3f | %d cell samples | %d pairs", fit_auc, fit_n, fit_np)
+
       output$spread_fit_status <- renderUI(
         tags$span(class = "text-success small", icon("check"),
-                  sprintf(" Complete. %d perimeter pairs processed.",
-                          nrow(climate_joined$pairs)))
+                  sprintf(" Complete [%s]. %s.", agg_lv, metric_lbl))
       )
     })
   })
@@ -4887,6 +5451,113 @@ server <- function(input, output, session) {
   # Diagnostics tab outputs
   # ---------------------------------------------------------------------------
 
+  # ---- Runtime FWI from the LANDIS climate file -------------------------------
+  observeEvent(input$load_landis_fwi, {
+    req(nchar(trimws(input$landis_climate_path)) > 0)
+    output$landis_fwi_status <- renderUI(
+      tags$span(class = "text-warning small",
+                icon("spinner", class = "fa-spin"), " Computing runtime FWI...")
+    )
+    withProgress(message = "LANDIS climate FWI...", value = 0, {
+      tryCatch({
+        res <- compute_landis_climate_fwi(
+          csv_path        = trimws(input$landis_climate_path),
+          init_ffmc       = as.numeric(input$landis_ffmc),
+          init_dmc        = as.numeric(input$landis_dmc),
+          init_dc         = as.numeric(input$landis_dc),
+          first_day       = as.integer(input$landis_firstday),
+          last_day        = as.integer(input$landis_lastday),
+          precip_units    = input$landis_precip_units,
+          library_patched = identical(input$landis_patched, "yes"),
+          progress_fn     = function(msg) setProgress(0.5, detail = msg)
+        )
+        rv$landis_fwi <- res
+        v   <- res$FWI$value
+        vjs <- v[lubridate::month(res$FWI$date) %in% 7:9]
+        output$landis_fwi_status <- renderUI(
+          tags$span(class = "text-success small", icon("check"),
+            sprintf(" %s days | all-year median %.1f | Jul-Sep median %.1f, p90 %.1f, max %.1f",
+                    scales::comma(nrow(res$FWI)),
+                    median(v, na.rm = TRUE),
+                    median(vjs, na.rm = TRUE),
+                    quantile(vjs, 0.9, na.rm = TRUE),
+                    max(v, na.rm = TRUE)))
+        )
+      }, error = function(e) {
+        output$landis_fwi_status <- renderUI(
+          tags$span(class = "text-danger small", icon("xmark"), " ", conditionMessage(e))
+        )
+      })
+    })
+  })
+
+  # ---- Percolation diagnostic ------------------------------------------------
+  # The single most useful spread diagnostic: shows the fitted P(spread) curve
+  # against the lattice percolation threshold, with the FWI distribution(s)
+  # underneath so it is immediately visible what fraction of fire-days can
+  # actually propagate.
+  .spread_perc_plot <- reactive({
+    req(rv$spread_prob_model, rv$spread_prob_samples)
+    plot_spread_percolation(
+      rv$spread_prob_model, rv$spread_prob_samples,
+      fwi_runtime = if (!is.null(rv$landis_fwi)) rv$landis_fwi$FWI$value else NULL
+    )
+  })
+
+  output$spread_percolation_plot <- renderPlot({
+    p <- .spread_perc_plot()
+    if (is.null(p)) {
+      return(ggplot() +
+        annotate("text", x = 0.5, y = 0.5, size = 4.5, hjust = 0.5,
+                 label = "Run the spread calibration to see the percolation diagnostic.") +
+        theme_void())
+    }
+    p
+  })
+
+  output$dl_spread_percolation <- downloadHandler(
+    filename = "spread_percolation_diagnostic.png",
+    content  = function(f) {
+      p <- .spread_perc_plot(); req(p)
+      ggsave(f, p, width = 9, height = 6.5, dpi = 300, bg = "white")
+    }
+  )
+
+  # ---- B0 target calculator ---------------------------------------------------
+  observeEvent(input$calc_b0, {
+    req(rv$spread_prob_model, rv$spread_prob_samples)
+    cf   <- coef(rv$spread_prob_model)
+    samp <- rv$spread_prob_samples
+
+    fwi_vec <- if (identical(input$b0_fwi_source, "runtime") && !is.null(rv$landis_fwi))
+      rv$landis_fwi$FWI$value else samp$FWI
+    src_lab <- if (identical(input$b0_fwi_source, "runtime") && !is.null(rv$landis_fwi))
+      "runtime (LANDIS climate file)" else "calibration"
+
+    res <- solve_spread_b0(
+      b1_fwi   = if ("FWI"           %in% names(cf)) cf[["FWI"]]           else 0,
+      b3_ews   = if ("EffectiveWind" %in% names(cf)) cf[["EffectiveWind"]] else 0,
+      b2_ff    = if ("FineFuels"     %in% names(cf)) cf[["FineFuels"]]     else 0,
+      fwi_vec  = fwi_vec,
+      ews_mean = if ("EffectiveWind" %in% names(samp)) mean(samp$EffectiveWind, na.rm = TRUE) else 0,
+      ff_mean  = if ("FineFuels"     %in% names(samp)) mean(samp$FineFuels,     na.rm = TRUE) else 0,
+      target_pct = as.numeric(input$b0_target_pct)
+    )
+
+    output$b0_calc_result <- renderUI({
+      if (is.null(res)) return(tags$span(class = "text-danger small",
+                                          "Could not solve \u2014 no usable FWI values."))
+      div(class = "alert alert-success py-2 small",
+        tags$b(sprintf("SpreadProbabilityB0 = %.4f", res$b0)), tags$br(),
+        sprintf("Targeting the %s FWI distribution. %s", src_lab, res$note), tags$br(),
+        tags$span(class = "text-muted",
+          "Slopes are unchanged \u2014 enter this B0 with your fitted B1/B2/B3, ",
+          "run SCF, and check the resulting fire-size distribution. Near the ",
+          "threshold fire size responds very steeply to B0, so expect to iterate.")
+      )
+    })
+  })
+
   output$spread_prob_fwi_plot <- renderPlot({
     req(rv$spread_prob_model, rv$spread_prob_samples)
     samp    <- rv$spread_prob_samples
@@ -4948,26 +5619,59 @@ server <- function(input, output, session) {
   })
 
   output$spread_roc_plot <- renderPlot({
-    req(rv$spread_prob_model, rv$spread_prob_samples)
-    samp  <- rv$spread_prob_samples
-    pred  <- predict(rv$spread_prob_model, samp, type = "response")
-    ord   <- order(pred, decreasing = TRUE)
-    y     <- samp$y[ord]
-    n_pos <- sum(y == 1);  n_neg <- sum(y == 0)
-    tpr   <- cumsum(y == 1) / n_pos
-    fpr   <- cumsum(y == 0) / n_neg
-    auc   <- sum(diff(c(0, fpr)) * (c(0, tpr[-length(tpr)]) + tpr) / 2)
-    roc_df <- data.frame(fpr = c(0, fpr, 1), tpr = c(0, tpr, 1))
-    ggplot(roc_df, aes(fpr, tpr)) +
-      geom_abline(slope = 1, intercept = 0,
-                  linetype = "dashed", color = "gray60") +
-      geom_line(color = "#c0392b", linewidth = 1) +
-      annotate("text", x = 0.65, y = 0.12,
-               label = sprintf("AUC = %.3f", auc), size = 4) +
-      scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
-      scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
-      labs(x = "False Positive Rate", y = "True Positive Rate") +
-      theme_bw(base_size = 11)
+    req(rv$spread_prob_model, rv$spread_prob_samples, rv$spread_prob_fit)
+    samp <- rv$spread_prob_samples
+    agg  <- rv$spread_prob_fit$aggregation_level
+
+    if (identical(agg, "fire_day")) {
+      # Fire-day mode: show observed vs predicted fraction burned
+      req("frac_burned" %in% names(samp), "n_burned" %in% names(samp))
+      samp$pred_frac <- predict(rv$spread_prob_model,
+                                newdata = samp, type = "response")
+      wt    <- samp$n_burned + samp$n_unburned
+      wmean <- stats::weighted.mean(samp$frac_burned, wt)
+      ss_tot <- sum(wt * (samp$frac_burned - wmean)^2)
+      ss_res <- sum(wt * (samp$frac_burned - samp$pred_frac)^2)
+      wt_r2  <- round(1 - ss_res / ss_tot, 3)
+
+      ggplot(samp, aes(pred_frac, frac_burned, size = wt)) +
+        geom_abline(slope = 1, intercept = 0,
+                    linetype = "dashed", colour = "gray60") +
+        geom_point(alpha = 0.6, colour = "#c0392b") +
+        scale_size_area(max_size = 6, guide = "none") +
+        annotate("text", x = 0.1, y = 0.9,
+                 label = sprintf("Weighted R² = %.3f", wt_r2),
+                 hjust = 0, size = 4) +
+        scale_x_continuous(labels = scales::percent_format(accuracy = 1),
+                            limits = c(0, 1)) +
+        scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                            limits = c(0, 1)) +
+        labs(x = "Predicted fraction burned", y = "Observed fraction burned",
+             subtitle = "Fire-day aggregation: each point = one perimeter pair") +
+        theme_bw(base_size = 11)
+
+    } else {
+      # Cell-level mode: standard ROC curve
+      req("y" %in% names(samp))
+      pred  <- predict(rv$spread_prob_model, samp, type = "response")
+      ord   <- order(pred, decreasing = TRUE)
+      y     <- samp$y[ord]
+      n_pos <- sum(y == 1);  n_neg <- sum(y == 0)
+      tpr   <- cumsum(y == 1) / n_pos
+      fpr   <- cumsum(y == 0) / n_neg
+      auc   <- sum(diff(c(0, fpr)) * (c(0, tpr[-length(tpr)]) + tpr) / 2)
+      roc_df <- data.frame(fpr = c(0, fpr, 1), tpr = c(0, tpr, 1))
+      ggplot(roc_df, aes(fpr, tpr)) +
+        geom_abline(slope = 1, intercept = 0,
+                    linetype = "dashed", color = "gray60") +
+        geom_line(color = "#c0392b", linewidth = 1) +
+        annotate("text", x = 0.65, y = 0.12,
+                 label = sprintf("AUC = %.3f", auc), size = 4) +
+        scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+        scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+        labs(x = "False Positive Rate", y = "True Positive Rate") +
+        theme_bw(base_size = 11)
+    }
   })
 
   output$max_area_scatter_plot <- renderPlot({
@@ -7288,6 +7992,19 @@ server <- function(input, output, session) {
     scale_method        = "radio",
     # -- Spread ------------------------------------------------------------------
     geomac_gdb_path     = "text",   spread_res_m      = "number",
+    perimeter_source    = "select", nirops_shp_path   = "text",
+    nirops_min_fire_ha  = "number", nirops_min_detection_days = "number",
+    nirops_simplify_m   = "number",
+    fwi_source          = "radio",  gridmet_cache_dir = "text",
+    gridmet_agg_fact    = "number", gridmet_reset_mmdd = "text",
+    gridmet_convention  = "radio",  gridmet_init_ffmc  = "number",
+    gridmet_init_dmc    = "number", gridmet_init_dc    = "number",
+    gridmet_precip_scale = "number", climlib_version = "radio",
+    landis_climate_path = "text",   landis_precip_units = "radio",
+    landis_patched      = "radio",  landis_ffmc      = "number",
+    landis_dmc          = "number", landis_dc        = "number",
+    landis_firstday     = "number", landis_lastday   = "number",
+    b0_target_pct       = "number", b0_fwi_source    = "radio",
     combustion_buoyancy = "select",
     max_samples_per_pair= "number", max_gap_spread_prob= "number",
     max_gap_daily_area  = "number", failure_sample_ratio = "number",

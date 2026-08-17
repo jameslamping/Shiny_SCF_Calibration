@@ -845,6 +845,206 @@ load_fired_perimeters <- function(fired_gpkg, cal_vect, working_crs,
 
 
 # =============================================================================
+# load_nirops_perimeters
+#
+# Loads the NIROPS airborne-infrared daily fire perimeter progression dataset
+# (Magstadt et al. 2026, Sci Data; Mendeley DOI 10.17632/95rj5d379g.1) as a
+# SpatVector matching the GeoMAC output schema.
+#
+# Why this source: perimeters are interpreted from airborne infrared overflights
+# by trained IR specialists (NIROPS program), giving far more accurate fire-edge
+# geometry than 500 m MODIS-derived products.  Crucially the perimeters are
+# already CUMULATIVE, so — unlike FIRED — no reconstruction step is needed and
+# sequential pairs feed bind_climate_to_pairs() directly.
+#
+# Coverage: US Forest Service Regions 1-6 (western CONUS), 2020-05-12 to
+# 2024-12-17.  737 incidents / 12,706 perimeter snapshots; median 11 distinct
+# days per incident.
+#
+# Attribute schema in the shapefile:
+#   Incident_C  fire event ID (e.g. "CA-AEU-017769_Electra")  -> FIRE_ID
+#   DateUTC     acquisition date                              -> perimeter_date
+#   UTC         full timestamp "YYYY-MM-DD HH:MM:SS"
+#   Acres       perimeter area                                -> AREA_HA (x 0.404686)
+#   IRWINID, "Inc Name", "Inc Number"  cross-reference IDs (note literal spaces)
+#
+# PERFORMANCE — two steps are essential and not optional:
+#   1. wkt_filter at read time.  The .shp is ~2 GB with ~518 million vertices;
+#      never read it whole.  Filtering to the calibration boundary bbox reads
+#      WA/OR/CA in ~3 s (7,655 features / 377 incidents).
+#   2. Geometry simplification.  Median polygon is 11,688 vertices (max
+#      255,128) — absurd detail relative to a 90 m raster.  Simplifying at half
+#      the spread cell size removes ~97.5% of vertices and drops the WA/OR/CA
+#      read from ~1.62 GB to roughly 40 MB in memory, with no meaningful loss
+#      once rasterized.
+#
+# Arguments:
+#   nirops_shp         path to NIROPS_2020_2024_R1_R6.shp
+#   cal_vect           SpatVector calibration boundary (any CRS)
+#   working_crs        target CRS (from LANDIS template)
+#   cal_start, cal_end Date bounds
+#   min_fire_ha        drop incidents whose max perimeter is below this
+#   min_detection_days require at least this many distinct acquisition days
+#   simplify_m         Douglas-Peucker tolerance in metres (NULL = no simplify)
+#
+# Returns SpatVector with FIRE_ID, perimeter_date, AREA_HA, row_id.
+# =============================================================================
+
+load_nirops_perimeters <- function(nirops_shp, cal_vect, working_crs,
+                                    cal_start, cal_end,
+                                    min_fire_ha        = 100,
+                                    min_detection_days = 3L,
+                                    simplify_m         = 45) {
+
+  if (!requireNamespace("sf", quietly = TRUE))
+    stop("Package 'sf' required for load_nirops_perimeters(). install.packages('sf')")
+  if (!file.exists(nirops_shp))
+    stop("NIROPS shapefile not found: ", nirops_shp)
+
+  # NIROPS geometries are hand-digitized from IR imagery and retain minor
+  # topology defects (duplicate vertices, self-touching rings) despite the
+  # publishers' zero-buffer repair pass.  s2's spherical predicates reject
+  # these outright ("Loop N is not valid: Edge X has duplicate vertex").
+  # Planar predicates tolerate them, and at these scales the planar/spherical
+  # difference is immaterial for a boundary intersection test.
+  old_s2 <- sf::sf_use_s2()
+  sf::sf_use_s2(FALSE)
+  on.exit(sf::sf_use_s2(old_s2), add = TRUE)
+
+  # ---- Spatial pre-filter at read time ---------------------------------------
+  # Build a WGS84 bbox polygon from the calibration boundary; OGR uses the .shx
+  # spatial index so only intersecting features are read off disk.
+  cal_wgs <- terra::project(cal_vect, "EPSG:4326")
+  bb      <- as.vector(terra::ext(cal_wgs))
+  bb_wkt  <- sprintf(
+    "POLYGON((%f %f, %f %f, %f %f, %f %f, %f %f))",
+    bb[1], bb[3], bb[2], bb[3], bb[2], bb[4], bb[1], bb[4], bb[1], bb[3]
+  )
+
+  lyr <- tryCatch(sf::st_layers(nirops_shp)$name[1],
+                  error = function(e) tools::file_path_sans_ext(basename(nirops_shp)))
+
+  message(sprintf("Reading NIROPS layer '%s' with spatial pre-filter...", lyr))
+  t0 <- proc.time()[["elapsed"]]
+
+  nir_sf <- sf::st_read(
+    nirops_shp,
+    query      = sprintf('SELECT "Incident_C", "DateUTC", "Acres" FROM "%s"', lyr),
+    wkt_filter = bb_wkt,
+    quiet      = TRUE
+  )
+  message(sprintf("  read %d features in %.0f s",
+                  nrow(nir_sf), proc.time()[["elapsed"]] - t0))
+
+  if (nrow(nir_sf) == 0)
+    stop("No NIROPS perimeters intersect the calibration boundary.\n",
+         "  NIROPS covers western CONUS (USFS Regions 1-6) only.")
+
+  # ---- Standardise attributes -------------------------------------------------
+  nir_sf <- nir_sf %>%
+    dplyr::rename(event_id = Incident_C, date = DateUTC) %>%
+    dplyr::mutate(
+      event_id = as.character(event_id),
+      date     = as.Date(date),
+      area_ha  = suppressWarnings(as.numeric(Acres)) * 0.404686   # acres -> ha
+    ) %>%
+    dplyr::filter(!is.na(event_id), !is.na(date), is.finite(area_ha), area_ha > 0)
+
+  # ---- Date filter ------------------------------------------------------------
+  n_before <- nrow(nir_sf)
+  nir_sf   <- nir_sf %>% dplyr::filter(date >= cal_start, date <= cal_end)
+  message(sprintf("  date filter [%s, %s]: %d of %d records remain",
+                  cal_start, cal_end, nrow(nir_sf), n_before))
+  if (nrow(nir_sf) == 0)
+    stop(sprintf(paste0(
+      "No NIROPS records within the calibration period (%s to %s).\n",
+      "  NIROPS covers 2020-05-12 to 2024-12-17 — widen the Calibration Period."),
+      cal_start, cal_end))
+
+  # ---- Collapse sub-daily acquisitions ---------------------------------------
+  # ~1% of incident-days have 2-3 overflights; keep the largest per day so each
+  # fire-date maps to a single cumulative perimeter.
+  n_pre <- nrow(nir_sf)
+  nir_sf <- nir_sf %>%
+    dplyr::group_by(event_id, date) %>%
+    dplyr::slice_max(order_by = area_ha, n = 1, with_ties = FALSE) %>%
+    dplyr::ungroup()
+  if (n_pre > nrow(nir_sf))
+    message(sprintf("  collapsed %d sub-daily acquisition(s) to largest-per-day",
+                    n_pre - nrow(nir_sf)))
+
+  # ---- Clip precisely to boundary --------------------------------------------
+  cal_sf <- sf::st_as_sf(cal_wgs) %>% sf::st_transform(sf::st_crs(nir_sf))
+  hits   <- sf::st_intersects(nir_sf, cal_sf, sparse = FALSE)[, 1]
+  nir_sf <- nir_sf[hits, ]
+  message(sprintf("  boundary intersect: %d records / %d incidents",
+                  nrow(nir_sf), length(unique(nir_sf$event_id))))
+
+  # ---- Minimum detection days -------------------------------------------------
+  if (!is.null(min_detection_days) && min_detection_days > 1L) {
+    det <- nir_sf %>% sf::st_drop_geometry() %>%
+      dplyr::count(event_id, name = "n_det")
+    keep_det <- det$event_id[det$n_det >= as.integer(min_detection_days)]
+    n_ev     <- length(unique(nir_sf$event_id))
+    nir_sf   <- nir_sf %>% dplyr::filter(event_id %in% keep_det)
+    message(sprintf("  min detection days (>= %d): kept %d of %d incidents",
+                    as.integer(min_detection_days), length(keep_det), n_ev))
+  }
+
+  # ---- Minimum fire size ------------------------------------------------------
+  sz <- nir_sf %>% sf::st_drop_geometry() %>%
+    dplyr::group_by(event_id) %>%
+    dplyr::summarise(max_ha = max(area_ha, na.rm = TRUE), .groups = "drop")
+  keep_sz <- sz$event_id[sz$max_ha >= min_fire_ha]
+  n_ev    <- length(unique(nir_sf$event_id))
+  nir_sf  <- nir_sf %>% dplyr::filter(event_id %in% keep_sz)
+  message(sprintf("  min fire size (>= %.0f ha): kept %d of %d incidents",
+                  min_fire_ha, length(keep_sz), n_ev))
+
+  if (nrow(nir_sf) == 0)
+    stop("No NIROPS incidents remain after size / detection-day filters.")
+
+  # ---- Project, then simplify -------------------------------------------------
+  # Simplify AFTER projecting so the tolerance is in metres, not degrees.
+  nir_v <- terra::vect(nir_sf)
+  nir_v <- terra::project(nir_v, working_crs)
+
+  if (!is.null(simplify_m) && is.finite(simplify_m) && simplify_m > 0) {
+    t1 <- proc.time()[["elapsed"]]
+    simp <- tryCatch({
+      s <- sf::st_simplify(sf::st_as_sf(nir_v), dTolerance = simplify_m,
+                           preserveTopology = TRUE)
+      s <- s[!sf::st_is_empty(s), ]
+      terra::vect(s)
+    }, error = function(e) {
+      message("  simplify failed (", conditionMessage(e), ") — using full geometry")
+      NULL
+    })
+    if (!is.null(simp) && nrow(simp) > 0) {
+      nir_v <- simp
+      message(sprintf("  simplified @ %.0f m in %.0f s",
+                      simplify_m, proc.time()[["elapsed"]] - t1))
+    }
+  }
+
+  # ---- Recompute area from (projected, simplified) geometry ------------------
+  # Use geometry-derived area for consistency with what actually gets rasterized,
+  # rather than the reported Acres attribute.
+  nir_v$AREA_HA        <- as.numeric(terra::expanse(nir_v, unit = "ha"))
+  nir_v$FIRE_ID        <- paste0("NIROPS-", nir_v$event_id)
+  nir_v$perimeter_date <- as.Date(nir_v$date)
+  nir_v$row_id         <- seq_len(nrow(nir_v))
+
+  result_v <- nir_v[, c("FIRE_ID", "perimeter_date", "AREA_HA", "row_id")]
+
+  message(sprintf("NIROPS: %d cumulative perimeters for %d fire events.",
+                  nrow(result_v), length(unique(result_v$FIRE_ID))))
+
+  result_v
+}
+
+
+# =============================================================================
 # load_fired_events_for_max_area
 #
 # Uses the FIRED EVENTS product (fired_events_conus_*.gpkg — one row per fire,
@@ -1554,15 +1754,18 @@ fit_max_daily_area <- function(pairs      = NULL,
 # -----------------------------------------------------------------------------
 
 fit_spread_probability <- function(pairs2, geomac_v, template_r, park_mask,
-                                    fine_fuels_r     = NULL,
-                                    failure_ratio    = 3, max_samples = 25000,
-                                    dil_kernel       = NULL,
-                                    min_pct_proximal = 0,
-                                    n_cores          = NULL,
-                                    progress_fn      = NULL,
-                                    cal_months       = NULL,
-                                    fwi_min          = NULL,
-                                    predictors       = c("FWI", "FineFuels", "EWS")) {
+                                    fine_fuels_r      = NULL,
+                                    failure_ratio     = 3, max_samples = 25000,
+                                    dil_kernel        = NULL,
+                                    min_pct_proximal  = 0,
+                                    n_cores           = NULL,
+                                    progress_fn       = NULL,
+                                    cal_months        = NULL,
+                                    fwi_min           = NULL,
+                                    predictors        = c("FWI", "FineFuels", "EWS"),
+                                    aggregation_level = c("cell", "fire_day")) {
+
+  aggregation_level <- match.arg(aggregation_level)
 
   # Default dilation kernel: 3x3 all-ones (rook-equivalent for max focal)
   if (is.null(dil_kernel)) dil_kernel <- matrix(1, 3, 3)
@@ -1670,31 +1873,46 @@ fit_spread_probability <- function(pairs2, geomac_v, template_r, park_mask,
         pair_stats_l[[j]] <- dplyr::tibble(
           pair_idx = i, FIRE_ID = row$FIRE_ID, date = row$date,
           FWI = fwi, EWS = ews, delta_ha = row$delta_ha,
-          n_new_burned = 0L, n_fail = 0L, pct_proximal = NA_real_,
+          n_new_burned = 0L, n_proximal = 0L, n_fail = 0L, pct_proximal = NA_real_,
           status = "null_raster"
         )
         next
       }
 
       new_burned <- (r_t1 == 1) & (r_t == 0)
-      succ_cells <- which(terra::values(new_burned) == 1)
 
+      # Candidate frontier ring: unburned-at-t cells adjacent to the day-t
+      # perimeter.  Must be computed BEFORE succ_cells so successes and failures
+      # are drawn from the SAME population.
       dil        <- terra::focal(r_t, w = dil_kernel, fun = "max",
                                  na.policy = "omit", fillvalue = 0)
       cand       <- (dil == 1) & (r_t == 0)
+
+      # Successes and failures are both restricted to `cand`.  SCF's CanSpread()
+      # is evaluated per source-cell -> immediate-neighbour transition, and each
+      # cell gets exactly ONE trial per fire event (FireEvent.cs:495 sets
+      # Disturbed regardless of outcome; the neighbour lookups default to
+      # ignoreDisturbed = TRUE and filter it out).  Drawing successes from ALL
+      # newly burned cells while drawing failures only from the ring compared two
+      # different populations and inflated the fitted probability roughly 2x.
+      succ_cells <- which(terra::values(cand & (r_t1 == 1)) == 1)
       fail_cells <- which(terra::values(cand & (r_t1 == 0)) == 1)
 
       n_succ <- length(succ_cells)
       n_fail <- length(fail_cells)
-      n_new  <- n_succ
 
-      n_proximal <- sum(terra::values((new_burned == 1) & (cand == 1)) == 1, na.rm = TRUE)
+      # n_new counts ALL newly burned cells (not just proximal ones) so
+      # pct_proximal remains a meaningful diagnostic of how much daily growth
+      # occurred beyond one cell of the previous perimeter.
+      n_new      <- sum(terra::values(new_burned) == 1, na.rm = TRUE)
+      n_proximal <- n_succ
       pct_prox   <- if (n_new > 0) round(100 * n_proximal / n_new, 1) else NA_real_
 
       pair_stats_l[[j]] <- dplyr::tibble(
         pair_idx     = i, FIRE_ID = row$FIRE_ID, date = row$date,
         FWI = fwi, EWS = ews, delta_ha = row$delta_ha,
-        n_new_burned = n_new, n_fail = n_fail, pct_proximal = pct_prox,
+        n_new_burned = n_new, n_proximal = n_proximal, n_fail = n_fail,
+        pct_proximal = pct_prox,
         status       = if (n_succ == 0) "no_success" else "ok"
       )
 
@@ -1837,6 +2055,194 @@ fit_spread_probability <- function(pairs2, geomac_v, template_r, park_mask,
 
   if (nrow(all_samples) == 0)
     stop("No raster samples generated. Check that perimeters fall within template extent.")
+
+  # ==========================================================================
+  # FIRE-DAY AGGREGATION PATH
+  # Instead of fitting a GLM on 2M+ binary cell samples, aggregate each
+  # perimeter pair to a single row:
+  #   n_proximal = candidate cells that burned  (successes)
+  #   n_fail     = candidate cells that didn't  (failures)
+  # Then fit:  cbind(n_proximal, n_fail) ~ FWI + EWS  (weighted binomial)
+  # The logit coefficients are identical in structure to the cell-level GLM
+  # and enter SCF directly.  Fine Fuels (B2) cannot be estimated at this
+  # scale because there's no within-pair FF variation, so B2 is always 0.
+  # ==========================================================================
+  if (aggregation_level == "fire_day") {
+
+    drop_b2 <- TRUE   # no cell-level FF at fire-day scale
+    drop_b3 <- !"EWS" %in% predictors
+    ff_var  <- NA_real_
+
+    message("fit_spread_probability [fire_day]: aggregating to pair level for GLM fit.")
+    message("  B2_FineFuels is always dropped in fire-day mode (no within-pair FF variation).")
+
+    fd_dat <- pair_diag %>%
+      dplyr::filter(status == "ok",
+                    !is.na(n_proximal),
+                    !is.na(n_fail),
+                    (n_proximal + n_fail) > 0,
+                    is.finite(FWI),
+                    is.finite(EWS)) %>%
+      dplyr::rename(EffectiveWind = EWS) %>%
+      dplyr::mutate(n_unburned = as.integer(n_fail),
+                    n_burned   = as.integer(n_proximal),
+                    frac_burned = n_burned / (n_burned + n_unburned))
+
+    if (nrow(fd_dat) < 5)
+      stop(sprintf(paste0(
+        "Fire-day aggregation needs at least 5 usable pairs; got %d. ",
+        "Try 'cell' aggregation or loosen quality filters."), nrow(fd_dat)))
+
+    message(sprintf("  Fire-day GLM: %d pairs | mean frac_burned = %.3f | FWI range [%.0f, %.0f]",
+                    nrow(fd_dat), mean(fd_dat$frac_burned),
+                    min(fd_dat$FWI), max(fd_dat$FWI)))
+
+    # VIF
+    vif_cols <- c("FWI", if (!drop_b3) "EffectiveWind")
+    vif_cols <- vif_cols[vif_cols %in% names(fd_dat)]
+    X_fd <- if (length(vif_cols) >= 2) as.matrix(fd_dat[, vif_cols]) else
+            matrix(NA_real_, nrow = nrow(fd_dat), ncol = 1,
+                   dimnames = list(NULL, vif_cols[1]))
+    vif_sp <- if (length(vif_cols) >= 2) compute_vif(X_fd) else
+              setNames(NA_real_, if (length(vif_cols) == 1) vif_cols else "none")
+
+    fd_terms <- c("FWI", if (!drop_b3) "EffectiveWind")
+    if (length(fd_terms) == 0) fd_terms <- "1"
+    fd_formula <- as.formula(paste(
+      "cbind(n_burned, n_unburned) ~", paste(fd_terms, collapse = " + ")
+    ))
+    m <- glm(fd_formula, data = fd_dat, family = binomial(link = "logit"))
+
+    # Weighted R² (on probability scale)
+    pr_fd  <- predict(m, type = "response")
+    wt_fd  <- fd_dat$n_burned + fd_dat$n_unburned
+    obs_fd <- fd_dat$frac_burned
+    wmean  <- stats::weighted.mean(obs_fd, wt_fd)
+    ss_tot <- sum(wt_fd * (obs_fd - wmean)^2)
+    ss_res <- sum(wt_fd * (obs_fd - pr_fd)^2)
+    r2_val  <- 1 - ss_res / ss_tot
+    auc_val <- NA_real_   # not applicable for continuous 0-1 response
+
+    wind_label <- if (drop_b3) "B3_EffectiveWind (dropped — zeroed)" else
+                  if (has_eff_wind) "B3_EffectiveWind" else
+                  "B3_EffectiveWind (raw wind, no terrain)"
+
+    coef_df_raw <- broom::tidy(m) %>%
+      dplyr::rename(std_error = std.error, p_value = p.value)
+
+    .get_b <- function(term_name) {
+      row <- coef_df_raw[coef_df_raw$term == term_name, ]
+      if (nrow(row) == 0)
+        list(est = 0.0, se = NA_real_, z = NA_real_, p = NA_real_)
+      else
+        list(est = row$estimate, se = row$std_error, z = row$statistic, p = row$p_value)
+    }
+    b0 <- .get_b("(Intercept)")
+    b1 <- .get_b("FWI")
+    b2 <- list(est = 0.0, se = NA_real_, z = NA_real_, p = NA_real_)
+    b3 <- .get_b("EffectiveWind")
+
+    coef_df <- tibble::tibble(
+      term          = c("B0_Intercept", "B1_FWI",
+                        "B2_FineFuels (dropped — fire-day aggregation)",
+                        wind_label),
+      estimate      = c(b0$est, b1$est, 0.0,    b3$est),
+      std_error     = c(b0$se,  b1$se,  NA_real_, b3$se),
+      statistic     = c(b0$z,   b1$z,  NA_real_, b3$z),
+      p_value       = c(b0$p,   b1$p,  NA_real_, b3$p),
+      scf_parameter = c("SpreadProbabilityB0", "SpreadProbabilityB1",
+                        "SpreadProbabilityB2", "SpreadProbabilityB3"),
+      note          = c(
+        "fire-day logit; enter directly in SCF parameter file",
+        "fire-day logit; enter directly in SCF parameter file",
+        "B2=0: fine fuels not estimable at fire-day aggregation level",
+        if (drop_b3) "EWS excluded by user. SpreadProbabilityB3=0."
+        else         "fire-day logit; enter directly in SCF parameter file"
+      )
+    )
+
+    # Model comparison (fire-day level)
+    .safe_fd_glm <- function(formula) {
+      tryCatch(
+        glm(formula, data = fd_dat, family = binomial(link = "logit")),
+        error   = function(e) NULL,
+        warning = function(w) withCallingHandlers(
+          glm(formula, data = fd_dat, family = binomial(link = "logit")),
+          warning = function(w) invokeRestart("muffleWarning"))
+      )
+    }
+    .fd_r2 <- function(fit) {
+      if (is.null(fit)) return(NA_real_)
+      pr  <- predict(fit, type = "response")
+      wt  <- fd_dat$n_burned + fd_dat$n_unburned
+      obs <- fd_dat$frac_burned
+      wm  <- stats::weighted.mean(obs, wt)
+      round(1 - sum(wt * (obs - pr)^2) / sum(wt * (obs - wm)^2), 4)
+    }
+    .fd_mcf <- function(fit) if (!is.null(fit)) round(1 - fit$deviance / fit$null.deviance, 4) else NA_real_
+    .fd_row <- function(fit, label) {
+      if (is.null(fit)) return(NULL)
+      cf <- coef(fit)
+      tibble::tibble(
+        Model    = label,
+        McF_R2   = .fd_mcf(fit),
+        # AUC is undefined for a continuous 0-1 proportion response.  It was
+        # previously filled with the weighted R², which made the column read as
+        # a sub-0.5 (worse-than-random) AUC.  McF_R2 already carries fit quality
+        # for model comparison, so leave AUC empty in fire-day mode.
+        AUC      = NA_real_,
+        Wtd_R2   = .fd_r2(fit),
+        B1_FWI   = if ("FWI"           %in% names(cf)) round(cf["FWI"],           5) else NA_real_,
+        B2_FF    = NA_real_,
+        B3_EWS   = if ("EffectiveWind" %in% names(cf)) round(cf["EffectiveWind"], 5) else NA_real_,
+        FWI_sign = if ("FWI"           %in% names(cf)) ifelse(cf["FWI"] > 0, "+", "-") else NA_character_,
+        FF_sign  = NA_character_,
+        EWS_sign = if ("EffectiveWind" %in% names(cf)) ifelse(cf["EffectiveWind"] > 0, "+", "-") else NA_character_
+      )
+    }
+
+    m1_fd <- .safe_fd_glm(cbind(n_burned, n_unburned) ~ FWI)
+    m3_fd <- if (!drop_b3) .safe_fd_glm(cbind(n_burned, n_unburned) ~ FWI + EffectiveWind) else NULL
+
+    model_comparison <- dplyr::bind_rows(
+      .fd_row(m1_fd, "M1: FWI only"),
+      .fd_row(m3_fd, "M3: FWI + EWS"),
+      .fd_row(m,     "M4: FWI + EWS (primary)")
+    )
+
+    message(sprintf(
+      "Spread prob fit [fire_day]: %d pairs | weighted R²=%.4f | drop_b3=%s | VIF: %s",
+      nrow(fd_dat), r2_val, drop_b3,
+      paste(names(vif_sp), round(vif_sp, 2), sep = "=", collapse = ", ")
+    ))
+
+    # Expose fd_dat as "samples" for downstream diagnostics
+    fd_samples <- fd_dat %>%
+      dplyr::select(pair_idx = pair_idx, FIRE_ID, date, FWI,
+                    EffectiveWind, n_burned, n_unburned, frac_burned)
+
+    return(list(
+      coef             = coef_df,
+      model            = m,
+      model_comparison = model_comparison,
+      pair_diag        = pair_diag,
+      samples          = fd_samples,
+      wind_predictor   = wind_col,
+      ff_placeholder   = is.null(fine_fuels_r),
+      ff_var           = ff_var,
+      drop_b2          = drop_b2,
+      drop_b3          = drop_b3,
+      predictors       = predictors,
+      vif              = vif_sp,
+      auc              = auc_val,
+      r2               = r2_val,
+      n_pairs          = nrow(fd_dat),
+      n_obs            = nrow(fd_dat),
+      aggregation_level = "fire_day"
+    ))
+  }
+  # End fire_day path — cell-level path continues below
+  # ==========================================================================
 
   # ---- Fine fuels variance check --------------------------------------------
   # B2_FineFuels is only identifiable when FF varies across the sample.
@@ -2002,22 +2408,23 @@ fit_spread_probability <- function(pairs2, geomac_v, template_r, park_mask,
   r2_val  <- .mcf_r2(m)
   n_pairs_val <- sum(pair_diag$status == "ok", na.rm = TRUE)
 
-  list(coef             = coef_df,
-       model            = m,
-       model_comparison = model_comparison,
-       pair_diag        = pair_diag,
-       samples          = all_samples,
-       wind_predictor   = wind_col,
-       ff_placeholder   = is.null(fine_fuels_r),
-       ff_var           = ff_var,
-       drop_b2          = drop_b2,
-       drop_b3          = drop_b3,
-       predictors       = predictors,
-       vif              = vif_sp,
-       auc              = auc_val,
-       r2               = r2_val,
-       n_pairs          = n_pairs_val,
-       n_obs            = nrow(all_samples))
+  list(coef              = coef_df,
+       model             = m,
+       model_comparison  = model_comparison,
+       pair_diag         = pair_diag,
+       samples           = all_samples,
+       wind_predictor    = wind_col,
+       ff_placeholder    = is.null(fine_fuels_r),
+       ff_var            = ff_var,
+       drop_b2           = drop_b2,
+       drop_b3           = drop_b3,
+       predictors        = predictors,
+       vif               = vif_sp,
+       auc               = auc_val,
+       r2                = r2_val,
+       n_pairs           = n_pairs_val,
+       n_obs             = nrow(all_samples),
+       aggregation_level = "cell")
 }
 
 
@@ -2037,146 +2444,175 @@ rasterize_perim <- function(v, row_id_val, template, mask_r = NULL) {
 
 
 # -----------------------------------------------------------------------------
-# Diagnostic plots
+# PERCOLATION_THRESHOLD
+#
+# SCF spread is a SINGLE-TRIAL percolation process: FireEvent.cs:495 sets
+# SiteVars.Disturbed = true whether or not a cell ignites, and the neighbour
+# lookups default to ignoreDisturbed = TRUE, so each cell gets exactly ONE
+# spread trial per fire event.  Fire therefore only propagates when P clears the
+# lattice percolation threshold.
+#
+# For an 8-neighbour (Moore) lattice, site percolation p_c ~= 0.407.  SCF
+# down-weights diagonals by 0.71 (FireEvent.cs:577), which lies between the
+# 4-neighbour case (p_c = 0.593) and the pure 8-neighbour case, so the effective
+# threshold sits around 0.45-0.50.  Below that band fires die out within a few
+# cells regardless of MaximumSpreadArea; above it they run away.
+# -----------------------------------------------------------------------------
+PERCOLATION_LO <- 0.45
+PERCOLATION_HI <- 0.50
+
+
+# -----------------------------------------------------------------------------
+# plot_spread_percolation
+#
+# P(spread) vs FWI with the percolation threshold band and the ACTUAL FWI
+# distribution overlaid, plus the fraction of fire-days that clear the band.
+#
+# This is the diagnostic that answers "why are my fires the wrong size?".  A
+# coefficient set can look perfectly reasonable while placing the threshold
+# crossing outside the range of FWI the landscape ever experiences — in which
+# case no fire ever propagates, no matter how the other parameters are set.
+#
+# Arguments:
+#   spread_prob_model  fitted glm from fit_spread_probability()
+#   samples            samples tibble (supplies FWI/EWS/FineFuels distributions)
+#   fwi_runtime        optional numeric vector of RUNTIME FWI (e.g. from the
+#                      LANDIS climate file).  When supplied it is shown as a
+#                      second distribution, because the calibration FWI and the
+#                      FWI SCF actually consumes need not be the same.
 # -----------------------------------------------------------------------------
 
-plot_spread_prob_diagnostics <- function(pairs, spread_prob_fit) {
+plot_spread_percolation <- function(spread_prob_model, samples,
+                                     fwi_runtime = NULL,
+                                     fwi_runtime_label = "Runtime FWI (LANDIS)") {
 
-  if (is.null(spread_prob_fit))
-    return(ggplot() + labs(title = "Spread probability not yet fitted.") + theme_bw())
+  if (is.null(spread_prob_model) || is.null(samples)) return(NULL)
+  if (!"FWI" %in% names(samples)) return(NULL)
 
-  coef_df <- spread_prob_fit$coef
+  ews_mean <- if ("EffectiveWind" %in% names(samples))
+    mean(samples$EffectiveWind, na.rm = TRUE) else 0
+  ff_mean  <- if ("FineFuels" %in% names(samples))
+    mean(samples$FineFuels, na.rm = TRUE) else 0
 
-  # Match coefficients by name prefix (term may have suffix like "(placeholder)")
-  get_b <- function(prefix) {
-    idx <- grep(prefix, coef_df$term, fixed = FALSE)[1]
-    if (is.na(idx)) NA_real_ else coef_df$estimate[idx]
+  fwi_cal <- samples$FWI[is.finite(samples$FWI)]
+  fwi_max <- max(c(fwi_cal, fwi_runtime), na.rm = TRUE)
+  fwi_seq <- seq(0, fwi_max * 1.05, length.out = 300)
+
+  nd <- data.frame(FWI = fwi_seq, EffectiveWind = ews_mean, FineFuels = ff_mean)
+  nd <- nd[, intersect(names(nd), c("FWI", "EffectiveWind", "FineFuels")), drop = FALSE]
+  nd$fit <- tryCatch(as.numeric(predict(spread_prob_model, nd, type = "response")),
+                     error = function(e) rep(NA_real_, nrow(nd)))
+  if (all(is.na(nd$fit))) return(NULL)
+
+  # Fraction of fire-days above the threshold band
+  .pct_over <- function(fwi_vec) {
+    if (is.null(fwi_vec) || length(fwi_vec) == 0) return(NA_real_)
+    d <- data.frame(FWI = fwi_vec[is.finite(fwi_vec)],
+                    EffectiveWind = ews_mean, FineFuels = ff_mean)
+    d <- d[, names(nd)[names(nd) != "fit"], drop = FALSE]
+    p <- tryCatch(as.numeric(predict(spread_prob_model, d, type = "response")),
+                  error = function(e) return(NA_real_))
+    100 * mean(p >= PERCOLATION_LO, na.rm = TRUE)
   }
-  b0 <- get_b("B0_Intercept")
-  b1 <- get_b("B1_FWI")
-  b2 <- get_b("B2_Fine")
-  b3 <- get_b("B3_Effective")
+  pct_cal <- .pct_over(fwi_cal)
+  pct_run <- .pct_over(fwi_runtime)
 
-  if (any(is.na(c(b0, b1))))
-    return(ggplot() + labs(title = "Spread probability not yet fitted.") + theme_bw())
+  # FWI at which the curve first crosses the lower threshold
+  cross <- nd$FWI[which(nd$fit >= PERCOLATION_LO)[1]]
+  cross_txt <- if (is.na(cross))
+    sprintf("never reaches %.2f within observed FWI", PERCOLATION_LO)
+  else sprintf("crosses %.2f at FWI = %.0f", PERCOLATION_LO, cross)
 
-  # Use effective wind when available in pairs
-  ews_col  <- if ("EffectiveWind" %in% names(pairs)) "EffectiveWind" else "WindSpeed_kmh"
-  ews_lo   <- quantile(pairs[[ews_col]], 0.25, na.rm = TRUE)
-  ews_mean <- mean(pairs[[ews_col]], na.rm = TRUE)
-  ews_hi   <- quantile(pairs[[ews_col]], 0.75, na.rm = TRUE)
-
-  fwi_seq <- seq(0, max(pairs$FWI, na.rm = TRUE), length.out = 100)
-
-  make_line <- function(ews_val, label) {
-    tibble(
-      FWI      = fwi_seq,
-      prob     = plogis(coalesce(b0, 0) + coalesce(b1, 0) * fwi_seq +
-                        coalesce(b2, 0) * 1.0 +       # fine fuels = 1 (fully loaded)
-                        coalesce(b3, 0) * ews_val),
-      scenario = label
-    )
+  # Scale the FWI density to the 0-1 probability axis for overlay
+  dens_df <- function(x, lab) {
+    x <- x[is.finite(x)]
+    if (length(x) < 10) return(NULL)
+    d <- density(x, from = 0, to = fwi_max * 1.05)
+    data.frame(FWI = d$x, dens = d$y / max(d$y) * 0.28, series = lab)
   }
+  dd <- bind_rows(dens_df(fwi_cal, "Calibration FWI"),
+                  dens_df(fwi_runtime, fwi_runtime_label))
 
-  pred_df <- bind_rows(
-    make_line(ews_lo,   sprintf("EWS Q25 = %.1f km/h", ews_lo)),
-    make_line(ews_mean, sprintf("EWS mean = %.1f km/h", ews_mean)),
-    make_line(ews_hi,   sprintf("EWS Q75 = %.1f km/h", ews_hi))
-  )
+  sub <- sprintf("Fitted curve %s.  %.1f%% of calibration fire-days are supercritical.",
+                 cross_txt, pct_cal)
+  if (!is.na(pct_run))
+    sub <- paste0(sub, sprintf("\n%s: %.1f%% supercritical.", fwi_runtime_label, pct_run))
 
-  ggplot(pred_df, aes(FWI, prob, colour = scenario)) +
-    geom_line(linewidth = 1.2) +
-    geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50") +
-    scale_colour_manual(values = c("grey55", "#2c3e50", "#c0392b")) +
-    scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+  p <- ggplot() +
+    annotate("rect", xmin = -Inf, xmax = Inf,
+             ymin = PERCOLATION_LO, ymax = PERCOLATION_HI,
+             fill = "#2c5f2e", alpha = 0.16) +
+    annotate("text", x = 0, y = mean(c(PERCOLATION_LO, PERCOLATION_HI)),
+             label = "  percolation threshold", hjust = 0, vjust = -0.4,
+             size = 3.1, colour = "#2c5f2e")
+
+  if (!is.null(dd) && nrow(dd) > 0)
+    p <- p + geom_area(data = dd, aes(FWI, dens, fill = series),
+                       position = "identity", alpha = 0.30, colour = NA)
+
+  p +
+    geom_line(data = nd, aes(FWI, fit), colour = "#c0392b", linewidth = 1.1) +
+    scale_fill_manual(values = c("Calibration FWI" = "#2c3e50",
+                                 setNames("#a0522d", fwi_runtime_label)),
+                      name = NULL) +
+    scale_y_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25)) +
     labs(
-      title    = "Fitted Spread Probability vs FWI",
-      subtitle = paste0(
-        "P(spread) = logistic(B0 + B1\u00d7FWI + B2\u00d7FineFuels + B3\u00d7EWS)\n",
-        "Shown at fine fuels = 1.0 (fully loaded); three effective wind scenarios (km/h)."
-      ),
-      x = "FWI", y = "P(spread to neighbor cell)",
-      colour = "Wind scenario"
+      title    = "Spread Probability vs Percolation Threshold",
+      subtitle = sub,
+      x = "Fire Weather Index (FWI)",
+      y = "P(spread to neighbour cell)",
+      caption = paste0(
+        "Shaded band = single-trial percolation threshold for SCF's 8-neighbour ",
+        "spread with 0.71 diagonal weighting.\nBelow it fires die out within a ",
+        "few cells regardless of MaximumSpreadArea; above it they run away.\n",
+        "Filled curves = FWI distributions (scaled), so you can see what ",
+        "fraction of fire-days actually reach the threshold.")
     ) +
     theme_bw(base_size = 12) +
-    theme(legend.position = "bottom")
+    theme(legend.position = "bottom",
+          plot.caption = element_text(hjust = 0, colour = "grey45", size = 8))
 }
 
 
-plot_max_area_diagnostics <- function(pairs, max_area_fit) {
+# -----------------------------------------------------------------------------
+# solve_spread_b0
+#
+# Given fitted slopes and a target, return the B0 that puts the percolation
+# crossing at a chosen FWI percentile.
+#
+# SCF's B0 is NOT identifiable from the regression: the case-control sampling
+# used to build the training set biases the intercept (only the slopes are
+# consistent), and the observable — daily perimeter change — is jointly
+# determined by P and MaximumSpreadArea.  So B0 has to be set by targeting,
+# then validated against observed fire sizes.
+#
+# target_pct: percentage of fire-days that should be supercritical (e.g. 10
+#             means the top 10% of fire-days propagate).
+# -----------------------------------------------------------------------------
 
-  dat <- pairs %>%
-    filter(use_for_daily_area,
-           is.finite(daily_area_ha), daily_area_ha > 0,
-           is.finite(FWI), is.finite(EffectiveWind))
+solve_spread_b0 <- function(b1_fwi, b3_ews = 0, b2_ff = 0,
+                             fwi_vec, ews_mean = 0, ff_mean = 0,
+                             target_pct = 10,
+                             p_target = PERCOLATION_LO) {
 
-  if (nrow(dat) == 0 || is.null(max_area_fit))
-    return(ggplot() + labs(title = "No max daily area data.") + theme_bw())
+  fwi_vec <- fwi_vec[is.finite(fwi_vec)]
+  if (length(fwi_vec) == 0) return(NULL)
 
-  coef_df <- max_area_fit$coef
+  fwi_at <- as.numeric(quantile(fwi_vec, 1 - target_pct / 100, na.rm = TRUE))
+  # logit(p_target) = B0 + B1*FWI + B2*FF + B3*EWS  ->  solve for B0
+  b0 <- qlogis(p_target) - b1_fwi * fwi_at - b2_ff * ff_mean - b3_ews * ews_mean
 
-  # Extract coefficients for each fit target
-  make_pred <- function(target_label) {
-    b <- coef_df %>%
-      filter(fit_target == target_label) %>%
-      { setNames(.$estimate, .$term) }
-    b0 <- b["B0_Intercept"];   b1 <- b["B1_FWI"];  b2 <- b["B2_EffectiveWind"]
-    if (any(is.na(c(b0, b1, b2)))) return(NULL)
-    dat %>%
-      mutate(pred_ha = b0 + b1 * FWI + b2 * EffectiveWind,
-             fit_target = target_label)
-  }
-
-  pred_df <- bind_rows(
-    make_pred("Mean (OLS)"),
-    make_pred("75th percentile (recommended)"),
-    make_pred("90th percentile")
+  list(
+    b0            = b0,
+    fwi_crossing  = fwi_at,
+    target_pct    = target_pct,
+    p_target      = p_target,
+    note = sprintf(
+      paste0("B0 = %.4f puts P = %.2f at FWI = %.1f, the %g%% percentile of the ",
+             "supplied FWI distribution — i.e. the top %g%% of fire-days become ",
+             "supercritical."),
+      b0, p_target, fwi_at, 100 - target_pct, target_pct)
   )
-
-  if (nrow(pred_df) == 0)
-    return(ggplot() + labs(title = "No predicted values.") + theme_bw())
-
-  q75 <- quantile(dat$daily_area_ha, 0.75, na.rm = TRUE)
-  q90 <- quantile(dat$daily_area_ha, 0.90, na.rm = TRUE)
-
-  ggplot() +
-    # Observed data as points
-    geom_point(data = dat, aes(FWI, daily_area_ha),
-               alpha = 0.35, color = "grey40", size = 1.2) +
-    # Fitted lines for each target
-    geom_line(data = pred_df,
-              aes(FWI, pred_ha, color = fit_target, linetype = fit_target),
-              linewidth = 1.1) +
-    geom_hline(yintercept = q75, linetype = "dotted", colour = "#2c5f2e", linewidth = 0.6) +
-    geom_hline(yintercept = q90, linetype = "dotted", colour = "#a0522d", linewidth = 0.6) +
-    annotate("text", x = max(dat$FWI, na.rm = TRUE), y = q75,
-             label = sprintf("obs Q75 = %.0f ha", q75),
-             hjust = 1.05, vjust = -0.4, size = 3, colour = "#2c5f2e") +
-    annotate("text", x = max(dat$FWI, na.rm = TRUE), y = q90,
-             label = sprintf("obs Q90 = %.0f ha", q90),
-             hjust = 1.05, vjust = -0.4, size = 3, colour = "#a0522d") +
-    scale_color_manual(values = c(
-      "Mean (OLS)"                      = "grey30",
-      "75th percentile (recommended)"   = "#2c5f2e",
-      "90th percentile"                 = "#a0522d"
-    )) +
-    scale_linetype_manual(values = c(
-      "Mean (OLS)"                      = "dashed",
-      "75th percentile (recommended)"   = "solid",
-      "90th percentile"                 = "longdash"
-    )) +
-    scale_y_continuous(labels = scales::comma, limits = c(0, NA)) +
-    labs(
-      title    = "Max Daily Spread Area: Observed vs Fitted",
-      subtitle = paste0(
-        "Points = observed fire-day increments (ha).  Lines = SCF MaxSpreadArea = B0 + B1\u00d7FWI + B2\u00d7EWS.\n",
-        "Recommended: 75th-percentile fit (MaxSpreadArea is a ceiling, not an average)."
-      ),
-      x = "FWI at ignition", y = "Daily area increment (ha)",
-      color = "Fit target", linetype = "Fit target"
-    ) +
-    theme_bw(base_size = 12) +
-    theme(legend.position = "bottom")
 }
 
 
@@ -2302,17 +2738,44 @@ write_scf_snippet <- function(spread_coef_df, max_area_fit,
     ">> IMPORTANT UNIT NOTES:",
     ">>   EWS units:        km/h  (SCF User Guide §2.43/2.47/2.51: climate library",
     ">>                     converts all wind speed units to km/h; ERA5 m/s * 3.6)",
-    ">>   Fine fuels scale: 0-1  (SiteVars.FineFuels / MaxFineFuels in SCF)",
-    ">>   MaxFineFuels:     set in your SCF parameter file; calibration normalised",
-    ">>                     to max FBFM40 load = 9.0 t/acre (GR9 fuel model).",
-    ">>                     If your SCF MaxFineFuels differs, B2 needs rescaling.",
+    ">>   Fine fuels scale: 0-1.  SCF computes (FireEvent.cs:501)",
+    ">>                     min(SiteVars.FineFuels / MaximumFineFuels, 1.0)",
+    ">>                     -- note the SCF keyword is MaximumFineFuels, and the",
+    ">>                     divisor is that PARAMETER, not the raster maximum.",
+    ">>   B2 SCALE WARNING: calibration normalises to max FBFM40 load = 9.0 t/acre",
+    ">>                     (GR9), i.e. FineFuels=1.0 means 9.0 t/ac of surface",
+    ">>                     fine fuel.  SCF's SiteVars.FineFuels is LANDIS biomass",
+    ">>                     in g C m^-2.  For B2 to transfer, MaximumFineFuels must",
+    ">>                     be set so that FineFuels=1.0 denotes a COMPARABLE fuel",
+    ">>                     load (9.0 t/ac ~ 2000 g biomass m^-2 ~ 900 g C m^-2).",
+    ">>                     If the two 1.0-points differ, B2 must be rescaled or",
+    ">>                     the fuel term will be systematically mis-weighted.",
     ">>   CombustionBuoyancy used in calibration (Cb) is shown in the EWS note.",
     ">>   SCF uses Cb=10 (intensity<=3), Cb=25 (4-6), Cb=50 (>6); calibrate at",
     ">>   the Cb matching your landscape's typical fire intensity.",
     "",
+    ">> SUPPRESSION — RISK OF DOUBLE-COUNTING:",
+    ">>   SCF applies Pspread_adjusted = Pspread * suppressEffect, where",
+    ">>   suppressEffect = 1 - Suppression%/100 from the Suppression_CSV_File",
+    ">>   table (FireEvent.cs:522-584), keyed by FWI breaks and ignition type and",
+    ">>   disabled above SuppressionMaxWindSpeed.",
+    ">>   The historical perimeters these coefficients were fit to were ALREADY",
+    ">>   subject to real-world suppression, so that effect is baked into B0-B3.",
+    ">>   Adding a non-zero suppression table on top suppresses fire TWICE.",
+    ">>   Either leave suppression at 0, or re-tune B0 upward to compensate.",
+    "",
+    ">> SPREAD IS A SINGLE-TRIAL PERCOLATION PROCESS:",
+    ">>   SCF sets SiteVars.Disturbed = true whether or not a cell ignites",
+    ">>   (FireEvent.cs:495), and neighbour lookups filter disturbed cells by",
+    ">>   default.  Each cell therefore gets exactly ONE spread trial per event.",
+    ">>   Fire only propagates when P clears the lattice percolation threshold",
+    ">>   (~0.4 for 8-neighbour Moore spread).  A P of 0.05-0.2 at typical fire",
+    ">>   weather will extinguish nearly every ignition regardless of",
+    ">>   MaximumSpreadArea.  Validate B0 against historical fire sizes.",
+    "",
     ">> Cell-to-cell spread probability (logistic / binomial GLM)",
     ">>   P(spread) = 1 / (1 + exp(-(B0 + B1*FWI + B2*FineFuels + B3*EWS)))",
-    ">>   FineFuels = SiteVars.FineFuels / MaxFineFuels  (0-1 scale)",
+    ">>   FineFuels = min(SiteVars.FineFuels / MaximumFineFuels, 1.0)  (0-1 scale)",
     ">>   EWS       = effective wind speed (Nelson 2002 Eq.5, km/h)",
     ">>   Coefficients are logit-scale — enter directly, no back-transform needed.",
     sprintf("SpreadProbabilityB0    %9.6f", coalesce(sp_b0, NA_real_)),

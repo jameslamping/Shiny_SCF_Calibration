@@ -292,6 +292,534 @@ extract_gridmet_wind <- function(cal_vect, cal_start, cal_end,
 }
 
 
+# =============================================================================
+# fetch_gridmet_met_year   (internal helper for compute_gridmet_fwi)
+#
+# Fetches the four GRIDMET variables needed by the Canadian FWI System for a
+# single year, aggregates to a coarser grid, and returns a long data.frame of
+# per-cell daily values.  Results are cached to disk as .rds so an interrupted
+# multi-year fetch can resume without re-downloading.
+#
+# GRIDMET -> FWI input mapping (US daily gridded fire-danger convention):
+#   tmmx (daily max temperature, K)      -> temp (deg C)
+#   rmin (daily min relative humidity %) -> rh   (%)
+#   vs   (daily mean 10 m wind, m/s)     -> ws   (km/h)   [x 3.6]
+#   pr   (daily precipitation, mm)       -> prec (mm)
+#
+# Max-temp / min-RH approximates mid-afternoon peak burning conditions rather
+# than true local noon.  This runs slightly hotter than a noon-referenced FWI
+# but better represents the peak-of-day behaviour SCF's spread logic models.
+# -----------------------------------------------------------------------------
+
+fetch_gridmet_met_year <- function(cal_sf, yr, yr_start, yr_end,
+                                    agg_fact  = 6L,
+                                    cache_dir = NULL,
+                                    aoi_key   = "aoi") {
+
+  cache_file <- if (!is.null(cache_dir)) {
+    if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
+    file.path(cache_dir, sprintf("gridmet_met_%s_%d.rds", aoi_key, yr))
+  } else NULL
+
+  if (!is.null(cache_file) && file.exists(cache_file)) {
+    cached <- tryCatch(readRDS(cache_file), error = function(e) NULL)
+    # Reject caches that are unusable: all-NA dates (pre time-axis fix), or the
+    # older 4-variable schema that stored derived temp/rh instead of the raw
+    # tmax/tmin/rmin/rmax needed to switch FWI convention.
+    need_cols <- c("tmax", "tmin", "rmin", "rmax", "ws", "prec")
+    if (!is.null(cached) && nrow(cached) > 0 && !all(is.na(cached$date)) &&
+        all(need_cols %in% names(cached))) {
+      message(sprintf("  GRIDMET %d: loaded from cache (%s)", yr, basename(cache_file)))
+      return(cached)
+    }
+    reason <- if (is.null(cached) || nrow(cached) == 0) "unreadable"
+              else if (all(is.na(cached$date))) "bad dates"
+              else "old 4-variable schema"
+    message(sprintf("  GRIDMET %d: cache invalid (%s) — re-fetching", yr, reason))
+    unlink(cache_file)
+  }
+
+  # Fetch each variable in its own request with retry.  The GRIDMET THREDDS
+  # server intermittently returns HTTP 500 on individual aggregate files
+  # (e.g. "readAgg agg_met_pr_1979_CurrentYear_CONUS.nc"); requesting all four
+  # at once means one flaky variable kills the whole year, which is costly on a
+  # multi-hour multi-year pull.  climateR returns long descriptive layer names
+  # rather than the short variable codes, so match by pattern.
+  fetch_var <- function(vn, pat, label, n_try = 3L) {
+    for (k in seq_len(n_try)) {
+      r <- tryCatch(
+        climateR::getGridMET(AOI = cal_sf, varname = vn,
+                             startDate = as.character(yr_start),
+                             endDate   = as.character(yr_end)),
+        error = function(e) {
+          message(sprintf("    %s attempt %d/%d failed: %s",
+                          vn, k, n_try, conditionMessage(e)))
+          NULL
+        }
+      )
+      if (!is.null(r)) {
+        i <- grep(pat, names(r), ignore.case = TRUE)[1]
+        if (is.na(i)) i <- 1L
+        return(r[[i]])
+      }
+      if (k < n_try) Sys.sleep(5 * k)   # linear backoff
+    }
+    stop(sprintf("GRIDMET %s (%s) unavailable for %d after %d attempts.",
+                 label, vn, yr, n_try))
+  }
+
+  # Fetch BOTH temperature and BOTH humidity extremes so the cache can serve
+  # either FWI convention (see compute_gridmet_fwi) without re-downloading:
+  #   "landis" — mean temp / mean RH, matching the LANDIS Climate Library
+  #   "peak"   — max temp / min RH, the US gridded fire-danger convention
+  r_tmax <- fetch_var("tmmx", "^tmmx$|maximum.*temp",        "max temperature")
+  r_tmin <- fetch_var("tmmn", "^tmmn$|minimum.*temp",        "min temperature")
+  r_rmin <- fetch_var("rmin", "^rmin$|minimum.*humid",       "min relative humidity")
+  r_rmax <- fetch_var("rmax", "^rmax$|maximum.*humid",       "max relative humidity")
+  r_ws   <- fetch_var("vs",   "^vs$|wind.?speed|mean.*wind", "wind speed")
+  r_pr   <- fetch_var("pr",   "^pr$|precip",                 "precipitation")
+  r_temp <- r_tmax   # reference layer for the time axis / geometry
+
+  # Capture the time axis BEFORE aggregating — terra::aggregate() does not carry
+  # the time dimension through, which silently yields all-NA dates downstream.
+  n_lyr <- terra::nlyr(r_temp)
+  dates <- tryCatch(as.Date(terra::time(r_temp)), error = function(e) NULL)
+  if (is.null(dates) || all(is.na(dates)) || length(dates) != n_lyr) {
+    dates <- seq(yr_start, by = "day", length.out = n_lyr)
+    message(sprintf("  GRIDMET %d: time axis unusable — assuming daily from %s",
+                    yr, yr_start))
+  }
+
+  # Aggregate to a coarser grid before computing FWI.  FWI is nonlinear and the
+  # moisture codes carry day-to-day memory, so we preserve per-location code
+  # evolution (unlike averaging the met fields first) without paying the full
+  # 4 km cost.  agg_fact = 6 gives ~24 km cells.
+  .agg <- function(r) if (agg_fact > 1L)
+    terra::aggregate(r, fact = agg_fact, fun = "mean", na.rm = TRUE) else r
+  r_tmax <- .agg(r_tmax); r_tmin <- .agg(r_tmin)
+  r_rmin <- .agg(r_rmin); r_rmax <- .agg(r_rmax)
+  r_ws   <- .agg(r_ws);   r_pr   <- .agg(r_pr)
+
+  cal_v  <- project(vect(cal_sf), crs(r_tmax))
+  .msk <- function(r) mask(r, cal_v)
+  r_tmax <- .msk(r_tmax); r_tmin <- .msk(r_tmin)
+  r_rmin <- .msk(r_rmin); r_rmax <- .msk(r_rmax)
+  r_ws   <- .msk(r_ws);   r_pr   <- .msk(r_pr)
+
+  xy <- terra::xyFromCell(r_tmax, seq_len(terra::ncell(r_tmax)))
+  m_tmax <- terra::values(r_tmax); m_tmin <- terra::values(r_tmin)
+  m_rmin <- terra::values(r_rmin); m_rmax <- terra::values(r_rmax)
+  m_ws   <- terra::values(r_ws);   m_pr   <- terra::values(r_pr)
+
+  # Keep only cells with complete data across all six variables
+  keep <- which(
+    rowSums(is.na(m_tmax)) == 0 & rowSums(is.na(m_tmin)) == 0 &
+    rowSums(is.na(m_rmin)) == 0 & rowSums(is.na(m_rmax)) == 0 &
+    rowSums(is.na(m_ws))   == 0 & rowSums(is.na(m_pr))   == 0
+  )
+  if (length(keep) == 0)
+    stop(sprintf("GRIDMET %d: no cells with complete data inside boundary.", yr))
+
+  nd <- length(dates)
+  # Cache the RAW variables.  Deriving temp/rh here would bake one convention
+  # into the cache and force a full re-download to switch.
+  out <- tibble(
+    id    = rep(keep, times = nd),
+    long  = rep(xy[keep, 1], times = nd),
+    lat   = rep(xy[keep, 2], times = nd),
+    date  = rep(dates, each = length(keep)),
+    tmax  = as.numeric(m_tmax[keep, ]) - 273.15,   # K -> deg C
+    tmin  = as.numeric(m_tmin[keep, ]) - 273.15,   # K -> deg C
+    rmin  = as.numeric(m_rmin[keep, ]),
+    rmax  = as.numeric(m_rmax[keep, ]),
+    ws    = as.numeric(m_ws[keep, ]) * 3.6,        # m/s -> km/h
+    prec  = as.numeric(m_pr[keep, ])               # mm (Van Wagner expects mm)
+  )
+
+  if (!is.null(cache_file)) saveRDS(out, cache_file)
+  out
+}
+
+
+# =============================================================================
+# compute_gridmet_fwi
+#
+# Derives daily FFMC / DMC / DC / FWI time series from GRIDMET meteorology
+# using the Canadian Forest Fire Weather Index System (cffdrs package).
+#
+# Motivation: the ERA-Interim FWI product (Vitolo et al. 2019) ends in 2018,
+# but NIROPS perimeters run 2020-2024 and GRIDMET runs 1979-present.  Deriving
+# FWI from GRIDMET gives a single internally consistent FWI definition that
+# spans both the ignition record (FPA FOD, 1992-2020) and the modern perimeter
+# record — which matters because SCF applies one FWI stream at runtime.
+#
+# Moisture codes are re-initialised each year on `reset_mmdd` (default 1 April).
+# Running continuously through winter would let DC accumulate unrealistically.
+#
+# Returns list(FWI, FFMC, DMC, DC), each a tibble(date, value) matching the
+# schema produced by extract_era_timeseries() so downstream code is unchanged.
+# -----------------------------------------------------------------------------
+
+compute_gridmet_fwi <- function(cal_vect, cal_start, cal_end,
+                                 agg_fact    = 6L,
+                                 reset_mmdd  = "04-01",
+                                 init_ffmc   = 85,
+                                 init_dmc    = 6,
+                                 init_dc     = 15,
+                                 convention  = c("landis", "peak"),
+                                 precip_scale = 1.0,
+                                 cache_dir   = NULL,
+                                 progress_fn = NULL) {
+
+  # FWI convention.  This matters more than any coefficient:
+  #
+  #   "landis" — daily MEAN temperature and MEAN relative humidity.  This is
+  #     what the LANDIS-II Climate Library computes (ClimateDataParser.cs:314
+  #     sets Temp = 0.5*(MinTemp+MaxTemp); :329 sets RH = 0.5*(MinRH+MaxRH)),
+  #     and therefore what SCF actually consumes at runtime.
+  #
+  #   "peak" — daily MAX temperature and MIN relative humidity, the US gridded
+  #     fire-danger convention approximating mid-afternoon burning conditions.
+  #
+  # Calibrating on "peak" and running SCF on Climate-Library FWI applies the
+  # fitted coefficients to a systematically different (much higher) predictor.
+  # Default to "landis" so calibration and simulation share one definition.
+  convention <- match.arg(convention)
+
+  if (!requireNamespace("climateR", quietly = TRUE))
+    stop("climateR package required. Install with: install.packages('climateR')")
+  if (!requireNamespace("cffdrs", quietly = TRUE))
+    stop("cffdrs package required for GRIDMET-derived FWI. ",
+         "Install with: install.packages('cffdrs')")
+
+  cal_wgs84 <- project(cal_vect, "EPSG:4326")
+  cal_sf    <- sf::st_as_sf(cal_wgs84)
+
+  # Stable short key so cached files are tied to this specific boundary
+  bb      <- as.vector(terra::ext(cal_wgs84))
+  aoi_key <- substr(
+    paste0(format(round(bb, 3), trim = TRUE), collapse = "_"), 1, 40
+  )
+  aoi_key <- gsub("[^0-9A-Za-z_-]", "", aoi_key)
+
+  years   <- seq(year(cal_start), year(cal_end))
+  results <- vector("list", length(years))
+
+  for (i in seq_along(years)) {
+    yr <- years[i]
+    if (!is.null(progress_fn)) progress_fn(i, length(years), yr)
+
+    yr_start <- max(cal_start, as.Date(sprintf("%d-01-01", yr)))
+    yr_end   <- min(cal_end,   as.Date(sprintf("%d-12-31", yr)))
+
+    met <- tryCatch(
+      fetch_gridmet_met_year(cal_sf, yr, yr_start, yr_end,
+                             agg_fact = agg_fact, cache_dir = cache_dir,
+                             aoi_key  = aoi_key),
+      error = function(e) {
+        warning(sprintf("GRIDMET fetch/compute failed for %d: %s",
+                        yr, conditionMessage(e)))
+        NULL
+      }
+    )
+    if (is.null(met)) next
+
+    # Restrict to the fire season starting at reset_mmdd so the moisture codes
+    # begin from the standard spring startup state each year.
+    reset_date <- as.Date(sprintf("%d-%s", yr, reset_mmdd))
+    met <- met %>% filter(date >= reset_date) %>% arrange(date, id)
+    if (nrow(met) == 0) next
+
+    # Derive temp / RH per the selected convention.  The cache stores raw
+    # tmax/tmin/rmin/rmax so switching convention costs nothing.
+    if (convention == "landis") {
+      met_temp <- 0.5 * (met$tmax + met$tmin)   # LANDIS: 0.5*(MinTemp+MaxTemp)
+      met_rh   <- 0.5 * (met$rmin + met$rmax)   # LANDIS: 0.5*(MinRH+MaxRH)
+    } else {
+      met_temp <- met$tmax                      # peak burning conditions
+      met_rh   <- met$rmin
+    }
+    # FWI equations require RH strictly within (0, 100]
+    met_rh <- pmax(pmin(met_rh, 100), 0.01)
+
+    fwi_in <- data.frame(
+      id   = met$id,   lat  = met$lat,  long = met$long,
+      yr   = as.integer(format(met$date, "%Y")),
+      mon  = as.integer(format(met$date, "%m")),
+      day  = as.integer(format(met$date, "%d")),
+      temp = met_temp, rh = met_rh, ws = met$ws,
+      # precip_scale replicates a LANDIS climate file whose precipitation column
+      # is in CENTIMETRES.  The Climate Library feeds Precip straight into the
+      # Van Wagner rain equations, which are calibrated in MILLIMETRES and use
+      # thresholds of 1.5 / 2.8 mm with no unit conversion (FireClimate.cs:95,
+      # :122).  A cm file is therefore treated as 1/10 the true rainfall, which
+      # inflates runtime FWI.  Set precip_scale = 0.1 to reproduce that, so the
+      # calibration FWI matches what SCF actually consumes.
+      prec = met$prec * precip_scale
+    )
+
+    n_cells <- length(unique(met$id))
+    fwi_out <- tryCatch(
+      cffdrs::fwi(
+        fwi_in,
+        init  = data.frame(
+          ffmc = rep(init_ffmc, n_cells),
+          dmc  = rep(init_dmc,  n_cells),
+          dc   = rep(init_dc,   n_cells),
+          lat  = unique(met[, c("id", "lat")])$lat
+        ),
+        batch = TRUE, out = "all", lat.adjust = TRUE, uppercase = TRUE
+      ),
+      error = function(e) {
+        warning(sprintf("cffdrs::fwi failed for %d: %s", yr, conditionMessage(e)))
+        NULL
+      }
+    )
+    if (is.null(fwi_out)) next
+
+    # Spatial mean per date — matches how extract_era_timeseries() reduces the
+    # gridded ERA FWI product to a single regional series.
+    results[[i]] <- tibble(
+      date = met$date,
+      FWI  = as.numeric(fwi_out$FWI),
+      FFMC = as.numeric(fwi_out$FFMC),
+      DMC  = as.numeric(fwi_out$DMC),
+      DC   = as.numeric(fwi_out$DC)
+    ) %>%
+      group_by(date) %>%
+      summarise(across(c(FWI, FFMC, DMC, DC), ~ mean(.x, na.rm = TRUE)),
+                .groups = "drop")
+  }
+
+  all_df <- bind_rows(results)
+  if (nrow(all_df) == 0)
+    stop(paste0(
+      "No GRIDMET-derived FWI produced for the specified region and period.\n",
+      "  Check that the calibration boundary is within CONUS and that the\n",
+      "  GRIDMET THREDDS server is reachable."
+    ))
+
+  all_df <- all_df %>%
+    filter(date >= cal_start, date <= cal_end) %>%
+    arrange(date)
+
+  message(sprintf(
+    "GRIDMET FWI: %d daily values | FWI range %.1f - %.1f | %d year(s)",
+    nrow(all_df), min(all_df$FWI, na.rm = TRUE), max(all_df$FWI, na.rm = TRUE),
+    length(unique(format(all_df$date, "%Y")))
+  ))
+
+  list(
+    FWI  = all_df %>% transmute(date, value = FWI),
+    FFMC = all_df %>% transmute(date, value = FFMC),
+    DMC  = all_df %>% transmute(date, value = DMC),
+    DC   = all_df %>% transmute(date, value = DC)
+  )
+}
+
+
+# =============================================================================
+# compute_landis_climate_fwi
+#
+# Computes FWI directly from a LANDIS-II daily climate input file, replicating
+# the Climate Library's own conventions.  This is the FWI SCF actually consumes
+# at runtime, so it is the reference against which any calibration FWI should
+# be checked.
+#
+# WHY THIS EXISTS: spread and ignition coefficients are fit against whatever FWI
+# series the calibration uses.  SCF then applies them to the Climate Library's
+# FWI.  If the two are computed from different variables the coefficients are
+# applied to a systematically different predictor and no amount of tuning fixes
+# it.  This function makes that comparison possible.
+#
+# Expected file format (LANDIS daily climate CSV):
+#   Year,Month,Day,Variable,eco1,eco2,...
+# with Variable rows including tmin/tmax, ppt, and either RH, or dewpoint, or
+# specific humidity.  Wind (windSpeed) is optional but improves ISI.
+#
+# Climate Library conventions replicated (commit a10d6c7):
+#   Temp = 0.5*(MinTemp + MaxTemp)                  ClimateDataParser.cs:314
+#   RH   = 0.5*(MinRH + MaxRH), else from dewpoint  ClimateDataParser.cs:329,333
+#   RH from dewpoint uses the mean temp             ClimateDataParser.cs:453-462
+#   Wind [m/s] * 3.6 -> [km/h]                      ClimateDataParser.cs:12
+#   Codes reset each year from the config startup   FireClimate.cs:19-21
+#   Only days SpringStart..WinterStart are computed FireClimate.cs:26-30
+#
+# PRECIPITATION UNITS — read carefully, the sign of this is easy to get wrong.
+#   The Van Wagner rain equations expect MILLIMETRES.  LANDIS climate files
+#   commonly supply CENTIMETRES (ClimateRecord.Precip is documented [cm]).
+#   An UNPATCHED Climate Library passes the raw column straight through, so a
+#   cm file is silently read as 1/10 the true rainfall.
+#
+#   precip_units    "cm" or "mm" — what the FILE contains.
+#   library_patched TRUE  = compute physically correct FWI (converts cm -> mm).
+#                   FALSE = replicate the unpatched library, i.e. feed the raw
+#                           column in regardless of units.
+#
+#   Resulting multiplier applied to the file's values:
+#       cm file + patched   -> x10   (correct)
+#       cm file + unpatched -> x1    (reproduces the bug)
+#       mm file, either     -> x1    (no bug to reproduce)
+#
+# NOTE: cffdrs implements the FFMC rainfall routine, which the unpatched
+# Climate Library omits entirely.  Against an unpatched library this function
+# will therefore read somewhat LOWER than the library's true output.  Against a
+# patched library the two should agree.
+#
+# Returns list(FWI, FFMC, DMC, DC), each tibble(date, value) — same schema as
+# extract_era_timeseries() so it drops into the rest of the app unchanged.
+# =============================================================================
+
+compute_landis_climate_fwi <- function(csv_path,
+                                        ecoregions   = NULL,
+                                        init_ffmc    = 85,
+                                        init_dmc     = 6,
+                                        init_dc      = 15,
+                                        first_day    = 1,
+                                        last_day     = 365,
+                                        precip_units    = c("cm", "mm"),
+                                        library_patched = TRUE,
+                                        lat          = 46.85,
+                                        progress_fn  = NULL) {
+
+  precip_units <- match.arg(precip_units)
+  precip_scale <- if (isTRUE(library_patched) && precip_units == "cm") 10.0 else 1.0
+
+  if (!file.exists(csv_path)) stop("LANDIS climate file not found: ", csv_path)
+  if (!requireNamespace("cffdrs", quietly = TRUE))
+    stop("cffdrs package required. install.packages('cffdrs')")
+
+  rd <- if (requireNamespace("data.table", quietly = TRUE))
+    data.table::fread(csv_path, showProgress = FALSE) else
+    utils::read.csv(csv_path, stringsAsFactors = FALSE)
+  rd <- as.data.frame(rd)
+
+  nm <- names(rd)
+  .find <- function(pat) nm[grepl(pat, nm, ignore.case = TRUE)][1]
+  c_year <- .find("^year$"); c_mon <- .find("^month$")
+  c_day  <- .find("^day$");  c_var <- .find("^variable$")
+  if (any(is.na(c(c_year, c_mon, c_day, c_var))))
+    stop("Expected Year, Month, Day and Variable columns. Found: ",
+         paste(head(nm, 12), collapse = ", "))
+
+  eco_cols <- nm[grepl("^eco", nm, ignore.case = TRUE)]
+  if (length(eco_cols) == 0) stop("No ecoregion columns (eco1, eco2, ...) found.")
+  if (!is.null(ecoregions) && length(ecoregions) > 0) {
+    sel <- eco_cols[tolower(eco_cols) %in% tolower(ecoregions)]
+    if (length(sel) > 0) eco_cols <- sel
+  }
+  if (!is.null(progress_fn))
+    progress_fn(sprintf("Averaging %d ecoregion column(s)", length(eco_cols)))
+
+  # Landscape mean across the selected ecoregions, then one row per day/variable
+  rd$.val <- rowMeans(
+    suppressWarnings(sapply(rd[eco_cols], as.numeric)), na.rm = TRUE)
+
+  long <- data.frame(
+    year = suppressWarnings(as.integer(rd[[c_year]])),
+    mon  = suppressWarnings(as.integer(rd[[c_mon]])),
+    day  = suppressWarnings(as.integer(rd[[c_day]])),
+    var  = tolower(trimws(as.character(rd[[c_var]]))),
+    val  = rd$.val,
+    stringsAsFactors = FALSE
+  )
+  long <- long[stats::complete.cases(long[, c("year", "mon", "day")]), ]
+
+  w <- tidyr::pivot_wider(long, names_from = var, values_from = val,
+                          values_fn = function(x) mean(x, na.rm = TRUE))
+  w <- as.data.frame(w)
+  w$date <- as.Date(sprintf("%04d-%02d-%02d", w$year, w$mon, w$day))
+  w <- w[!is.na(w$date), ]
+  w <- w[order(w$date), ]
+
+  g <- function(pat) { h <- names(w)[grepl(pat, names(w), ignore.case = TRUE)][1]
+                       if (is.na(h)) NULL else suppressWarnings(as.numeric(w[[h]])) }
+  tmin <- g("^tmin$|min.*temp"); tmax <- g("^tmax$|max.*temp")
+  tmean_direct <- g("^temp$|^tmean$")
+  rmin <- g("^rmin$|min.*(rh|humid)"); rmax <- g("^rmax$|max.*(rh|humid)")
+  rh_direct <- g("^rh$|^relativehumidity$")
+  dewp <- g("^dewpoint$|^tdew$|dew")
+  ppt  <- g("^ppt$|^precip"); wsp <- g("^windspeed$|^ws$|^wind$")
+
+  if (is.null(ppt)) stop("No precipitation column (ppt / precip) found.")
+
+  # Temp: prefer an explicit column, else the Climate Library's 0.5*(min+max)
+  temp <- if (!is.null(tmean_direct)) tmean_direct
+          else if (!is.null(tmin) && !is.null(tmax)) 0.5 * (tmin + tmax)
+          else stop("Need either a temp column or both tmin and tmax.")
+
+  # RH: explicit, else mean of min/max, else derived from dewpoint + mean temp
+  rh <- if (!is.null(rh_direct)) rh_direct
+        else if (!is.null(rmin) && !is.null(rmax)) 0.5 * (rmin + rmax)
+        else if (!is.null(dewp))
+          100 * pmin(1, exp(17.625 * (dewp / (243.04 + dewp) -
+                                      temp / (243.04 + temp))))
+        else stop("Need RH, or MinRH+MaxRH, or dewpoint.")
+  rh <- pmax(pmin(rh, 100), 0.01)
+
+  # Wind: LANDIS input is m/s and the library multiplies by 3.6
+  ws <- if (!is.null(wsp)) wsp * 3.6 else rep(0, nrow(w))
+  if (is.null(wsp))
+    message("compute_landis_climate_fwi: no wind column — ISI computed with ws = 0.")
+
+  prec <- ppt * precip_scale
+  doy  <- as.integer(format(w$date, "%j"))
+
+  # Codes reset each year; only SpringStart..WinterStart are computed
+  out <- list(); i <- 1
+  yrs <- sort(unique(w$year))
+  for (k in seq_along(yrs)) {
+    y <- yrs[k]
+    if (!is.null(progress_fn))
+      progress_fn(sprintf("FWI year %d (%d of %d)", y, k, length(yrs)))
+    sel <- which(w$year == y & doy >= first_day & doy <= last_day)
+    if (length(sel) < 2) next
+    inp <- data.frame(
+      yr = w$year[sel], mon = w$mon[sel], day = w$day[sel],
+      lat = lat, long = -120,
+      temp = temp[sel], rh = rh[sel], ws = ws[sel], prec = prec[sel]
+    )
+    inp <- inp[stats::complete.cases(inp), ]
+    if (nrow(inp) < 2) next
+    r <- tryCatch(
+      suppressWarnings(cffdrs::fwi(
+        inp, init = data.frame(ffmc = init_ffmc, dmc = init_dmc,
+                               dc = init_dc, lat = lat),
+        batch = TRUE, out = "all", uppercase = TRUE)),
+      error = function(e) { warning(sprintf("FWI failed for %d: %s", y,
+                                            conditionMessage(e))); NULL })
+    if (is.null(r)) next
+    out[[i]] <- tibble(
+      date = as.Date(sprintf("%04d-%02d-%02d", inp$yr, inp$mon, inp$day)),
+      FWI = as.numeric(r$FWI), FFMC = as.numeric(r$FFMC),
+      DMC = as.numeric(r$DMC), DC = as.numeric(r$DC)
+    )
+    i <- i + 1
+  }
+
+  all_df <- bind_rows(out)
+  if (nrow(all_df) == 0)
+    stop("No FWI produced from the LANDIS climate file. Check the day window ",
+         "(first_day/last_day) and that required variables are present.")
+  all_df <- all_df %>% arrange(date)
+
+  message(sprintf("  precip: file in %s, library_patched=%s -> multiplier x%g",
+                  precip_units, library_patched, precip_scale))
+  message(sprintf(
+    "LANDIS climate FWI: %d days | %d years | FWI median %.1f, p90 %.1f, max %.1f",
+    nrow(all_df), length(unique(format(all_df$date, "%Y"))),
+    median(all_df$FWI, na.rm = TRUE),
+    quantile(all_df$FWI, 0.9, na.rm = TRUE), max(all_df$FWI, na.rm = TRUE)))
+
+  list(
+    FWI  = all_df %>% transmute(date, value = FWI),
+    FFMC = all_df %>% transmute(date, value = FFMC),
+    DMC  = all_df %>% transmute(date, value = DMC),
+    DC   = all_df %>% transmute(date, value = DC)
+  )
+}
+
+
 # -----------------------------------------------------------------------------
 # compute_startup_values
 #
