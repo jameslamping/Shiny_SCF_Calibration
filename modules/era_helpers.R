@@ -821,6 +821,103 @@ compute_landis_climate_fwi <- function(csv_path,
 
 
 # -----------------------------------------------------------------------------
+# plot_fwi_comparison
+#
+# Side-by-side comparison of the CALIBRATION FWI (whatever series the models are
+# fit against) and the RUNTIME FWI (computed from the LANDIS climate file with
+# the Climate Library's conventions).
+#
+# This is the check that catches the single most damaging calibration error:
+# fitting coefficients against one FWI definition and running SCF on another.
+# The two series should overlap.  Where they do not, every fitted coefficient is
+# being applied to a systematically different predictor, and no amount of
+# parameter tuning will reconcile them.
+#
+# Panel A — distribution over the fire season (the days that matter).
+# Panel B — monthly median cycle, which exposes seasonal-timing differences that
+#           a pooled distribution can hide.
+#
+# Arguments:
+#   cal_fwi, runtime_fwi  tibble(date, value) each
+#   season_months         months treated as fire season for Panel A
+# -----------------------------------------------------------------------------
+
+plot_fwi_comparison <- function(cal_fwi, runtime_fwi = NULL,
+                                 cal_label     = "Calibration FWI",
+                                 runtime_label = "Runtime FWI (LANDIS)",
+                                 season_months = 6:9) {
+
+  if (is.null(cal_fwi) || !all(c("date", "value") %in% names(cal_fwi))) return(NULL)
+
+  mk <- function(df, lab) {
+    if (is.null(df) || nrow(df) == 0) return(NULL)
+    tibble(date = as.Date(df$date), value = suppressWarnings(as.numeric(df$value)),
+           series = lab) %>% filter(is.finite(value))
+  }
+  dd <- bind_rows(mk(cal_fwi, cal_label), mk(runtime_fwi, runtime_label))
+  if (nrow(dd) == 0) return(NULL)
+  dd$series <- factor(dd$series, levels = c(cal_label, runtime_label))
+
+  cols <- setNames(c("#2c3e50", "#a0522d"), c(cal_label, runtime_label))
+  seas <- dd %>% filter(lubridate::month(date) %in% season_months)
+
+  # Summary line: the numbers that decide whether these are the same variable
+  s <- seas %>% group_by(series) %>%
+    summarise(n = n(),
+              p50 = median(value, na.rm = TRUE),
+              p90 = quantile(value, 0.90, na.rm = TRUE),
+              mx  = max(value, na.rm = TRUE), .groups = "drop")
+  sub <- paste(sprintf("%s: p50 %.1f, p90 %.1f, max %.1f",
+                       s$series, s$p50, s$p90, s$mx), collapse = "   |   ")
+  if (nrow(s) == 2) {
+    r50 <- s$p50[2] / max(s$p50[1], 1e-9)
+    r90 <- s$p90[2] / max(s$p90[1], 1e-9)
+    sub <- paste0(sub, sprintf("\nRuntime / calibration: p50 %.2f\u00d7, p90 %.2f\u00d7",
+                               r50, r90))
+  } else {
+    sub <- paste0(sub, "\nLoad the LANDIS climate file to add the runtime series.")
+  }
+
+  p_a <- ggplot(seas, aes(value, fill = series, colour = series)) +
+    geom_density(alpha = 0.32, linewidth = 0.7) +
+    scale_fill_manual(values = cols, drop = FALSE) +
+    scale_colour_manual(values = cols, drop = FALSE) +
+    labs(title = sprintf("A. Fire-season distribution (months %s)",
+                         paste(range(season_months), collapse = "\u2013")),
+         x = "FWI", y = "Density", fill = NULL, colour = NULL) +
+    theme_bw(base_size = 11) + theme(legend.position = "bottom")
+
+  mo <- dd %>%
+    mutate(mon = lubridate::month(date)) %>%
+    group_by(series, mon) %>%
+    summarise(med = median(value, na.rm = TRUE), .groups = "drop")
+
+  p_b <- ggplot(mo, aes(mon, med, colour = series)) +
+    geom_line(linewidth = 0.9) + geom_point(size = 2.1) +
+    scale_colour_manual(values = cols, drop = FALSE) +
+    scale_x_continuous(breaks = 1:12, labels = month.abb) +
+    labs(title = "B. Monthly median cycle",
+         x = NULL, y = "Median FWI", colour = NULL) +
+    theme_bw(base_size = 11) + theme(legend.position = "bottom")
+
+  if (requireNamespace("patchwork", quietly = TRUE)) {
+    (p_a / p_b) + patchwork::plot_annotation(
+      title    = "Calibration vs Runtime FWI",
+      subtitle = sub,
+      caption  = paste0(
+        "Calibration FWI = the series the ignition and spread models are fit ",
+        "against.  Runtime FWI = computed from the LANDIS climate file using the\n",
+        "Climate Library's conventions, i.e. what SCF actually consumes.  ",
+        "These should overlap; if they do not, fitted coefficients are being\n",
+        "applied to a different predictor than they were estimated from.")
+    )
+  } else {
+    p_a + labs(subtitle = sub)
+  }
+}
+
+
+# -----------------------------------------------------------------------------
 # compute_startup_values
 #
 # Derives recommended SCF startup values (FFMC, DMC, DC) from ERA climatologies.

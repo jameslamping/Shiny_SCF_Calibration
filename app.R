@@ -262,6 +262,8 @@ ui <- page_navbar(
                  class = "btn-sm btn-outline-secondary w-100",
                  icon  = icon("file-import")),
     uiOutput("landis_fwi_status"),
+    br(),
+    uiOutput("fwi_compare_ui"),
 
     conditionalPanel(
       "input.fwi_source == 'era'",
@@ -5490,6 +5492,49 @@ server <- function(input, output, session) {
       })
     })
   })
+
+  # ---- Calibration vs runtime FWI comparison ---------------------------------
+  # The check that catches coefficients fit to one FWI definition and applied to
+  # another.  Appears as soon as a calibration FWI exists; the runtime series is
+  # added once the LANDIS climate file is loaded.
+  .fwi_cmp_plot <- reactive({
+    req(rv$era_fwi_daily)
+    plot_fwi_comparison(
+      cal_fwi     = rv$era_fwi_daily,
+      runtime_fwi = if (!is.null(rv$landis_fwi)) rv$landis_fwi$FWI else NULL
+    )
+  })
+
+  output$fwi_compare_plot <- renderPlot({
+    p <- .fwi_cmp_plot(); req(p); p
+  })
+
+  output$fwi_compare_ui <- renderUI({
+    if (is.null(rv$era_fwi_daily)) return(NULL)
+    tagList(
+      hr(),
+      h6(icon("code-compare"), " Calibration vs Runtime FWI"),
+      p(class = "text-muted small",
+        if (is.null(rv$landis_fwi))
+          "Showing the calibration FWI only. Compute the runtime FWI above to overlay what SCF actually consumes."
+        else
+          paste("The two series should overlap. Where they diverge, fitted",
+                "coefficients are being applied to a different predictor than",
+                "they were estimated from.")),
+      plotOutput("fwi_compare_plot", height = "520px"),
+      br(),
+      downloadButton("dl_fwi_compare", "Download PNG (300 dpi)",
+                     class = "btn-sm btn-outline-secondary")
+    )
+  })
+
+  output$dl_fwi_compare <- downloadHandler(
+    filename = "fwi_calibration_vs_runtime.png",
+    content  = function(f) {
+      p <- .fwi_cmp_plot(); req(p)
+      ggsave(f, p, width = 9, height = 8, dpi = 300, bg = "white")
+    }
+  )
 
   # ---- Percolation diagnostic ------------------------------------------------
   # The single most useful spread diagnostic: shows the fitted P(spread) curve
