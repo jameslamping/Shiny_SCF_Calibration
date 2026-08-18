@@ -262,6 +262,7 @@ ui <- page_navbar(
                  class = "btn-sm btn-outline-secondary w-100",
                  icon  = icon("file-import")),
     uiOutput("landis_fwi_status"),
+    uiOutput("landis_fwi_dl_ui"),
     br(),
     uiOutput("fwi_compare_ui"),
 
@@ -5492,6 +5493,31 @@ server <- function(input, output, session) {
       })
     })
   })
+
+  # ---- Download the runtime climate series with FWI attached ------------------
+  # Exports the meteorology exactly as fed to the FWI System (post-convention,
+  # post-unit-conversion) plus every derived index, and stamps the settings used
+  # so the file is self-documenting.
+  output$landis_fwi_dl_ui <- renderUI({
+    if (is.null(rv$landis_fwi) || is.null(rv$landis_fwi$daily)) return(NULL)
+    tagList(
+      br(),
+      downloadButton("dl_landis_fwi", "Download Runtime Climate + FWI (CSV)",
+                     class = "btn-sm btn-outline-primary w-100"),
+      p(class = "text-muted small mt-1",
+        sprintf("%s daily rows. Columns: date, the meteorology actually fed to the FWI System (temp_C, rh_pct, wind_kmh, precip_mm), all six indices (FFMC, DMC, DC, ISI, BUI, FWI, DSR), and the settings used.",
+                scales::comma(nrow(rv$landis_fwi$daily))))
+    )
+  })
+
+  output$dl_landis_fwi <- downloadHandler(
+    filename = function() sprintf("landis_runtime_climate_fwi_%s.csv",
+                                   format(Sys.Date(), "%Y%m%d")),
+    content  = function(f) {
+      req(rv$landis_fwi, rv$landis_fwi$daily)
+      readr::write_csv(rv$landis_fwi$daily, f)
+    }
+  )
 
   # ---- Calibration vs runtime FWI comparison ---------------------------------
   # The check that catches coefficients fit to one FWI definition and applied to

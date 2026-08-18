@@ -789,10 +789,19 @@ compute_landis_climate_fwi <- function(csv_path,
       error = function(e) { warning(sprintf("FWI failed for %d: %s", y,
                                             conditionMessage(e))); NULL })
     if (is.null(r)) next
+    # Keep the full record: the meteorology actually fed to the FWI System
+    # (post-convention, post-unit-conversion) alongside every derived index, so
+    # the result can be exported and checked against other sources.
     out[[i]] <- tibble(
       date = as.Date(sprintf("%04d-%02d-%02d", inp$yr, inp$mon, inp$day)),
-      FWI = as.numeric(r$FWI), FFMC = as.numeric(r$FFMC),
-      DMC = as.numeric(r$DMC), DC = as.numeric(r$DC)
+      temp_C      = as.numeric(r$TEMP),
+      rh_pct      = as.numeric(r$RH),
+      wind_kmh    = as.numeric(r$WS),
+      precip_mm   = as.numeric(r$PREC),
+      FFMC = as.numeric(r$FFMC), DMC = as.numeric(r$DMC),
+      DC   = as.numeric(r$DC),   ISI = as.numeric(r$ISI),
+      BUI  = as.numeric(r$BUI),  FWI = as.numeric(r$FWI),
+      DSR  = as.numeric(r$DSR)
     )
     i <- i + 1
   }
@@ -815,7 +824,26 @@ compute_landis_climate_fwi <- function(csv_path,
     FWI  = all_df %>% transmute(date, value = FWI),
     FFMC = all_df %>% transmute(date, value = FFMC),
     DMC  = all_df %>% transmute(date, value = DMC),
-    DC   = all_df %>% transmute(date, value = DC)
+    DC   = all_df %>% transmute(date, value = DC),
+    # Full daily record for export / external comparison.  Carries the exact
+    # inputs the FWI System received, so the settings that produced these
+    # numbers are reconstructable from the file alone.
+    daily = all_df %>%
+      mutate(
+        year  = as.integer(format(date, "%Y")),
+        month = as.integer(format(date, "%m")),
+        day   = as.integer(format(date, "%d")),
+        precip_units_in  = precip_units,
+        library_patched  = library_patched,
+        precip_scale     = precip_scale,
+        init_ffmc = init_ffmc, init_dmc = init_dmc, init_dc = init_dc,
+        first_day = first_day, last_day = last_day
+      ) %>%
+      select(date, year, month, day,
+             temp_C, rh_pct, wind_kmh, precip_mm,
+             FFMC, DMC, DC, ISI, BUI, FWI, DSR,
+             precip_units_in, library_patched, precip_scale,
+             init_ffmc, init_dmc, init_dc, first_day, last_day)
   )
 }
 
