@@ -1130,6 +1130,25 @@ ui <- page_navbar(
           "leave disabled for GeoMAC."),
 
         hr(),
+        h6("FWI Spatial Resolution"),
+        checkboxInput("fwi_per_fire",
+                      "Use per-fire FWI (grid cell at each fire centroid)",
+                      value = TRUE),
+        p(class = "text-muted small",
+          "When checked, each perimeter is assigned the FWI of the GRIDMET cell ",
+          "it sits in, at the resolution set by the aggregation factor on the ",
+          "Landscape tab. When unchecked, every fire burning on a given day gets ",
+          "the same landscape-mean FWI, which erases the spatial variance the ",
+          "spread model depends on and biases ", tags$code("B1_FWI"),
+          " toward zero. SCF reads the FWI of the specific ecoregion a fire ",
+          "spreads into, so per-fire is the closer analogue."),
+        div(class = "alert alert-warning py-2 small",
+          icon("clock"), " Requires the GRIDMET cache. It streams one year at a ",
+          "time and keeps only the cells containing fire centroids, so memory ",
+          "stays bounded \u2014 but at 4 km over a large boundary the cache years are ",
+          "~100 MB each and the first pass takes several minutes."),
+
+        hr(),
         h6("Spread Rasterization"),
         fluidRow(
           column(8,
@@ -2940,7 +2959,7 @@ server <- function(input, output, session) {
                    "max_gap_spread_prob","max_gap_daily_area","failure_sample_ratio",
                    "search_gap_sp","search_gap_da","search_max_samples",
                    "search_fail_ratio","search_neg_tol","search_w_auc","search_w_r2",
-                   "neg_growth_tol","max_growth_factor","fired_min_detection_days",
+                   "neg_growth_tol","max_growth_factor","fwi_per_fire","fired_min_detection_days",
                    "cand_b0_min","cand_b0_max","cand_b0_step",
                    "cand_b1_min","cand_b1_max","cand_b1_step","scf_runs_root",
                    "score_w_aab","score_w_size","val_cell_area_ha","val_events_path",
@@ -4676,6 +4695,42 @@ server <- function(input, output, session) {
         rv$dem_r <- rv$slope_r <- rv$aspect_r <- NULL
       }
 
+      # Per-fire FWI: assign each perimeter the FWI of the grid cell it sits in,
+      # rather than the landscape mean for that date.  Streams one cache year at
+      # a time and keeps only the cells containing fire centroids.
+      fwi_pt <- NULL
+      if (isTRUE(input$fwi_per_fire) && identical(input$fwi_source, "gridmet")) {
+        setProgress(0.15, detail = "Computing per-fire FWI at grid-cell resolution...")
+        cdir_pf <- trimws(input$gridmet_cache_dir)
+        if (nchar(cdir_pf) == 0) cdir_pf <- "gridmet_cache"
+        if (!grepl("^(/|~|[A-Za-z]:)", cdir_pf)) cdir_pf <- file.path(getwd(), cdir_pf)
+        fwi_pt <- tryCatch(
+          compute_gridmet_fwi_at_fires(
+            geomac_v     = geomac_result,
+            cal_vect     = rv$cal_vect,
+            cal_start    = as.Date(sprintf("%d-01-01", input$cal_years[1])),
+            cal_end      = as.Date(sprintf("%d-12-31", input$cal_years[2])),
+            agg_fact     = as.integer(input$gridmet_agg_fact),
+            reset_mmdd   = trimws(input$gridmet_reset_mmdd),
+            init_ffmc    = as.numeric(input$gridmet_init_ffmc),
+            init_dmc     = as.numeric(input$gridmet_init_dmc),
+            init_dc      = as.numeric(input$gridmet_init_dc),
+            convention   = input$gridmet_convention,
+            precip_scale = switch(input$climlib_version,
+                                   fixed = 1.0, prepatch = 0.1,
+                                   manual = as.numeric(input$gridmet_precip_scale), 1.0),
+            cache_dir    = cdir_pf,
+            progress_fn  = function(i, n, yr)
+              setProgress(0.15, detail = sprintf("Per-fire FWI: year %d (%d of %d)", yr, i, n))
+          ),
+          error = function(e) {
+            showNotification(paste("Per-fire FWI failed, using landscape mean:",
+                                    conditionMessage(e)), type = "warning", duration = 12)
+            NULL
+          }
+        )
+      }
+
       setProgress(0.2, detail = "Building perimeter pairs with effective wind...")
       climate_joined <- bind_climate_to_pairs(
         geomac_v            = geomac_result,
@@ -4688,6 +4743,7 @@ server <- function(input, output, session) {
         neg_tol_ha          = input$neg_growth_tol,
         max_growth_factor   = if (isTRUE(input$max_growth_factor > 0))
                                 input$max_growth_factor else NULL,
+        fwi_by_row          = fwi_pt,
         combustion_buoyancy = as.numeric(input$combustion_buoyancy)
       )
       rv$pairs_clean <- climate_joined$pairs
@@ -8084,6 +8140,7 @@ server <- function(input, output, session) {
     search_neg_tol      = "number", search_w_auc      = "number",
     search_w_r2         = "number", neg_growth_tol    = "number",
     max_growth_factor   = "number", fired_min_detection_days = "number",
+    fwi_per_fire        = "checkbox",
     cand_b0_min         = "number", cand_b0_max       = "number",
     cand_b0_step        = "number", cand_b1_min       = "number",
     cand_b1_max         = "number", cand_b1_step      = "number",

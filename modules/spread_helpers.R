@@ -1298,6 +1298,7 @@ bind_climate_to_pairs <- function(geomac_v, fwi_daily, wind_daily,
                                    max_gap_da          = 3,
                                    neg_tol_ha          = 1.0,
                                    max_growth_factor   = NULL,
+                                   fwi_by_row          = NULL,
                                    combustion_buoyancy = 10.0) {
 
   gm_df <- as.data.frame(geomac_v) %>%
@@ -1359,7 +1360,16 @@ bind_climate_to_pairs <- function(geomac_v, fwi_daily, wind_daily,
   pairs$centroid_x[valid_idx] <- ctr_xy[, "x"]
   pairs$centroid_y[valid_idx] <- ctr_xy[, "y"]
 
-  # Join climate
+  # Join climate.
+  #
+  # Wind is always joined on DATE (it is a regional daily series).  FWI is
+  # joined per-fire when `fwi_by_row` is supplied — a tibble(row_id, date, FWI)
+  # from compute_gridmet_fwi_at_fires(), giving each perimeter the FWI of the
+  # grid cell it actually sits in.  Joining FWI on date alone gives every fire
+  # burning that day the same landscape-mean value, which erases the spatial
+  # variance the spread model depends on and biases B1_FWI toward zero.
+  # SCF itself reads the FWI of the specific ecoregion a fire spreads into
+  # (FireEvent.cs:177), so the per-fire form is the closer analogue.
   climate <- fwi_daily %>%
     rename(FWI = value) %>%
     left_join(wind_daily, by = "date")
@@ -1371,6 +1381,34 @@ bind_climate_to_pairs <- function(geomac_v, fwi_daily, wind_daily,
       WindSpeed_kmh = suppressWarnings(as.numeric(WindSpeed_kmh)),
       WindDir_deg   = suppressWarnings(as.numeric(WindDir_deg))
     )
+
+  if (!is.null(fwi_by_row) && all(c("row_id", "FWI") %in% names(fwi_by_row))) {
+    pf <- fwi_by_row %>%
+      transmute(row_id = as.integer(row_id), FWI_pt = suppressWarnings(as.numeric(FWI))) %>%
+      filter(!is.na(row_id), is.finite(FWI_pt)) %>%
+      distinct(row_id, .keep_all = TRUE)
+
+    pairs <- pairs %>%
+      left_join(pf, by = "row_id") %>%
+      mutate(
+        FWI_source = ifelse(is.finite(FWI_pt), "per-fire cell", "landscape mean"),
+        FWI        = ifelse(is.finite(FWI_pt), FWI_pt, FWI)
+      ) %>%
+      select(-FWI_pt)
+
+    n_pt <- sum(pairs$FWI_source == "per-fire cell", na.rm = TRUE)
+    message(sprintf(
+      "FWI join: %d of %d pairs matched to their own grid cell (%.0f%%); %d fell back to the landscape mean.",
+      n_pt, nrow(pairs), 100 * n_pt / max(nrow(pairs), 1), nrow(pairs) - n_pt))
+    if (n_pt > 0) {
+      fp <- pairs$FWI[pairs$FWI_source == "per-fire cell"]
+      message(sprintf("  per-fire FWI: median %.1f  p90 %.1f  max %.1f  (sd %.1f)",
+                      median(fp, na.rm = TRUE), quantile(fp, 0.9, na.rm = TRUE),
+                      max(fp, na.rm = TRUE), sd(fp, na.rm = TRUE)))
+    }
+  } else {
+    pairs$FWI_source <- "landscape mean"
+  }
 
   # Compute effective wind: topographic formula if terrain available, else raw speed
   if (!is.null(slope_r) && !is.null(aspect_r)) {

@@ -849,6 +849,171 @@ compute_landis_climate_fwi <- function(csv_path,
 
 
 # -----------------------------------------------------------------------------
+# compute_gridmet_fwi_at_fires
+#
+# Per-fire FWI at native GRIDMET resolution, for spread calibration.
+#
+# WHY: bind_climate_to_pairs() joins FWI on DATE alone, so every fire burning on
+# a given day receives the same landscape-mean FWI.  Over a calibration boundary
+# of tens of millions of hectares that erases exactly the spatial variance the
+# spread model needs: the days that drive large fires are the ones where one
+# corner of the region is extreme while the mean is unremarkable.  Regressing
+# against a spatially-smoothed predictor also biases B1_FWI toward zero.
+#
+# SCF at runtime reads the FWI of the SPECIFIC ecoregion a fire is spreading
+# into (FireEvent.cs:177), so a per-fire predictor is the closer analogue.
+#
+# MEMORY: a 4 km cache year over a large boundary is ~100 MB compressed and
+# several hundred MB in memory.  This function therefore streams one year at a
+# time and immediately subsets to the handful of cells containing fire
+# centroids, so peak memory is set by the cache year, not by the full record.
+# FWI still has to run over the whole year for those cells because the moisture
+# codes carry day-to-day memory — only the fire dates are retained afterwards.
+#
+# Arguments:
+#   geomac_v  SpatVector of perimeters with row_id and perimeter_date
+#             (output of load_nirops_perimeters / load_geomac_perimeters)
+#   ...       remaining arguments match compute_gridmet_fwi()
+#
+# Returns tibble(row_id, date, FWI, FFMC, DMC, DC) — one row per perimeter.
+# Perimeters whose year has no usable met data are omitted, so the caller must
+# handle missing row_ids (bind_climate_to_pairs falls back to the date join).
+# -----------------------------------------------------------------------------
+
+compute_gridmet_fwi_at_fires <- function(geomac_v, cal_vect, cal_start, cal_end,
+                                          agg_fact     = 1L,
+                                          reset_mmdd   = "04-01",
+                                          init_ffmc    = 85,
+                                          init_dmc     = 6,
+                                          init_dc      = 15,
+                                          convention   = c("landis", "peak"),
+                                          precip_scale = 1.0,
+                                          cache_dir    = NULL,
+                                          progress_fn  = NULL) {
+
+  convention <- match.arg(convention)
+  if (!requireNamespace("cffdrs", quietly = TRUE))
+    stop("cffdrs package required. install.packages('cffdrs')")
+
+  # ---- Fire centroids in lon/lat ---------------------------------------------
+  gv  <- terra::project(geomac_v, "EPSG:4326")
+  ctr <- terra::geom(terra::centroids(gv))[, c("x", "y"), drop = FALSE]
+  fires <- tibble(
+    row_id = as.integer(gv$row_id),
+    date   = as.Date(gv$perimeter_date),
+    flon   = as.numeric(ctr[, "x"]),
+    flat   = as.numeric(ctr[, "y"])
+  ) %>%
+    filter(!is.na(row_id), !is.na(date), is.finite(flon), is.finite(flat),
+           date >= cal_start, date <= cal_end)
+
+  if (nrow(fires) == 0)
+    stop("No perimeters with usable centroid and date within the calibration period.")
+
+  cal_wgs84 <- terra::project(cal_vect, "EPSG:4326")
+  cal_sf    <- sf::st_as_sf(cal_wgs84)
+  bb        <- as.vector(terra::ext(cal_wgs84))
+  aoi_key   <- gsub("[^0-9A-Za-z_-]", "",
+                    substr(paste0(format(round(bb, 3), trim = TRUE), collapse = "_"), 1, 40))
+
+  yrs <- sort(unique(as.integer(format(fires$date, "%Y"))))
+  out <- vector("list", length(yrs))
+
+  for (k in seq_along(yrs)) {
+    y <- yrs[k]
+    if (!is.null(progress_fn)) progress_fn(k, length(yrs), y)
+
+    f_y <- fires %>% filter(as.integer(format(date, "%Y")) == y)
+    if (nrow(f_y) == 0) next
+
+    yr_start <- max(cal_start, as.Date(sprintf("%d-01-01", y)))
+    yr_end   <- min(cal_end,   as.Date(sprintf("%d-12-31", y)))
+
+    met <- tryCatch(
+      fetch_gridmet_met_year(cal_sf, y, yr_start, yr_end,
+                             agg_fact = agg_fact, cache_dir = cache_dir,
+                             aoi_key  = aoi_key),
+      error = function(e) {
+        warning(sprintf("GRIDMET %d unavailable: %s", y, conditionMessage(e))); NULL })
+    if (is.null(met) || nrow(met) == 0) next
+
+    # ---- Nearest cell for each fire ------------------------------------------
+    cells <- met %>% distinct(id, long, lat)
+    locs  <- f_y %>% distinct(flon, flat)
+    locs$cell_id <- vapply(seq_len(nrow(locs)), function(i) {
+      d2 <- (cells$long - locs$flon[i])^2 + (cells$lat - locs$flat[i])^2
+      cells$id[which.min(d2)]
+    }, numeric(1))
+    f_y <- f_y %>% left_join(locs, by = c("flon", "flat"))
+
+    keep_cells <- unique(f_y$cell_id)
+    met_sub <- met %>% filter(id %in% keep_cells)
+    if (nrow(met_sub) == 0) next
+
+    # ---- Convention + units, then FWI over the full year for those cells ------
+    reset_date <- as.Date(sprintf("%d-%s", y, reset_mmdd))
+    met_sub <- met_sub %>% filter(date >= reset_date) %>% arrange(date, id)
+    if (nrow(met_sub) == 0) next
+
+    if (convention == "landis") {
+      m_temp <- 0.5 * (met_sub$tmax + met_sub$tmin)
+      m_rh   <- 0.5 * (met_sub$rmin + met_sub$rmax)
+    } else {
+      m_temp <- met_sub$tmax
+      m_rh   <- met_sub$rmin
+    }
+    m_rh <- pmax(pmin(m_rh, 100), 0.01)
+
+    n_cells <- length(unique(met_sub$id))
+    fwi_in <- data.frame(
+      id = met_sub$id, lat = met_sub$lat, long = met_sub$long,
+      yr = as.integer(format(met_sub$date, "%Y")),
+      mon = as.integer(format(met_sub$date, "%m")),
+      day = as.integer(format(met_sub$date, "%d")),
+      temp = m_temp, rh = m_rh, ws = met_sub$ws,
+      prec = met_sub$prec * precip_scale
+    )
+    fwi_out <- tryCatch(
+      cffdrs::fwi(fwi_in,
+                  init = data.frame(ffmc = rep(init_ffmc, n_cells),
+                                    dmc  = rep(init_dmc,  n_cells),
+                                    dc   = rep(init_dc,   n_cells),
+                                    lat  = unique(met_sub[, c("id", "lat")])$lat),
+                  batch = TRUE, out = "all", lat.adjust = TRUE, uppercase = TRUE),
+      error = function(e) {
+        warning(sprintf("cffdrs::fwi failed for %d: %s", y, conditionMessage(e))); NULL })
+    if (is.null(fwi_out)) next
+
+    cell_fwi <- tibble(
+      cell_id = met_sub$id, date = met_sub$date,
+      FWI = as.numeric(fwi_out$FWI), FFMC = as.numeric(fwi_out$FFMC),
+      DMC = as.numeric(fwi_out$DMC), DC  = as.numeric(fwi_out$DC)
+    )
+
+    # Retain only the fire dates; the rest of the year existed solely to carry
+    # the moisture codes forward.
+    out[[k]] <- f_y %>%
+      select(row_id, date, cell_id) %>%
+      inner_join(cell_fwi, by = c("cell_id", "date")) %>%
+      select(row_id, date, FWI, FFMC, DMC, DC)
+
+    rm(met, met_sub, cell_fwi, fwi_in, fwi_out); invisible(gc(FALSE))
+  }
+
+  res <- bind_rows(out)
+  if (nrow(res) == 0)
+    stop("No per-fire FWI produced. Check the cache directory and calibration period.")
+
+  message(sprintf(
+    "Per-fire FWI: %d of %d perimeters matched | FWI median %.1f, p90 %.1f, max %.1f",
+    nrow(res), nrow(fires), median(res$FWI, na.rm = TRUE),
+    quantile(res$FWI, 0.9, na.rm = TRUE), max(res$FWI, na.rm = TRUE)))
+
+  res
+}
+
+
+# -----------------------------------------------------------------------------
 # plot_fwi_comparison
 #
 # Side-by-side comparison of the CALIBRATION FWI (whatever series the models are
