@@ -67,6 +67,27 @@ renv::snapshot()
 # then commit renv.lock
 ```
 
+### Windows and macOS
+
+The app is developed on macOS and used on Windows. The same `renv.lock` works
+on both because renv installs the right binaries for each OS.
+
+- **R version:** use R 4.4.x. The lockfile was recorded with R 4.4.2. R 4.5
+  usually works, but renv will warn about the version mismatch.
+- **No Rtools needed:** every package is either a CRAN binary or pure R,
+  including the GitHub-only `climateR`, `ncmeta`, `rFIA` and `rnz`.
+- **GitHub rate limit:** if `renv::restore()` fails on those GitHub packages
+  with an HTTP 403 error, GitHub's anonymous download limit has been hit. Wait
+  an hour, or set a `GITHUB_PAT` in your `.Renviron` file, then retry.
+- **File paths:** paste paths in any form. `C:\data\fwi.nc`, `C:/data/fwi.nc`
+  and a quoted path from Explorer's "Copy as path" are all normalised to
+  forward slashes when entered.
+- **Default paths:** several path boxes come pre-filled with the original
+  developer's macOS paths. Replace them with your own before loading data.
+- **Sharing the lockfile:** if you install a new package on either OS, run
+  `renv::snapshot()` and commit `renv.lock`. Don't commit `renv/library/`;
+  it is OS-specific and already gitignored.
+
 ---
 
 ## 2. Required Data

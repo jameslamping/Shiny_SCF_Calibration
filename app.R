@@ -41,13 +41,13 @@ pacman::p_load(
 )
 options(tigris_use_cache = TRUE)   # cache downloaded TIGER/Line files locally
 
-source("modules/era_helpers.R")
-source("modules/ignition_helpers.R")
-source("modules/spread_helpers.R")
-source("modules/species_helpers.R")
-source("modules/validation_helpers.R")
-source("modules/mortality_helpers.R")
-source("modules/tuning_helpers.R")
+source("modules/era_helpers.R", encoding = "UTF-8")
+source("modules/ignition_helpers.R", encoding = "UTF-8")
+source("modules/spread_helpers.R", encoding = "UTF-8")
+source("modules/species_helpers.R", encoding = "UTF-8")
+source("modules/validation_helpers.R", encoding = "UTF-8")
+source("modules/mortality_helpers.R", encoding = "UTF-8")
+source("modules/tuning_helpers.R", encoding = "UTF-8")
 options(jsonlite.named_vectors_as_objects = FALSE)
 options(shiny.maxRequestSize = 50 * 1024^2)   # 50 MB — covers JSON settings; .RData loaded by path (no upload)
 
@@ -3089,6 +3089,38 @@ ui <- page_navbar(
 # =============================================================================
 
 server <- function(input, output, session) {
+
+  # ---- Cross-platform path inputs ---------------------------------------------
+  # Windows Explorer's "Copy as path" wraps the path in double quotes and uses
+  # backslashes ("C:\Users\me\data\fwi.nc").  Strip surrounding quotes and switch
+  # to forward slashes, which R, terra and sf accept on every OS, so a pasted
+  # path behaves the same on Windows and macOS.  UNC paths (\\server\share)
+  # become //server/share, which R on Windows also accepts.
+  clean_path_input <- function(x) {
+    if (is.null(x) || !nzchar(x)) return(x)
+    x <- trimws(x)
+    x <- sub("^[\"']+", "", sub("[\"']+$", "", x))
+    gsub("\\\\", "/", x)
+  }
+  path_input_ids <- c(
+    "tif_path", "shp_path", "era_fwi_path", "era_ffmc_path", "era_dmc_path",
+    "era_dc_path", "gridmet_cache_dir", "landis_climate_path", "fpa_gdb_path",
+    "events_log_path", "geomac_gdb_path", "nirops_shp_path", "fired_gpkg_path",
+    "fired_events_gpkg_path", "fine_fuels_path", "ladder_fuels_path",
+    "scf_runs_root", "lookup_csv_path", "necn_csv_path", "fia_local_dir",
+    "ftm_dir", "mtbs_dnbr_dir", "mtbs_local_path", "mtbs_out_dir",
+    "sg_clay_dir", "solus_clay_dir", "et_local_path", "cwd_local_path",
+    "tc_cache_dir", "val_events_path", "fri_maps_dir", "fri_lf_tif_path",
+    "rdata_load_path"
+  )
+  for (id in path_input_ids) local({
+    pid <- id
+    observeEvent(input[[pid]], {
+      raw     <- input[[pid]]
+      cleaned <- clean_path_input(raw)
+      if (!identical(cleaned, raw)) updateTextInput(session, pid, value = cleaned)
+    }, ignoreNULL = TRUE)
+  })
 
   # Helper: map input ID to its tab name for the session preview table
   tab_for_input <- function(id) {

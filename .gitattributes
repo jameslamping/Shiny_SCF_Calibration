@@ -1,0 +1,6 @@
+# Keep LF line endings on every OS so Windows checkouts produce no spurious diffs
+* text=auto eol=lf
+*.png binary
+*.pdf binary
+*.RData binary
+*.rds binary
