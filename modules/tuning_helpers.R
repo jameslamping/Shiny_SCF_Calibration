@@ -6,7 +6,7 @@
 # ggplot objects or plain R values, making them easy to test independently.
 #
 # Functions:
-#   simulate_fire_simple()   Vectorized cellular automaton (no terra deps)
+#   simulate_fire_simple()   One SCF fire event, FireEvent.cs spread rules
 #   plot_msa_surface()       MaxSpreadArea vs FWI at multiple EWS levels
 #   plot_sp_surface()        SpreadProbability vs FWI
 #   plot_sp_ff_sensitivity() P vs FWI at FF=0 vs FF=1 (shows mismatch risk)
@@ -16,7 +16,7 @@
 #   dnbr_sensitivity_table() Denominator / dNBR tabulation across LF values
 #   plot_cm_curve()          P(cohort mort) vs BarkThickness at multiple dNBR
 #   plot_fire_map()          Fire grid from simulate_fire_simple() as ggplot
-#   plot_fire_timeline()     Cumulative area burned per day
+#   plot_fire_timeline()     Area burned per day vs MaxSpreadArea
 #   ign_tune_coef_df()       Hand-typed ignition coefficients -> coef tibble
 #   build_scf_tuning_snippet() SCF parameter file text from tuning inputs
 # =============================================================================
@@ -32,21 +32,46 @@ pacman::p_load(ggplot2, dplyr, tidyr, scales)
 # -----------------------------------------------------------------------------
 # simulate_fire_simple
 #
-# Vectorized cellular automaton that mimics SCF's daily fire spread loop.
+# Single SCF fire event on a square grid of active cells, replicating the
+# spread loop in FireEvent.cs (Extension-Social-Climate-Fire master, 2026-04):
 #
-# At each day:
-#   1. Find cells adjacent (8-connectivity) to the current burn front.
-#   2. Each candidate cell ignites with probability P(spread).
-#   3. If total new cells > MaxSpreadArea/cell_area_ha, randomly subsample.
-#   4. Burning cells advance to burned; new ignitions become the new front.
+#   * FIFO queue.  The ignition cell is queued first and marked Disturbed
+#     (FireEvent.cs:105).  Each popped cell burns, then tries its 4 cardinal
+#     neighbours (N, E, S, W) and then its 4 diagonals, skipping any neighbour
+#     already Disturbed (:679, :707, :735).
+#   * ONE TRIAL PER CELL.  CanSpread() marks the neighbour Disturbed whether or
+#     not it ignites (:456), so a cell that fails is never tried again.  This
+#     is single-trial (site) percolation: fire only propagates when P clears
+#     roughly 0.4 for this 8-neighbour lattice.
+#   * Diagonal tries use P * 0.71 (:537).  Which neighbour tries a cell, and so
+#     which weight applies, is decided by queue order exactly as in SCF.
+#   * MaxSpreadArea is PACING, not a ceiling (:204-216).  After each burned
+#     cell the day's area grows by one cell; once it exceeds
+#     (int)(B0 + B1*FWI + B2*EWS) the day advances and the fire keeps burning.
+#     So each day burns floor(MSA / cell_area) + 1 cells.  Nothing is discarded.
+#   * The loop runs while day <= max_days and a cell only spreads while
+#     day < max_days (:166, :226; SCF uses DaysPerYear = 364).
+#   * FWI and EWS may be single values or DAILY VECTORS (element d is day d;
+#     the last value is reused past the end), as SCF reads daily climate.  The
+#     weather of the day a cell burns sets both its spread trials and MSA.
 #
-# Returns a list with:
-#   total_ha   : total area burned (ha)
-#   days       : number of simulation days
-#   msa_ha     : MaxSpreadArea ceiling used
-#   p_spread   : spread probability used
-#   timeline   : data.frame (day, new_cells, total_cells)
-#   grid       : integer matrix — 0=unburned, 1=still burning (last front), 2=burned
+# Not modelled: suppression, BurningSitesThreshold (absent from SCF master),
+# Cb escalation of EWS with intensity, spatially varying fuels/terrain, and
+# cells already Disturbed by earlier fires in the same year.
+#
+# Implementation: the queue is processed one generation at a time (all cells
+# queued by the previous generation, in queue order).  Each untried neighbour
+# is tried once, by the earliest cell in queue order that reaches it, which is
+# exactly the first CanSpread() call SCF would make for it.  Same result as a
+# per-cell loop, at vector speed.
+#
+# Returns a list:
+#   total_ha, days, msa_ha (day-1 MSA), p_spread (day-1 cardinal P), p_diag,
+#   cells_per_day (day 1), n_burned, n_tried, hit_edge (fire reached the grid
+#   edge, so the size is truncated by the grid), timeline
+#   data.frame(day, new_cells, total_cells), grid (0 = untouched,
+#   1 = burned on the final day, 2 = burned, 3 = tried but did not ignite),
+#   fwi, ews, ff (day-1 values), grid_dim, cell_area_ha.
 # -----------------------------------------------------------------------------
 
 simulate_fire_simple <- function(grid_dim     = 100,
@@ -59,89 +84,129 @@ simulate_fire_simple <- function(grid_dim     = 100,
                                   max_days     = 60,
                                   seed         = 42) {
 
-  set.seed(seed)
+  if (!is.null(seed)) set.seed(seed)
+  grid_dim <- as.integer(grid_dim)
+  n_cells  <- grid_dim * grid_dim
+  max_days <- max(1L, as.integer(max_days))
 
-  msa_ha    <- max(0, msa_b0 + msa_b1 * fwi + msa_b2 * ews)
-  msa_cells <- max(1L, ceiling(msa_ha / cell_area_ha))
-  p_spread  <- 1 / (1 + exp(-(sp_b0 + sp_b1 * fwi + sp_b2 * ff + sp_b3 * ews)))
-  p_spread  <- max(0, min(1, p_spread))   # clamp to [0,1]
+  # Daily weather lookups (recycle the last value past the end)
+  wx <- function(v, d) v[pmin(d, length(v))]
+  p_of_day <- function(d) {
+    1 / (1 + exp(-(sp_b0 + sp_b1 * wx(fwi, d) + sp_b2 * ff + sp_b3 * wx(ews, d))))
+  }
+  msa_of_day <- function(d) {
+    trunc(msa_b0 + msa_b1 * wx(fwi, d) + msa_b2 * wx(ews, d))   # C# (int) cast
+  }
+  # Cells burned per day: smallest k with k * cell_area > MSA  (k >= 1)
+  k_of_day <- function(d) {
+    m <- msa_of_day(d)
+    ifelse(m < 0, 1L, as.integer(floor(m / cell_area_ha)) + 1L)
+  }
+
+  # Neighbour offsets in SCF's order: N, E, S, W, then the four diagonals
+  # (Get4CardinalActiveNeighbors / Get4DiagonalNeighbors).
+  d_row  <- c(-1L, 0L, 1L,  0L, -1L, 1L,  1L, -1L)
+  d_col  <- c( 0L, 1L, 0L, -1L,  1L, 1L, -1L, -1L)
+  weight <- c(1, 1, 1, 1, 0.71, 0.71, 0.71, 0.71)
+
+  disturbed <- logical(n_cells)
+  burn_day  <- integer(n_cells)        # 0 = not burned
+  ign       <- (grid_dim %/% 2 - 1L) * grid_dim + grid_dim %/% 2   # centre
+  disturbed[ign] <- TRUE
+
+  gen      <- ign         # current generation, in queue order
+  day      <- 1L          # SCF's `day`
+  day_area <- 0L          # cells burned so far today
+  n_tried  <- 0L
+  hit_edge <- FALSE
+
+  while (length(gen) > 0 && day <= max_days) {
+
+    # ---- Pop the generation: assign burn days, advance `day` ---------------
+    m         <- length(gen)
+    pre_day   <- integer(m)      # day the cell burns (weather for its trials)
+    post_day  <- integer(m)      # day after any increment (gates spreading)
+    i <- 1L
+    while (i <= m && day <= max_days) {
+      k    <- k_of_day(day)
+      take <- min(m - i + 1L, k - day_area)   # cells that fit in today
+      idx  <- i:(i + take - 1L)
+      pre_day[idx]  <- day
+      post_day[idx] <- day
+      day_area <- day_area + take
+      i <- i + take
+      if (day_area >= k) {                    # area > MSA after the k-th cell
+        post_day[idx[take]] <- day + 1L
+        day      <- day + 1L
+        day_area <- 0L
+      }
+    }
+    popped <- seq_len(i - 1L)                 # cells actually processed
+    if (length(popped) == 0) break
+    gen      <- gen[popped]
+    pre_day  <- pre_day[popped]
+    post_day <- post_day[popped]
+    burn_day[gen] <- pre_day
+
+    # ---- Spread: each untried neighbour gets one try, from its first reacher
+    spreaders <- which(post_day < max_days)
+    if (length(spreaders) == 0) break
+    src  <- gen[spreaders]
+    srow <- (src - 1L) %% grid_dim + 1L
+    scol <- (src - 1L) %/% grid_dim + 1L
+
+    # All (source, direction) pairs in SCF's processing order:
+    # source queue order first, then direction rank 1..8.
+    nr  <- rep(srow, each = 8) + rep(d_row, times = length(src))
+    nc  <- rep(scol, each = 8) + rep(d_col, times = length(src))
+    dir <- rep(1:8, times = length(src))
+    who <- rep(spreaders, each = 8)
+    inside <- nr >= 1L & nr <= grid_dim & nc >= 1L & nc <= grid_dim
+    if (!all(inside)) hit_edge <- TRUE
+    nb  <- (nc[inside] - 1L) * grid_dim + nr[inside]
+    dir <- dir[inside]; who <- who[inside]
+
+    keep <- !disturbed[nb] & !duplicated(nb)      # first reacher wins
+    nb   <- nb[keep]; dir <- dir[keep]; who <- who[keep]
+    if (length(nb) == 0) { gen <- integer(0); break }
+
+    disturbed[nb] <- TRUE                         # tried, burn or not
+    n_tried <- n_tried + length(nb)
+    p   <- p_of_day(pre_day[who]) * weight[dir]
+    ok  <- runif(length(nb)) < p
+    gen <- nb[ok]                                 # already in queue order
+  }
+
+  burned  <- which(burn_day > 0L)
+  n_burn  <- length(burned)
+  last_d  <- if (n_burn) max(burn_day) else 0L
+  tl <- if (n_burn) {
+    nd <- tabulate(burn_day[burned], nbins = last_d)
+    data.frame(day = seq_len(last_d), new_cells = nd, total_cells = cumsum(nd))
+  } else data.frame(day = integer(0), new_cells = integer(0), total_cells = integer(0))
 
   grid <- matrix(0L, grid_dim, grid_dim)
-  cr <- grid_dim %/% 2
-  cc <- grid_dim %/% 2
-  grid[cr, cc] <- 1L
-
-  n_total  <- 1L
-  timeline <- data.frame(day = integer(max_days),
-                          new_cells  = integer(max_days),
-                          total_cells = integer(max_days))
-  n_days <- 0L
-
-  # Vectorized 8-neighbour dilation: shift burning mask in all 8 directions
-  dilate8 <- function(burning) {
-    nr <- nrow(burning); nc <- ncol(burning)
-    Reduce(`|`, list(
-      # cardinal
-      rbind(burning[-1, ],  matrix(FALSE, 1, nc)),  # shift up
-      rbind(matrix(FALSE, 1, nc), burning[-nr, ]),  # shift down
-      cbind(burning[, -1],  matrix(FALSE, nr, 1)),  # shift left
-      cbind(matrix(FALSE, nr, 1), burning[, -nc]),  # shift right
-      # diagonal
-      rbind(cbind(burning[-1, -1],  matrix(FALSE, nr-1, 1)), matrix(FALSE, 1, nc)),
-      rbind(cbind(matrix(FALSE, nr-1, 1), burning[-1, -nc]), matrix(FALSE, 1, nc)),
-      rbind(matrix(FALSE, 1, nc), cbind(burning[-nr, -1],  matrix(FALSE, nr-1, 1))),
-      rbind(matrix(FALSE, 1, nc), cbind(matrix(FALSE, nr-1, 1), burning[-nr, -nc]))
-    ))
-  }
-
-  for (day in seq_len(max_days)) {
-    burning <- grid == 1L
-
-    if (!any(burning)) break
-
-    # Candidates: adjacent to burning, currently unburned
-    cand <- dilate8(burning) & (grid == 0L)
-    n_cand <- sum(cand)
-    if (n_cand == 0L) break
-
-    # Spread probabilistically (fully vectorized)
-    spread_mask <- cand & (matrix(runif(grid_dim^2), grid_dim, grid_dim) < p_spread)
-
-    # Enforce MaxSpreadArea ceiling
-    n_new <- sum(spread_mask)
-    if (n_new > msa_cells) {
-      new_idx  <- which(spread_mask)
-      kept_idx <- sample(new_idx, msa_cells)
-      spread_mask[] <- FALSE
-      spread_mask[kept_idx] <- TRUE
-      n_new <- msa_cells
-    }
-
-    # Advance state
-    grid[burning]     <- 2L   # burning -> burned
-    grid[spread_mask] <- 1L   # new front
-
-    n_total <- n_total + n_new
-    n_days  <- n_days + 1L
-    timeline$day[n_days]         <- day
-    timeline$new_cells[n_days]   <- n_new
-    timeline$total_cells[n_days] <- n_total
-
-    if (n_new == 0L || n_total >= grid_dim^2) break
-  }
-
-  timeline <- timeline[seq_len(n_days), , drop = FALSE]
+  grid[disturbed]  <- 3L
+  grid[burned]     <- 2L
+  grid[burn_day == last_d & burn_day > 0L] <- 1L
 
   list(
-    total_ha  = n_total * cell_area_ha,
-    days      = n_days,
-    msa_ha    = msa_ha,
-    p_spread  = p_spread,
-    timeline  = timeline,
-    grid      = grid,
-    fwi       = fwi,
-    ews       = ews,
-    ff        = ff
+    total_ha      = n_burn * cell_area_ha,
+    days          = last_d,
+    msa_ha        = msa_of_day(1L),
+    p_spread      = p_of_day(1L),
+    p_diag        = 0.71 * p_of_day(1L),
+    cells_per_day = k_of_day(1L),
+    n_burned      = n_burn,
+    n_tried       = n_tried,
+    hit_edge      = hit_edge,
+    timeline      = tl,
+    grid          = grid,
+    fwi           = fwi[1],
+    ews           = ews[1],
+    ff            = ff,
+    grid_dim      = grid_dim,
+    cell_area_ha  = cell_area_ha
   )
 }
 
@@ -795,33 +860,38 @@ plot_cm_curve <- function(cm_b0, cm_b1, cm_b2,
 # Plots: Fire simulation output
 # =============================================================================
 
-plot_fire_timeline <- function(sim, cell_area_ha) {
+plot_fire_timeline <- function(sim, cell_area_ha = sim$cell_area_ha) {
 
   tl <- sim$timeline
-  if (nrow(tl) == 0) {
+  if (nrow(tl) <= 1 && sim$n_burned <= 1) {
     return(ggplot() +
-      labs(title = "Fire went out immediately (P(spread) ≈ 0 or MSA = 0)") +
+      labs(title = sprintf(
+        "Fire went out at the ignition cell (P(spread) = %.3f; percolation needs ~0.45+)",
+        sim$p_spread)) +
       theme_bw())
   }
 
-  tl$area_ha <- tl$total_cells * cell_area_ha
+  tl$area_ha <- tl$new_cells * cell_area_ha
+  msa_line   <- max(sim$msa_ha, 0)
 
   ggplot(tl, aes(day, area_ha)) +
-    geom_area(fill = "#fc8d59", alpha = 0.55) +
-    geom_line(colour = "#d94801", linewidth = 0.8) +
-    geom_hline(yintercept = sim$msa_ha, linetype = "dashed",
+    geom_col(fill = "#fc8d59", alpha = 0.75, width = 1) +
+    geom_hline(yintercept = msa_line, linetype = "dashed",
                colour = "#c0392b", linewidth = 0.7) +
-    annotate("text", x = max(tl$day), y = sim$msa_ha,
-             label = sprintf("MaxSpreadArea = %.0f ha", sim$msa_ha),
+    annotate("text", x = max(tl$day), y = msa_line,
+             label = sprintf("MaxSpreadArea = %.0f ha/day", sim$msa_ha),
              hjust = 1.05, vjust = -0.5, colour = "#c0392b", size = 3) +
     scale_y_continuous(labels = scales::comma) +
     labs(
-      title    = sprintf("Simulated Fire Growth  |  FWI=%.0f  EWS=%.0f  FF=%.2f",
+      title    = sprintf("Area Burned per Day  |  FWI=%.0f  EWS=%.0f  FF=%.2f",
                          sim$fwi, sim$ews, sim$ff),
-      subtitle = sprintf("Total: %.1f ha over %d days  |  P(spread)=%.3f  |  Grid: 100×100 cells",
-                         sim$total_ha, sim$days, sim$p_spread),
-      x        = "Simulation day",
-      y        = "Cumulative area burned (ha)"
+      subtitle = sprintf(
+        "Total %s ha over %d days  |  P(spread) %.3f cardinal, %.3f diagonal  |  Grid %d\u00d7%d%s",
+        scales::comma(round(sim$total_ha, 1)), sim$days, sim$p_spread, sim$p_diag,
+        sim$grid_dim, sim$grid_dim, if (isTRUE(sim$hit_edge)) "  |  HIT GRID EDGE" else ""),
+      x        = "Fire day",
+      y        = "Area burned that day (ha)",
+      caption  = "MaxSpreadArea paces the fire (cells per day); it does not cap total size."
     ) +
     theme_bw(base_size = 12)
 }
@@ -838,15 +908,18 @@ plot_fire_map <- function(sim) {
     state = as.integer(as.vector(grid))
   ) |>
     dplyr::mutate(
-      State = factor(state, levels = 0:2,
-                     labels = c("Unburned", "Final front", "Burned"))
+      State = factor(state, levels = c(0L, 3L, 2L, 1L),
+                     labels = c("Untouched", "Tried, did not ignite",
+                                "Burned", "Burned on final day"))
     )
 
   ggplot(df, aes(col, row, fill = State)) +
     geom_raster() +
-    scale_fill_manual(values = c("Unburned"    = "#f0f0f0",
-                                  "Final front" = "#ff6b00",
-                                  "Burned"      = "#67001f")) +
+    scale_fill_manual(values = c("Untouched"             = "#f0f0f0",
+                                  "Tried, did not ignite" = "#9ecae1",
+                                  "Burned"                = "#67001f",
+                                  "Burned on final day"   = "#ff6b00"),
+                      drop = FALSE) +
     coord_equal() +
     labs(
       title = "Final Fire Footprint",
@@ -941,7 +1014,7 @@ plot_sp_heatmap <- function(sp_b0, sp_b1, sp_b2, sp_b3, ff_val = 0.5) {
 # distribution under the current parameter set.
 #
 # Returns a data.frame with columns:
-#   FWI, EWS, rep, fire_ha, days, p_spread, msa_ha
+#   FWI, EWS, rep, fire_ha, days, p_spread, msa_ha, hit_edge, grid_dim
 # -----------------------------------------------------------------------------
 
 run_fire_ensemble <- function(fwi_vals     = c(5, 15, 25, 35),
@@ -952,6 +1025,7 @@ run_fire_ensemble <- function(fwi_vals     = c(5, 15, 25, 35),
                                msa_b0, msa_b1, msa_b2,
                                sp_b0, sp_b1, sp_b2, sp_b3,
                                cell_area_ha = 0.09,
+                               max_days     = 150L,
                                progress_fn  = NULL) {
 
   grid_dim  <- max(50L, as.integer(grid_dim))
@@ -977,7 +1051,7 @@ run_fire_ensemble <- function(fwi_vals     = c(5, 15, 25, 35),
         sp_b0        = sp_b0,  sp_b1  = sp_b1,
         sp_b2        = sp_b2,  sp_b3  = sp_b3,
         cell_area_ha = cell_area_ha,
-        max_days     = 90
+        max_days     = max_days
       )
       results[[k]] <- data.frame(
         FWI      = fwi,
@@ -987,6 +1061,7 @@ run_fire_ensemble <- function(fwi_vals     = c(5, 15, 25, 35),
         days     = sim$days,
         p_spread = sim$p_spread,
         msa_ha   = sim$msa_ha,
+        hit_edge = sim$hit_edge,
         grid_dim = grid_dim
       )
     }

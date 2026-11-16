@@ -2954,21 +2954,30 @@ ui <- page_navbar(
           nav_panel("Fire Simulation",
             br(),
             p(class = "text-muted small",
-              "Single fire on a 100×100 cell grid starting from the centre.",
-              " Updates live as you move any coefficient slider.",
-              " FineFuels slider is on the 0-1 scale (FF_raw / MaxFF)."),
+              "Single fire on a 100×100 cell grid starting from the centre, using ",
+              "SCF's own spread rules (FireEvent.cs): each cell gets ONE spread ",
+              "trial per fire, diagonal trials use P × 0.71, and MaxSpreadArea sets ",
+              "how many cells burn per day — it does not cap the fire. Fire only ",
+              "keeps spreading when P(spread) is above roughly 0.45–0.5. ",
+              "Updates live as you move any coefficient slider. ",
+              "FineFuels slider is on the 0-1 scale (FF_raw / MaxFF)."),
             fluidRow(
-              column(4,
+              column(3,
                 sliderInput("tune_sim_fwi", "FWI",
                             min = 0, max = 50, value = 20, step = 1)
               ),
-              column(4,
+              column(3,
                 sliderInput("tune_sim_ews", "EWS (km/h)",
                             min = 0, max = 50, value = 15, step = 1)
               ),
-              column(4,
+              column(3,
                 sliderInput("tune_sim_ff", "FineFuels (0-1 scaled)",
                             min = 0, max = 1, value = 0.5, step = 0.05)
+              ),
+              column(3,
+                numericInput("tune_sim_max_days",
+                             "Days left in fire year (SCF: 364 − ignition day)",
+                             value = 150, min = 1, max = 364, step = 1)
               )
             ),
             uiOutput("tune_sim_summary_ui"),
@@ -2988,7 +2997,11 @@ ui <- page_navbar(
               " a single scenario — useful for checking whether the parameter set",
               " produces realistic fire sizes across the range of fire-weather conditions.",
               " If FPA FOD data is loaded (Ignition tab), blue reference lines show the",
-              " observed P50 and P90 fire sizes as calibration targets."),
+              " observed P50 and P90 fire sizes as calibration targets.",
+              " Uses the same SCF spread rules and 'Days left in fire year' as the",
+              " Fire Simulation tab. Weather is held constant for the whole fire,",
+              " which SCF does not do, so supercritical fires burn until the day cap",
+              " or the grid edge."),
             fluidRow(
               column(3,
                 numericInput("tune_ens_reps", "Runs per scenario",
@@ -6833,7 +6846,8 @@ server <- function(input, output, session) {
       lf_sm      = input$tune_lf_sm,
       sim_fwi    = input$tune_sim_fwi,
       sim_ews    = input$tune_sim_ews,
-      sim_ff     = input$tune_sim_ff
+      sim_ff     = input$tune_sim_ff,
+      sim_max_days = input$tune_sim_max_days
     )
   }) |> debounce(350)
 
@@ -7182,28 +7196,35 @@ server <- function(input, output, session) {
         is.numeric(p$sim_fwi), is.numeric(p$sim_ews),
         is.numeric(p$cell_area), p$cell_area > 0)
     simulate_fire_simple(
+      grid_dim     = 100L,
       fwi          = p$sim_fwi,
       ews          = p$sim_ews,
       ff           = coalesce(p$sim_ff, 0.5),
       msa_b0       = p$msa_b0,  msa_b1 = p$msa_b1,  msa_b2 = p$msa_b2,
       sp_b0        = p$sp_b0,   sp_b1  = p$sp_b1,
       sp_b2        = p$sp_b2,   sp_b3  = p$sp_b3,
-      cell_area_ha = p$cell_area
+      cell_area_ha = p$cell_area,
+      max_days     = if (is.numeric(p$sim_max_days) && isTRUE(p$sim_max_days >= 1))
+                       p$sim_max_days else 150L
     )
   })
 
   output$tune_sim_summary_ui <- renderUI({
     sim <- tune_sim_r()
     req(!is.null(sim))
-    grid_total_ha <- 100 * 100 * isolate(tuning_r())$cell_area
+    grid_total_ha <- sim$grid_dim^2 * sim$cell_area_ha
     pct_burned    <- round(100 * sim$total_ha / grid_total_ha, 1)
-    col_class <- if (pct_burned > 75) "alert-danger" else
+    col_class <- if (sim$hit_edge || pct_burned > 75) "alert-danger" else
                  if (pct_burned > 40) "alert-warning" else "alert-success"
     div(class = paste("alert p-2 small mb-0", col_class),
       sprintf(
-        "\U0001f525 Total: %.1f ha (%.1f%% of grid)  │  Days: %d  │  P(spread): %.3f  │  MaxSpreadArea: %.0f ha",
-        sim$total_ha, pct_burned, sim$days, sim$p_spread, sim$msa_ha
-      )
+        "\U0001f525 Total: %.1f ha (%.1f%% of grid)  │  Days: %d  │  P(spread): %.3f cardinal / %.3f diagonal  │  MaxSpreadArea: %.0f ha/day = %d cells/day",
+        sim$total_ha, pct_burned, sim$days, sim$p_spread, sim$p_diag,
+        sim$msa_ha, sim$cells_per_day
+      ),
+      if (sim$hit_edge)
+        tags$div(tags$b("Fire reached the grid edge"),
+                 " — its size here is limited by the 100×100 grid, not by the parameters.")
     )
   })
 
@@ -7540,6 +7561,9 @@ server <- function(input, output, session) {
         sp_b0        = p$sp_b0,  sp_b1  = p$sp_b1,
         sp_b2        = p$sp_b2,  sp_b3  = p$sp_b3,
         cell_area_ha = cell_area_ha,
+        max_days     = if (is.numeric(input$tune_sim_max_days) &&
+                           isTRUE(input$tune_sim_max_days >= 1))
+                         input$tune_sim_max_days else 150L,
         progress_fn  = function(k, n) setProgress(k / n)
       )
       ensemble_rv(ens)
@@ -7692,12 +7716,16 @@ server <- function(input, output, session) {
       med_ha <- round(stats::median(ens$fire_ha), 1)
       p90_ha <- round(stats::quantile(ens$fire_ha, 0.90), 1)
       n_runs <- nrow(ens)
+      pct_edge <- if ("hit_edge" %in% names(ens)) 100 * mean(ens$hit_edge) else 0
       tags$div(
-        class = "alert alert-info p-2 mt-2",
+        class = paste("alert p-2 mt-2", if (pct_edge > 0) "alert-warning" else "alert-info"),
         style = "font-size:0.82rem;",
         tags$b(icon("circle-check"), sprintf(" %d runs complete", n_runs)),
         tags$br(),
-        sprintf("Median: %.1f ha  |  P90: %.1f ha", med_ha, p90_ha)
+        sprintf("Median: %.1f ha  |  P90: %.1f ha", med_ha, p90_ha),
+        if (pct_edge > 0) tagList(tags$br(), sprintf(
+          "%.0f%% of runs reached the grid edge, so their sizes are truncated by the grid.",
+          pct_edge))
       )
     }
   })
