@@ -24,6 +24,46 @@ rm(.pkg)
 
 
 # =============================================================================
+# SCF parameter-file formatting (shared by every snippet writer)
+#
+# LANDIS-II parameter syntax (SCF InputParameterParser.cs + its own test files):
+#   * whole-line comments start with ">>"; trailing comments start with "<<"
+#   * parameters are "Keyword  value" -- no "=" (it would be read as the value)
+#   * keywords are read in a FIXED order, so a pasted block must follow it:
+#       Timestep, [TimeZeroPET], [TimeZeroCWD], ... maps ...,
+#       LightningIgnitionsB0/B1, AccidentalIgnitionsB0/B1,
+#       [IgnitionDistribution ZeroInflatedPoisson + 4 ...BinomialB0/B1],
+#       MaximumFineFuels, ... Rx parameters ...,
+#       MaximumSpreadAreaB0-B2, SpreadProbabilityB0-B3, SiteMortalityB0-B6,
+#       CohortMortalityB0-B2, LadderFuelMaxAge, LadderFuelSpeciesList
+#       (species on the FOLLOWING line), SuppressionMaxWindSpeed, ...
+# Numbers are written as plain decimals with 7 significant digits: SiteMortality
+# coefficients are ~1e-7, which fixed "%.8f" formats truncated to 1-2 digits.
+# =============================================================================
+
+scf_num <- function(x, sig = 7L) {
+  if (length(x) != 1 || is.null(x) || !is.finite(x)) return(NA_character_)
+  if (x == 0) return("0.0")
+  x <- signif(x, sig)
+  d <- max(1L, as.integer(sig - 1L - floor(log10(abs(x)))))
+  out <- formatC(x, format = "f", digits = d)
+  out <- sub("0+$", "", out)
+  sub("\\.$", ".0", out)
+}
+
+# One parameter line.  A missing value becomes a commented <SET THIS> line so
+# the block never contains "NA" (which the parser would reject).
+scf_kv <- function(key, value, note = NULL, integer = FALSE) {
+  val <- if (isTRUE(integer) && length(value) == 1 && is.finite(value))
+    as.character(as.integer(round(value))) else scf_num(value)
+  tail <- if (!is.null(note) && nzchar(note)) paste0("  << ", note) else ""
+  if (is.na(val)) sprintf(">> %-28s <SET THIS>%s", key, tail)
+  else sprintf("%-30s %s%s", key, val, tail)
+}
+
+
+
+# =============================================================================
 # Collinearity helpers (used by both fit_* functions)
 # =============================================================================
 
@@ -2894,19 +2934,27 @@ write_scf_snippet <- function(spread_coef_df, max_area_fit,
     ">>   FineFuels = min(SiteVars.FineFuels / MaximumFineFuels, 1.0)  (0-1 scale)",
     ">>   EWS       = effective wind speed (Nelson 2002 Eq.5, km/h)",
     ">>   Coefficients are logit-scale — enter directly, no back-transform needed.",
-    sprintf("SpreadProbabilityB0    %9.6f", coalesce(sp_b0, NA_real_)),
-    sprintf("SpreadProbabilityB1    %9.6f", coalesce(sp_b1, NA_real_)),
-    sprintf("SpreadProbabilityB2    %9.6f", coalesce(sp_b2, NA_real_)),
-    sprintf("SpreadProbabilityB3    %9.6f", coalesce(sp_b3, NA_real_)),
+    ">> MaximumSpreadArea is read BEFORE SpreadProbability (InputParameterParser.cs),",
+    ">> so this block is in parse order: paste it over your existing",
+    ">> MaximumSpreadAreaB0 ... SpreadProbabilityB3 lines (after the Rx parameters).",
     "",
     sprintf(">> Maximum daily spread area (%s fit)", max_area_target),
     ">>   MaxSpreadArea = (int)(B0 + B1*FWI + B2*EWS)   [units: HECTARES]",
-    ">>   EWS in km/h (same as above). B0 must be > 0 to avoid MaxSpreadArea<=0.",
-    ">>   When fire burns > MaxSpreadArea ha in a day, simulation advances day+1.",
-    ">>   Coefficients are on the RAW ha scale — enter directly.",
-    sprintf("MaximumSpreadAreaB0    %9.4f", coalesce(ma_b0, NA_real_)),
-    sprintf("MaximumSpreadAreaB1    %9.4f", coalesce(ma_b1, NA_real_)),
-    sprintf("MaximumSpreadAreaB2    %9.4f", coalesce(ma_b2, NA_real_)),
+    ">>   EWS in km/h. Paces the fire (cells per day); it does not cap fire size.",
+    ">>   B0 > 0 avoids MaxSpreadArea <= 0 (one cell per day) at low FWI.",
+    scf_kv("MaximumSpreadAreaB0", ma_b0, "intercept, ha"),
+    scf_kv("MaximumSpreadAreaB1", ma_b1, "FWI"),
+    scf_kv("MaximumSpreadAreaB2", ma_b2, "effective wind speed, km/h"),
+    "",
+    ">> Cell-to-cell spread probability (logistic / binomial GLM)",
+    ">>   P(spread) = 1 / (1 + exp(-(B0 + B1*FWI + B2*FineFuels + B3*EWS)))",
+    ">>   FineFuels = min(SiteVars.FineFuels / MaximumFineFuels, 1.0)  (0-1 scale)",
+    ">>   B0 from the regression is NOT usable as is: set it with the",
+    ">>   Parameter Tuning > B0 Sweep tab or by scoring LANDIS runs.",
+    scf_kv("SpreadProbabilityB0", sp_b0, "intercept (set by sweep)"),
+    scf_kv("SpreadProbabilityB1", sp_b1, "FWI"),
+    scf_kv("SpreadProbabilityB2", sp_b2, "fine fuels, 0-1"),
+    scf_kv("SpreadProbabilityB3", sp_b3, "effective wind speed, km/h"),
     ""
   ), collapse = "\n")
 }

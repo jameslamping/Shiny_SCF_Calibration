@@ -1676,78 +1676,113 @@ ign_tune_coef_df <- function(l_b0, l_b1, l_bz0, l_bz1,
 # SCF snippet builder
 # =============================================================================
 
+# -----------------------------------------------------------------------------
+# build_scf_tuning_snippet
+#
+# SCF parameter text from the Parameter Tuning values, in LANDIS syntax and
+# split into the two places the parser reads them (see the formatting notes
+# above scf_num() in spread_helpers.R):
+#   A. ignitions + IgnitionDistribution + MaximumFineFuels  (after ClayMap,
+#      before the Rx parameters)
+#   B. MaximumSpreadArea .. CohortMortalityB2  (after the Rx parameters)
+#
+# Ignition coefficients from the tuning panel are REGIONAL (fit over the
+# calibration boundary).  SCF needs landscape coefficients: b0 + log(landscape /
+# boundary area).  Pass area_log_ratio to apply it; without it the ignition
+# section is written commented out, so a regional b0 can never be pasted in
+# by accident.  b1, bz0 and bz1 transfer unchanged (as apply_area_offset()).
+# -----------------------------------------------------------------------------
+
 build_scf_tuning_snippet <- function(msa_b0, msa_b1, msa_b2,
                                       sp_b0, sp_b1, sp_b2, sp_b3,
                                       sm_b0, sm_b1, sm_b2, sm_b3, sm_b4, sm_b5, sm_b6,
                                       cm_b0, cm_b1, cm_b2,
-                                      max_ff = 500,
-                                      ign_coef = NULL) {
+                                      max_ff = NA_real_,
+                                      ign_coef = NULL,
+                                      area_log_ratio = NULL) {
+  rule <- ">> ---------------------------------------------------------------------"
 
-  # ---- Ignition block (omitted entirely when no ignition coefficients set) ----
+  # ---- Section A: ignitions + MaximumFineFuels ------------------------------
   ign_lines <- character(0)
   if (!is.null(ign_coef) && nrow(ign_coef) > 0) {
-    zip <- !identical(unique(ign_coef$distribution)[1], "Poisson")
+    zip <- !identical(as.character(unique(ign_coef$distribution)[1]), "Poisson")
+    offset_ok <- length(area_log_ratio) == 1 && is.finite(area_log_ratio)
+    row_of <- function(type) ign_coef[ign_coef$ignition_type == type, ][1, ]
+    L <- row_of("Lightning"); A <- row_of("Accidental")
+    b0_land <- function(b0) if (offset_ok) b0 + area_log_ratio else b0
+    body <- c(
+      scf_kv("LightningIgnitionsB0", b0_land(L$b0), "landscape b0"),
+      scf_kv("LightningIgnitionsB1", L$b1, "FWI"),
+      scf_kv("AccidentalIgnitionsB0", b0_land(A$b0), "landscape b0"),
+      scf_kv("AccidentalIgnitionsB1", A$b1, "FWI"),
+      sprintf("%-30s %s", "IgnitionDistribution", if (zip) "ZeroInflatedPoisson" else "Poisson"),
+      if (zip) c(
+        scf_kv("LightningIgnitionsBinomialB0", L$bz0, "P(structural zero) intercept"),
+        scf_kv("LightningIgnitionsBinomialB1", L$bz1, "FWI"),
+        scf_kv("AccidentalIgnitionsBinomialB0", A$bz0, "P(structural zero) intercept"),
+        scf_kv("AccidentalIgnitionsBinomialB1", A$bz1, "FWI")))
     ign_lines <- c(
-      ">> ---- Ignitions (lambda = exp(b0 + b1*FWI); landscape-mean FWI) -----",
-      unlist(lapply(seq_len(nrow(ign_coef)), function(i) {
-        r  <- ign_coef[i, ]
-        kw <- if (identical(r$ignition_type, "Lightning")) "Lightning" else "Accidental"
-        c(
-          sprintf("%-30s %12.6f", paste0(kw, "IgnitionsB0"), r$b0),
-          sprintf("%-30s %12.6f", paste0(kw, "IgnitionsB1"), r$b1),
-          if (zip && is.finite(r$bz0) && is.finite(r$bz1)) c(
-            sprintf("%-30s %12.6f", paste0(kw, "IgnitionsBinomialB0"), r$bz0),
-            sprintf("%-30s %12.6f", paste0(kw, "IgnitionsBinomialB1"), r$bz1)
-          )
-        )
-      })),
-      if (zip)
-        ">> Binomial keywords are the ZIP structural-zero terms: SCF draws from"
-      else
-        ">> Poisson only — no Binomial keywords written.",
-      if (zip)
-        ">> the Poisson only when runif() >= plogis(bz0 + bz1*FWI).",
-      "",
-      ">> NOTE: these are the REGIONAL (calibration boundary) coefficients as",
-      ">> tuned.  Before use in SCF, b0 must carry the log(landscape / boundary)",
-      ">> area offset from the Scale Adjustment tab.  b1 transfers unchanged.",
-      ""
-    )
+      ">> Ignitions: lambda = exp(b0 + b1*FWI) on the landscape-mean FWI",
+      if (zip) ">> ZIP: SCF skips the Poisson draw when runif() < plogis(bz0 + bz1*FWI)",
+      if (offset_ok)
+        sprintf(">> b0 = regional (calibration boundary) b0 + log(landscape/boundary) = %+.4f",
+                area_log_ratio)
+      else c(
+        ">> COMMENTED OUT: these b0 values are REGIONAL (calibration boundary).",
+        ">> SCF needs b0 + log(landscape area / boundary area).  Load the landscape",
+        ">> template and calibration boundary, then export again, or add the offset",
+        ">> from the Ignition > Scale Adjustment tab by hand."),
+      if (offset_ok) body else paste(">>", body))
   }
+  sec_a <- c(rule,
+    ">> SECTION A -- replaces the ignition parameters and MaximumFineFuels",
+    ">>   (after ClayMap, before MaximumRxWindSpeed)",
+    rule,
+    if (length(ign_lines)) ign_lines else ">> (no ignition coefficients in the tuning panel)",
+    "",
+    scf_kv("MaximumFineFuels", max_ff,
+           "g C m-2; FineFuels = min(FF / MaximumFineFuels, 1); ~900 matches the 9 t/ac fit scale"),
+    "")
+
+  # ---- Section B: spread, severity, cohort mortality -------------------------
+  sec_b <- c(rule,
+    ">> SECTION B -- replaces MaximumSpreadAreaB0 through CohortMortalityB2",
+    ">>   (after the Rx parameters, before LadderFuelMaxAge)",
+    rule,
+    ">> Max spread area: (int)(B0 + B1*FWI + B2*EWS) hectares per day (pacing)",
+    scf_kv("MaximumSpreadAreaB0", msa_b0, "intercept, ha"),
+    scf_kv("MaximumSpreadAreaB1", msa_b1, "FWI"),
+    scf_kv("MaximumSpreadAreaB2", msa_b2, "effective wind speed, km/h"),
+    "",
+    ">> Spread probability: logistic; FineFuels 0-1, EWS km/h",
+    scf_kv("SpreadProbabilityB0", sp_b0, "intercept"),
+    scf_kv("SpreadProbabilityB1", sp_b1, "FWI"),
+    scf_kv("SpreadProbabilityB2", sp_b2, "fine fuels, 0-1"),
+    scf_kv("SpreadProbabilityB3", sp_b3, "effective wind speed, km/h"),
+    "",
+    ">> Site mortality: Gamma GLM inverse link; dNBR = 1 / max(eta, 0.0005)",
+    scf_kv("SiteMortalityB0", sm_b0, "intercept"),
+    scf_kv("SiteMortalityB1", sm_b1, "clay fraction 0-1"),
+    scf_kv("SiteMortalityB2", sm_b2, "previous-year PET, mm/yr"),
+    scf_kv("SiteMortalityB3", sm_b3, "effective wind speed, km/h"),
+    scf_kv("SiteMortalityB4", sm_b4, "previous-year CWD, mm/yr"),
+    scf_kv("SiteMortalityB5", sm_b5, "fine fuels, 0-1"),
+    scf_kv("SiteMortalityB6", sm_b6, "ladder fuel biomass, g m-2"),
+    "",
+    ">> Cohort mortality: logistic; BarkThickness single-sided cm",
+    scf_kv("CohortMortalityB0", cm_b0, "intercept"),
+    scf_kv("CohortMortalityB1", cm_b1, "bark thickness, cm"),
+    scf_kv("CohortMortalityB2", cm_b2, "site dNBR"),
+    "")
 
   paste(c(
     ">> =====================================================================",
     ">> SCF Parameter Tuning Export",
     sprintf(">> Generated: %s", format(Sys.time(), "%Y-%m-%d %H:%M")),
+    ">> LANDIS syntax: '>>' comment lines, '<<' trailing comments.",
+    ">> SCF reads keywords in a fixed order: paste each section where it says.",
     ">> =====================================================================",
     "",
-    ign_lines,
-    ">> ---- Max Spread Area (B0 + B1*FWI + B2*EWS, result in hectares) ----",
-    sprintf("MaximumSpreadAreaB0    %10.4f",  msa_b0),
-    sprintf("MaximumSpreadAreaB1    %10.4f",  msa_b1),
-    sprintf("MaximumSpreadAreaB2    %10.4f",  msa_b2),
-    "",
-    ">> ---- Spread Probability (logistic; EWS and FF in km/h and 0-1) -----",
-    sprintf("SpreadProbabilityB0    %12.6f",  sp_b0),
-    sprintf("SpreadProbabilityB1    %12.6f",  sp_b1),
-    sprintf("SpreadProbabilityB2    %12.6f",  sp_b2),
-    sprintf("SpreadProbabilityB3    %12.6f",  sp_b3),
-    "",
-    sprintf("MaximumFineFuels       %10.1f   >> g C m^-2; divides LANDIS fine fuels to 0-1", max_ff),
-    "",
-    ">> ---- Site Mortality (Gamma GLM inverse link; dNBR = 1/eta) ---------",
-    sprintf("SiteMortalityB0        %14.8f",  sm_b0),
-    sprintf("SiteMortalityB1        %14.8f",  sm_b1),
-    sprintf("SiteMortalityB2        %14.8f",  sm_b2),
-    sprintf("SiteMortalityB3        %14.8f",  sm_b3),
-    sprintf("SiteMortalityB4        %14.8f",  sm_b4),
-    sprintf("SiteMortalityB5        %14.8f",  sm_b5),
-    sprintf("SiteMortalityB6        %14.8f",  sm_b6),
-    "",
-    ">> ---- Cohort Mortality (logistic; BarkThickness in cm) --------------",
-    sprintf("CohortMortalityB0      %10.6f",  cm_b0),
-    sprintf("CohortMortalityB1      %10.6f",  cm_b1),
-    sprintf("CohortMortalityB2      %10.6f",  cm_b2),
-    ""
-  ), collapse = "\n")
+    sec_a, sec_b), collapse = "\n")
 }
+

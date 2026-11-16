@@ -8076,8 +8076,8 @@ server <- function(input, output, session) {
     content = function(f) {
       p <- isolate(tuning_r())
 
-      # Tuned ignition coefficients are regional; the snippet's own comment
-      # says so, since b0 still needs the Scale Adjustment area offset.
+      # Tuned ignition coefficients are regional; build_scf_tuning_snippet()
+      # applies the area offset (or comments the block out without it).
       ign <- NULL
       if (is.numeric(p$ign_l_b0) && is.numeric(p$ign_a_b0)) {
         ign <- ign_tune_coef_df(
@@ -8096,8 +8096,11 @@ server <- function(input, output, session) {
           p$sm_b0,  p$sm_b1,  p$sm_b2,  p$sm_b3,
           p$sm_b4,  p$sm_b5,  p$sm_b6,
           p$cm_b0,  p$cm_b1,  p$cm_b2,
-          max_ff   = coalesce(p$max_ff, 500),
-          ign_coef = ign
+          max_ff   = if (is.numeric(p$max_ff) && isTRUE(p$max_ff > 0)) p$max_ff else NA_real_,
+          ign_coef = ign,
+          # Landscape b0 = regional b0 + log(landscape / boundary); without the
+          # areas the ignition section is written commented out.
+          area_log_ratio = if (!is.null(rv$landscape_areas)) rv$landscape_areas$log_ratio else NULL
         ), f
       )
     }

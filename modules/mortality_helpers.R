@@ -1621,8 +1621,9 @@ plot_site_mortality_coef <- function(site_fit) {
 # -----------------------------------------------------------------------------
 # write_mortality_snippet
 #
-# Purpose: Format mortality coefficients for direct copy into an SCF parameter
-#   file. Mirrors the style of write_scf_snippet() in spread_helpers.R.
+# Purpose: Format mortality coefficients for an SCF parameter file, in LANDIS
+#   syntax and split into the three places the parser reads them (see the
+#   formatting notes above scf_num() in spread_helpers.R).
 #
 # Args:
 #   site_fit    return value of fit_site_mortality()
@@ -1639,97 +1640,32 @@ write_mortality_snippet <- function(site_fit, cohort_fit = NULL,
                                     ladder_ceiling_m = NULL) {
 
   now <- format(Sys.time(), "%Y-%m-%d %H:%M")
-
-  fmt_par <- function(name, value, note) {
-    sprintf("%-30s  %+.8f  %s", paste0(name, " ="), value, note)
-  }
+  rule <- ">> ---------------------------------------------------------------------------"
 
   lines <- c(
-    "# =============================================================================",
-    paste0("# SCF Mortality Parameters - generated ", now),
-    "# =============================================================================",
-    "#",
-    "# SITE MORTALITY (Equation 7, FireEvent.cs:363-379)",
-    "#   eta  = B0 + B1*Clay + B2*PET + B3*EWS + B4*CWD + B5*FineFuels + B6*LadderFuels",
-    "#   dNBR = max(eta, 0.0005) ^ -1        <- Gamma inverse link",
-    "#",
-    "#   The max(eta, 0.0005) floor is a CLIFF, not a soft bound: any cell whose",
-    "#   linear predictor reaches zero is assigned the maximum dNBR of 2000.",
-    "#   Because of the inverse link, SIGNS ARE INVERTED - a variable that",
-    "#   increases severity carries a NEGATIVE coefficient, and B0 must be",
-    "#   positive (1/B0 is the baseline dNBR).",
-    "#",
-    "# COHORT MORTALITY (Equations 8-9, FireEvent.cs:448-450)",
-    "#   P = exp(B0 + B1*BarkThickness + B2*SiteMortality);  p = P/(1+P)",
-    "#   One Bernoulli draw per cohort; a kill removes the ENTIRE cohort biomass.",
-    "#   BarkThickness is SINGLE-SIDED cm (Cansler/FOFEM BT_coef x DBH).",
-    "# =============================================================================",
-    ""
-  )
+    ">> =============================================================================",
+    paste0(">> SCF Mortality Parameters - generated ", now),
+    ">> =============================================================================",
+    ">> LANDIS syntax: '>>' comment lines, '<<' trailing comments, 'Keyword value'.",
+    ">> SCF reads these keywords in THREE different places in the parameter file;",
+    ">> paste each section below where its header says.",
+    ">>",
+    ">> SITE MORTALITY (Equation 7, FireEvent.cs CalculateDNBR)",
+    ">>   eta  = B0 + B1*Clay + B2*PET + B3*EWS + B4*CWD + B5*FineFuels + B6*LadderFuels",
+    ">>   dNBR = max(eta, 0.0005) ^ -1        (Gamma inverse link)",
+    ">>   The max(eta, 0.0005) floor is a CLIFF: any cell whose linear predictor",
+    ">>   reaches zero gets the maximum dNBR of 2000.  Because of the inverse link,",
+    ">>   SIGNS ARE INVERTED: a variable that increases severity has a NEGATIVE",
+    ">>   coefficient, and B0 must be positive (1/B0 is the baseline dNBR).",
+    ">>",
+    ">> COHORT MORTALITY (Equations 8-9)",
+    ">>   P = exp(B0 + B1*BarkThickness + B2*SiteMortality);  p = P/(1+P)",
+    ">>   One Bernoulli draw per cohort; a kill removes the ENTIRE cohort biomass.",
+    ">>   BarkThickness is SINGLE-SIDED cm (Cansler/FOFEM BT_coef x DBH).",
+    ">> =============================================================================",
+    "")
 
-  # ---- Site mortality --------------------------------------------------------
-  lines <- c(lines,
-    "# ---------------------------------------------------------------------------",
-    "# Site Mortality",
-    paste0("#   Model: Gamma GLM, link = ", site_fit$link),
-    paste0("#   N pixels: ", scales::comma(site_fit$n)),
-    paste0("#   Predictors fitted: ", paste(site_fit$available_preds, collapse = ", ")),
-    sprintf("#   Residual deviance: %.4f  (null: %.4f)",
-            site_fit$residual_deviance, site_fit$null_deviance),
-    "# ---------------------------------------------------------------------------",
-    ""
-  )
-
-  if (!is.null(site_fit$dropped_preds) && length(site_fit$dropped_preds) > 0)
-    lines <- c(lines,
-      paste0("# NOT FITTED (no data or no variance), written as 0.0: ",
-             paste(site_fit$dropped_preds, collapse = ", ")),
-      "")
-
-  for (i in seq_len(nrow(site_fit$coef_df))) {
-    row <- site_fit$coef_df[i, ]
-    unit_note <- switch(row$term,
-      "(Intercept)" = sprintf("# intercept -> baseline dNBR = %.0f",
-                              if (row$estimate > 0) 1 / row$estimate else NA_real_),
-      "Clay"        = "# clay FRACTION 0-1 (SCF User Guide 2.18: ClayMap values 0-1)",
-      "ET_mm"       = "# previous-year POTENTIAL ET, mm/yr (SCF Succession.PET)",
-      "EWS_kmh"     = "# effective wind speed km/h (Nelson 2002, Cb=10)",
-      "CWD_mm"      = "# previous-year climatic water deficit, mm/yr (SCF Succession.CWD)",
-      "FineFuels"   = "# fine fuel fraction 0-1 -- SEE MaximumFineFuels NOTE BELOW",
-      "LadderFuels" = "# ladder fuel BIOMASS, g m-2 (SCF sums raw cohort biomass)",
-      ""
-    )
-    if (!isTRUE(row$fitted) && row$term != "(Intercept)")
-      unit_note <- paste(unit_note, "  [not fitted - set to 0]")
-    lines <- c(lines, fmt_par(row$scf_parameter, row$estimate, unit_note))
-  }
-
-  # ---- Companion parameters that change what the B's mean --------------------
-  lines <- c(lines, "",
-    "# ---------------------------------------------------------------------------",
-    "# COMPANION PARAMETERS - these change the meaning of the coefficients above",
-    "# ---------------------------------------------------------------------------")
-
-  lines <- c(lines, "",
-    "# MaximumFineFuels rescales the fine fuel term in BOTH Equation 5 (spread)",
-    "# and Equation 7 (severity) -- User Guide 2.28. SCF computes",
-    "#     fineFuelPercent = min(SiteVars.FineFuels / MaximumFineFuels, 1.0)",
-    "# Calibration normalised FBFM40 by 9.0 t/ac (GR9 max), so MaximumFineFuels",
-    "# must be set to a comparable load or SiteMortalityB5 (and SpreadProbabilityB2)",
-    "# are on the wrong scale.")
-  lines <- c(lines,
-    if (!is.null(max_fine_fuels) && is.finite(max_fine_fuels))
-      sprintf("%-30s  %.2f", "MaximumFineFuels =", max_fine_fuels)
-    else
-      "# MaximumFineFuels           <SET THIS>   # ~900-1000 g m-2 to match the 9 t/ac normalisation")
-
-  # TimeZero fallbacks
-  lines <- c(lines, "",
-    "# SCF falls back to these at year 0, before NECN has produced PET/CWD",
-    "# (FireEvent.cs:344-360). Leaving them at 0.0 drops two terms from Eq. 7 in",
-    "# the first simulated fire year, which -- with negative B2/B4 -- lowers eta",
-    "# and therefore RAISES first-year severity.")
-
+  # ---- Section 1: TimeZeroPET / TimeZeroCWD (right after Timestep) ----------
   mean_of <- function(r) {
     if (is.null(r)) return(NA_real_)
     v <- try(terra::values(r, mat = FALSE), silent = TRUE)
@@ -1742,92 +1678,134 @@ write_mortality_snippet <- function(site_fit, cohort_fit = NULL,
   if (!is.finite(tz_pet) && "ET_mm"  %in% names(site_fit$data)) tz_pet <- mean(site_fit$data$ET_mm,  na.rm = TRUE)
   if (!is.finite(tz_cwd) && "CWD_mm" %in% names(site_fit$data)) tz_cwd <- mean(site_fit$data$CWD_mm, na.rm = TRUE)
 
-  lines <- c(lines,
-    if (is.finite(tz_pet)) sprintf("%-30s  %.2f   # landscape mean PET, mm/yr", "TimeZeroPET =", tz_pet)
-    else "# TimeZeroPET                <SET THIS>   # landscape mean PET, mm/yr",
-    if (is.finite(tz_cwd)) sprintf("%-30s  %.2f   # landscape mean CWD, mm/yr", "TimeZeroCWD =", tz_cwd)
-    else "# TimeZeroCWD                <SET THIS>   # landscape mean CWD, mm/yr")
+  lines <- c(lines, rule,
+    ">> SECTION 1 of 3 -- paste DIRECTLY AFTER the 'Timestep' line",
+    ">>   (optional keywords, but leaving them out sets PET/CWD to 0 in year 0:",
+    ">>   with negative B2/B4 that lowers eta and RAISES first-year severity)",
+    rule,
+    scf_kv("TimeZeroPET", tz_pet, "landscape mean PET, mm/yr"),
+    scf_kv("TimeZeroCWD", tz_cwd, "landscape mean CWD, mm/yr"),
+    "")
 
-  # Ladder fuel definition
+  # ---- Section 2: MaximumFineFuels (after ignitions, before Rx) ------------
+  lines <- c(lines, rule,
+    ">> SECTION 2 of 3 -- replaces 'MaximumFineFuels' (after the ignition",
+    ">>   parameters, before the Rx parameters)",
+    rule,
+    ">> MaximumFineFuels rescales the fine fuel term in BOTH Equation 5 (spread)",
+    ">> and Equation 7 (severity):",
+    ">>     fineFuelPercent = min(SiteVars.FineFuels / MaximumFineFuels, 1.0)",
+    ">> Calibration normalised FBFM40 by 9.0 t/ac (GR9 max), about 900 g C m-2, so",
+    ">> MaximumFineFuels must denote a comparable load or SiteMortalityB5 (and",
+    ">> SpreadProbabilityB2) are on the wrong scale.",
+    scf_kv("MaximumFineFuels",
+           if (!is.null(max_fine_fuels)) max_fine_fuels else NA_real_,
+           "g C m-2; ~900 matches the 9 t/ac calibration scale"),
+    "")
+
+  # ---- Section 3: Site + cohort mortality + ladder fuels --------------------
+  lines <- c(lines, rule,
+    ">> SECTION 3 of 3 -- replaces 'SiteMortalityB0' through the",
+    ">>   LadderFuelSpeciesList species line (after SpreadProbabilityB3, before",
+    ">>   SuppressionMaxWindSpeed)",
+    rule,
+    paste0(">> Site mortality: Gamma GLM, link = ", site_fit$link,
+           "; ", scales::comma(site_fit$n), " pixels"),
+    paste0(">>   Predictors fitted: ", paste(site_fit$available_preds, collapse = ", ")),
+    sprintf(">>   Residual deviance: %.4f  (null: %.4f)",
+            site_fit$residual_deviance, site_fit$null_deviance))
+  if (!is.null(site_fit$dropped_preds) && length(site_fit$dropped_preds) > 0)
+    lines <- c(lines, paste0(">>   NOT FITTED (no data or no variance), written as 0.0: ",
+                             paste(site_fit$dropped_preds, collapse = ", ")))
+
+  for (i in seq_len(nrow(site_fit$coef_df))) {
+    row <- site_fit$coef_df[i, ]
+    note <- switch(row$term,
+      "(Intercept)" = sprintf("intercept; baseline dNBR = %s",
+                              if (row$estimate > 0) sprintf("%.0f", 1 / row$estimate) else "n/a (B0 <= 0!)"),
+      "Clay"        = "clay FRACTION 0-1",
+      "ET_mm"       = "previous-year POTENTIAL ET, mm/yr",
+      "EWS_kmh"     = "effective wind speed, km/h (Cb = 10)",
+      "CWD_mm"      = "previous-year climatic water deficit, mm/yr",
+      "FineFuels"   = "fine fuel fraction 0-1 (see MaximumFineFuels)",
+      "LadderFuels" = "ladder fuel BIOMASS, g m-2",
+      "")
+    if (!isTRUE(row$fitted) && row$term != "(Intercept)")
+      note <- paste(note, "[not fitted - 0]")
+    lines <- c(lines, scf_kv(row$scf_parameter, row$estimate, note))
+  }
+
+  lines <- c(lines, "")
+  if (!is.null(cohort_fit)) {
+    lines <- c(lines,
+      paste0(">> Cohort mortality: binomial GLM (logit), ", scales::comma(cohort_fit$n), " trees",
+             if (!is.null(cohort_fit$n_fires)) paste0(" across ", cohort_fit$n_fires, " fires") else "",
+             "; SEs ", if (isTRUE(cohort_fit$cluster_robust)) "cluster-robust by fire"
+                      else "NAIVE (p-values anticonservative)"))
+    for (i in seq_len(nrow(cohort_fit$coef_df))) {
+      row <- cohort_fit$coef_df[i, ]
+      note <- switch(row$term,
+        "(Intercept)"   = "intercept",
+        "BarkThickness" = "single-sided bark thickness, cm (match MaximumBarkThickness)",
+        "dNBR"          = "site dNBR 0-2000 (SCF passes its own predicted dNBR)",
+        "")
+      lines <- c(lines, scf_kv(row$scf_parameter, row$estimate, note))
+    }
+  } else {
+    lines <- c(lines,
+      ">> Cohort mortality not fitted in this session -- the parser REQUIRES these:",
+      scf_kv("CohortMortalityB0", NA_real_, "intercept"),
+      scf_kv("CohortMortalityB1", NA_real_, "bark thickness, cm (expect negative)"),
+      scf_kv("CohortMortalityB2", NA_real_, "site dNBR (expect positive)"))
+  }
+
+  # Ladder fuels: LadderFuelSpeciesList on its own line, species on the next
+  # line(s) -- the parser reads species lines until SuppressionMaxWindSpeed.
   b6 <- site_fit$coef_df$estimate[site_fit$coef_df$scf_parameter == "SiteMortalityB6"]
   lines <- c(lines, "",
-    "# LadderFuelMaxAge / LadderFuelSpeciesList define the biomass SCF sums into",
-    "# the B6 term. They MUST match the stratum B6 was calibrated on.")
+    ">> LadderFuelMaxAge / LadderFuelSpeciesList define the biomass SCF sums into",
+    ">> the B6 term. They MUST match the stratum B6 was calibrated on.")
   if (!is.null(ladder_ceiling_m) && is.finite(ladder_ceiling_m))
     lines <- c(lines, sprintf(
-      "# Calibrated against LANDFIRE canopy biomass below %.1f m, in g m-2.",
-      ladder_ceiling_m))
-  if (length(b6) == 1 && b6 == 0) {
+      ">> Calibrated against LANDFIRE canopy biomass below %.1f m, in g m-2.", ladder_ceiling_m))
+  if (length(b6) == 1 && isTRUE(b6 == 0))
     lines <- c(lines,
-      "# SiteMortalityB6 is 0.0, so the ladder fuel term is inactive. The two",
-      "# parameters below are still required by the parser.")
-  }
+      ">> SiteMortalityB6 is 0.0, so the ladder fuel term is inactive; the two",
+      ">> keywords below are still required by the parser.")
   lines <- c(lines,
-    if (!is.null(ladder_max_age) && is.finite(ladder_max_age))
-      sprintf("%-30s  %d", "LadderFuelMaxAge =", as.integer(ladder_max_age))
-    else "# LadderFuelMaxAge           <SET THIS>   # age below which a cohort is ladder fuel",
+    scf_kv("LadderFuelMaxAge",
+           if (!is.null(ladder_max_age)) ladder_max_age else NA_real_,
+           "years; cohorts this age or younger are ladder fuel", integer = TRUE),
     if (!is.null(ladder_species) && length(ladder_species) > 0)
-      paste0("LadderFuelSpeciesList  ", paste(ladder_species, collapse = "  "))
-    else "# LadderFuelSpeciesList      <SET THIS>   # species codes acting as ladder fuel")
+      c("LadderFuelSpeciesList", paste(ladder_species, collapse = "  "))
+    else c(">> LadderFuelSpeciesList", ">> <SET THIS: species codes on this line>"))
 
-  # ---- Diagnostics -----------------------------------------------------------
-  lines <- c(lines, "",
-    "# ---------------------------------------------------------------------------",
-    "# Diagnostics",
-    "# ---------------------------------------------------------------------------")
-
+  # ---- Diagnostics (comments only) ------------------------------------------
+  lines <- c(lines, "", rule, ">> Diagnostics", rule)
   if (!is.null(site_fit$pct_clamped))
     lines <- c(lines, sprintf(
-      "#   Clamp exposure: %.2f%% of calibration pixels have eta <= 0.0005 (SCF would give them dNBR 2000)",
+      ">>   Clamp exposure: %.2f%% of calibration pixels have eta <= 0.0005 (SCF gives them dNBR 2000)",
       site_fit$pct_clamped))
   if (!is.null(site_fit$obs_dnbr_q) && !is.null(site_fit$pred_dnbr_q))
     lines <- c(lines,
-      sprintf("#   Observed dNBR  5/50/95: %.0f / %.0f / %.0f",
+      sprintf(">>   Observed dNBR  5/50/95: %.0f / %.0f / %.0f",
               site_fit$obs_dnbr_q[1], site_fit$obs_dnbr_q[2], site_fit$obs_dnbr_q[3]),
-      sprintf("#   Predicted dNBR 5/50/95: %.0f / %.0f / %.0f  (span ratio %.2f)",
+      sprintf(">>   Predicted dNBR 5/50/95: %.0f / %.0f / %.0f  (span ratio %.2f)",
               site_fit$pred_dnbr_q[1], site_fit$pred_dnbr_q[2], site_fit$pred_dnbr_q[3],
               site_fit$span_ratio),
-      "#   A low span ratio means SCF feeds a near-constant SiteMortality into",
-      "#   cohort mortality, leaving CohortMortalityB2 with little to act on.")
+      ">>   A low span ratio means SCF feeds a near-constant SiteMortality into",
+      ">>   cohort mortality, leaving CohortMortalityB2 with little to act on.")
   if (!is.null(site_fit$ews_wind_basis) && !is.na(site_fit$ews_wind_basis))
-    lines <- c(lines, sprintf("#   EWS wind basis: %s (SCF uses day-of-burn wind)",
+    lines <- c(lines, sprintf(">>   EWS wind basis: %s (SCF uses day-of-burn wind)",
                               site_fit$ews_wind_basis))
   if (!is.null(site_fit$sign_warnings) && length(site_fit$sign_warnings) > 0)
-    lines <- c(lines, "#   SIGN WARNINGS:",
-               paste0("#     - ", site_fit$sign_warnings))
-
-  # ---- Cohort mortality ------------------------------------------------------
+    lines <- c(lines, ">>   SITE SIGN WARNINGS:", paste0(">>     - ", site_fit$sign_warnings))
   if (!is.null(cohort_fit)) {
-    lines <- c(lines, "",
-      "# ---------------------------------------------------------------------------",
-      "# Cohort Mortality (Equations 8-9)",
-      "#   P(mortality) = P/(1+P),  P = exp(B0 + B1*BarkThickness + B2*SiteMortality)",
-      "#   Model: Binomial GLM, logit link",
-      paste0("#   N trees: ", scales::comma(cohort_fit$n),
-             if (!is.null(cohort_fit$n_fires))
-               paste0(" across ", cohort_fit$n_fires, " fires") else ""),
-      paste0("#   SEs: ", if (isTRUE(cohort_fit$cluster_robust))
-                            "cluster-robust by fire" else
-                            "NAIVE - p-values are anticonservative"),
-      "# ---------------------------------------------------------------------------",
-      ""
-    )
-    for (i in seq_len(nrow(cohort_fit$coef_df))) {
-      row <- cohort_fit$coef_df[i, ]
-      unit_note <- switch(row$term,
-        "(Intercept)"   = "# intercept",
-        "BarkThickness" = "# SINGLE-SIDED bark thickness, cm -- must match Species_CSV_File MaximumBarkThickness",
-        "dNBR"          = "# site-level dNBR 0-2000 (SCF passes its own predicted dNBR here)",
-        ""
-      )
-      lines <- c(lines, fmt_par(row$scf_parameter, row$estimate, unit_note))
-    }
     if (!is.null(cohort_fit$n_dnbr_levels))
-      lines <- c(lines, "",
-        sprintf("#   Distinct dNBR values available to B2: %d", cohort_fit$n_dnbr_levels))
+      lines <- c(lines, sprintf(">>   Distinct dNBR values available to CohortMortalityB2: %d",
+                                cohort_fit$n_dnbr_levels))
     if (!is.null(cohort_fit$sign_warnings) && length(cohort_fit$sign_warnings) > 0)
-      lines <- c(lines, "#   SIGN WARNINGS:",
-                 paste0("#     - ", cohort_fit$sign_warnings))
+      lines <- c(lines, ">>   COHORT SIGN WARNINGS:", paste0(">>     - ", cohort_fit$sign_warnings))
   }
 
   paste(lines, collapse = "\n")
