@@ -17,6 +17,8 @@
 #   plot_cm_curve()          P(cohort mort) vs BarkThickness at multiple dNBR
 #   plot_fire_map()          Fire grid from simulate_fire_simple() as ggplot
 #   plot_fire_timeline()     Area burned per day vs MaxSpreadArea
+#   run_fire_ensemble_weather() Fires on real daily weather, SCF-weighted ignition days
+#   plot_fire_ensemble_weather() Size CDF vs FPA FOD + size vs ignition FWI
 #   ign_tune_coef_df()       Hand-typed ignition coefficients -> coef tibble
 #   build_scf_tuning_snippet() SCF parameter file text from tuning inputs
 # =============================================================================
@@ -1067,6 +1069,190 @@ run_fire_ensemble <- function(fwi_vals     = c(5, 15, 25, 35),
     }
   }
   do.call(rbind, results)
+}
+
+
+# -----------------------------------------------------------------------------
+# ignition_day_weights
+#
+# Expected SCF ignitions on each day, summed over ignition types, from the
+# ignition coefficients (PlugIn.cs): lambda = exp(b0 + b1*FWI), and for ZIP
+# the Poisson draw only happens when runif() >= plogis(bz0 + bz1*FWI), so
+# E[n] = (1 - plogis(bz0 + bz1*FWI)) * lambda.  Used to pick ignition days in
+# proportion to how often SCF would ignite fires on them.
+# ign_coef: data.frame(ignition_type, distribution, b0, b1, bz0, bz1), or NULL
+# for equal weights.
+# -----------------------------------------------------------------------------
+
+ignition_day_weights <- function(fwi, ign_coef = NULL) {
+  if (is.null(ign_coef) || nrow(ign_coef) == 0) return(rep(1, length(fwi)))
+  w <- numeric(length(fwi))
+  for (i in seq_len(nrow(ign_coef))) {
+    r   <- ign_coef[i, ]
+    lam <- exp(r$b0 + r$b1 * fwi)
+    zip <- !identical(as.character(r$distribution), "Poisson") &&
+           isTRUE(is.finite(r$bz0) && is.finite(r$bz1))
+    if (zip) lam <- lam * (1 - stats::plogis(r$bz0 + r$bz1 * fwi))
+    w <- w + lam
+  }
+  w[!is.finite(w) | w < 0] <- 0
+  w
+}
+
+
+# -----------------------------------------------------------------------------
+# run_fire_ensemble_weather
+#
+# Fire-size distribution under REAL daily weather, the way SCF experiences it:
+#   1. Ignition days are drawn from the weather record in proportion to the
+#      expected number of SCF ignitions that day (ignition_day_weights), so
+#      fire weather at ignition has SCF's own distribution.
+#   2. Each fire then burns on that year's actual daily FWI and wind from the
+#      ignition day to day `days_per_year` (SCF DaysPerYear = 364), via
+#      simulate_fire_simple().  Fires go out when cooler days drop P(spread)
+#      below the percolation threshold, as they do in SCF.
+#
+# weather: data.frame(date, FWI, EWS).  EWS in km/h.  Days missing from the
+#   record get FWI = 0 (the Climate Library only computes FWI inside the fire
+#   season) and the median EWS.
+#
+# Returns one row per fire: fire, start_date, doy, ign_FWI, ign_EWS, fire_ha,
+# n_cells, days, hit_edge, p_spread (ignition day, cardinal), msa_ha.
+# attr(, "mode") = "weather"; attr(, "info") = list of run settings.
+# -----------------------------------------------------------------------------
+
+run_fire_ensemble_weather <- function(weather,
+                                      ign_coef      = NULL,
+                                      n_fires       = 100L,
+                                      grid_dim      = 200L,
+                                      ff_val        = 0.5,
+                                      msa_b0, msa_b1, msa_b2,
+                                      sp_b0,  sp_b1,  sp_b2,  sp_b3,
+                                      cell_area_ha  = 0.09,
+                                      days_per_year = 364L,
+                                      seed          = 1L,
+                                      progress_fn   = NULL) {
+
+  wx <- weather %>%
+    transmute(date = as.Date(date), FWI = as.numeric(FWI), EWS = as.numeric(EWS)) %>%
+    filter(!is.na(date)) %>%
+    distinct(date, .keep_all = TRUE) %>%
+    arrange(date)
+  ews_fill <- stats::median(wx$EWS, na.rm = TRUE)
+  if (!is.finite(ews_fill)) ews_fill <- 0
+  doy <- as.integer(format(wx$date, "%j"))
+
+  # Candidate ignition days: FWI known, and at least one day left to spread
+  cand <- which(is.finite(wx$FWI) & doy < days_per_year)
+  if (length(cand) == 0) stop("No usable weather days for ignition.")
+  w <- ignition_day_weights(wx$FWI[cand], ign_coef)
+  weighting <- if (is.null(ign_coef) || nrow(ign_coef) == 0) "equal (no ignition coefficients)"
+               else "expected SCF ignitions per day"
+  if (sum(w) <= 0) { w <- rep(1, length(cand)); weighting <- "equal (weights were all zero)" }
+
+  set.seed(seed)
+  picks <- cand[sample.int(length(cand), n_fires, replace = TRUE, prob = w)]
+  date_key <- as.integer(wx$date)
+
+  rows <- vector("list", n_fires)
+  for (k in seq_len(n_fires)) {
+    if (!is.null(progress_fn)) progress_fn(k, n_fires)
+    d0  <- wx$date[picks[k]]
+    yr  <- as.integer(format(d0, "%Y"))
+    d1  <- as.Date(sprintf("%d-01-01", yr)) + (days_per_year - 1L)
+    dts <- seq(d0, d1, by = "day")
+    idx <- match(as.integer(dts), date_key)
+    fwi_v <- wx$FWI[idx]; fwi_v[!is.finite(fwi_v)] <- 0
+    ews_v <- wx$EWS[idx]; ews_v[!is.finite(ews_v)] <- ews_fill
+
+    sim <- simulate_fire_simple(
+      grid_dim = grid_dim, fwi = fwi_v, ews = ews_v, ff = ff_val,
+      msa_b0 = msa_b0, msa_b1 = msa_b1, msa_b2 = msa_b2,
+      sp_b0  = sp_b0,  sp_b1  = sp_b1,  sp_b2  = sp_b2, sp_b3 = sp_b3,
+      cell_area_ha = cell_area_ha, max_days = length(dts),
+      seed = seed * 100003L + k)
+
+    rows[[k]] <- data.frame(
+      fire = k, start_date = d0, doy = doy[picks[k]],
+      ign_FWI = fwi_v[1], ign_EWS = ews_v[1],
+      fire_ha = sim$total_ha, n_cells = sim$n_burned, days = sim$days,
+      hit_edge = sim$hit_edge, p_spread = sim$p_spread, msa_ha = sim$msa_ha)
+  }
+  out <- do.call(rbind, rows)
+  attr(out, "mode") <- "weather"
+  attr(out, "info") <- list(
+    weighting = weighting, n_weather_days = nrow(wx),
+    years = range(as.integer(format(wx$date, "%Y"))),
+    grid_dim = grid_dim, cell_area_ha = cell_area_ha,
+    days_per_year = days_per_year)
+  out
+}
+
+
+# -----------------------------------------------------------------------------
+# plot_fire_ensemble_weather
+#
+# A: size CDF of simulated fires vs observed FPA FOD, both restricted to fires
+#    larger than one cell and no larger than the simulation grid (the same
+#    truncation as candidate scoring, with the grid standing in for the
+#    landscape).  Subtitle gives the size score (mean |log quantile ratio|).
+# B: fire size against ignition-day FWI; open points hit the grid edge.
+# -----------------------------------------------------------------------------
+
+plot_fire_ensemble_weather <- function(ens, obs_sizes = NULL) {
+  info    <- attr(ens, "info")
+  cell    <- info$cell_area_ha
+  grid_ha <- info$grid_dim^2 * cell
+
+  sim_sz <- ens$fire_ha[ens$fire_ha > cell]
+  obs_sz <- if (!is.null(obs_sizes)) {
+    x <- obs_sizes[is.finite(obs_sizes)]
+    x[x > cell & x <= grid_ha]
+  } else numeric(0)
+
+  .cdf <- function(x, lab) if (length(x))
+    data.frame(size_ha = sort(x), cdf = seq_along(x) / length(x), source = lab)
+  cdf_df <- rbind(.cdf(sim_sz, "Simulated (SCF rules, real weather)"),
+                  .cdf(obs_sz, "Observed (FPA FOD)"))
+
+  score_txt <- if (length(sim_sz) && length(obs_sz))
+    sprintf("  |  size score %.2f (0 = match, 0.69 = 2x off)",
+            score_size_quantiles(obs_sz, sim_sz)) else ""
+  pct_out <- 100 * mean(ens$n_cells <= 1)
+
+  pA <- if (is.null(cdf_df)) {
+    ggplot() + labs(title = "No fire spread beyond its ignition cell") + theme_bw()
+  } else {
+    ggplot(cdf_df, aes(size_ha, cdf, colour = source)) +
+      geom_step(linewidth = 1) +
+      scale_x_log10(labels = scales::comma) +
+      scale_colour_manual(values = c("Simulated (SCF rules, real weather)" = "#d94801",
+                                     "Observed (FPA FOD)" = "#2166ac")) +
+      labs(title = "Fire size distribution",
+           subtitle = sprintf("%.0f%% of ignitions never left the ignition cell%s",
+                              pct_out, score_txt),
+           x = "Fire size (ha, log scale)", y = "Cumulative probability",
+           colour = NULL,
+           caption = sprintf("Fires > 1 cell (%.2f ha) and <= grid area (%s ha)",
+                             cell, scales::comma(round(grid_ha)))) +
+      theme_bw(base_size = 12) + theme(legend.position = "bottom")
+  }
+
+  pB <- ggplot(ens, aes(ign_FWI, pmax(fire_ha, cell), shape = hit_edge)) +
+    geom_point(colour = "#d94801", alpha = 0.6, size = 2) +
+    scale_y_log10(labels = scales::comma) +
+    scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 1),
+                       labels = c(`FALSE` = "Contained in grid",
+                                  `TRUE` = "Reached grid edge")) +
+    labs(title = "Size vs ignition-day FWI",
+         subtitle = sprintf("%d fires  |  ignition days weighted by %s",
+                            nrow(ens), info$weighting),
+         x = "FWI on ignition day", y = "Fire size (ha, log scale)", shape = NULL) +
+    theme_bw(base_size = 12) + theme(legend.position = "bottom")
+
+  if (requireNamespace("patchwork", quietly = TRUE))
+    patchwork::wrap_plots(pA, pB, ncol = 2)
+  else pA
 }
 
 

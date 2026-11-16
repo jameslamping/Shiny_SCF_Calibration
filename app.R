@@ -2998,16 +2998,40 @@ ui <- page_navbar(
               " produces realistic fire sizes across the range of fire-weather conditions.",
               " If FPA FOD data is loaded (Ignition tab), blue reference lines show the",
               " observed P50 and P90 fire sizes as calibration targets.",
-              " Uses the same SCF spread rules and 'Days left in fire year' as the",
-              " Fire Simulation tab. Weather is held constant for the whole fire,",
-              " which SCF does not do, so supercritical fires burn until the day cap",
-              " or the grid edge."),
+              " Both modes use SCF's spread rules (see Fire Simulation).",
+              " 'Real daily weather' is the closer match to SCF: fires grow and die",
+              " with the day-to-day FWI and wind of the year they ignite in.",
+              " 'Constant' holds weather fixed for the whole fire (using 'Days left",
+              " in fire year'), so any fire that gets going burns until that cap or",
+              " the grid edge — read its large-fire sizes as an upper bound."),
             fluidRow(
               column(3,
-                numericInput("tune_ens_reps", "Runs per scenario",
-                             value = 12, min = 5, max = 50, step = 1),
-                p(class = "text-muted small",
-                  "More runs = smoother distributions but slower (~1s per 10 runs)."),
+                radioButtons("tune_ens_mode", "Weather",
+                             choices = c("Real daily weather"          = "weather",
+                                         "Constant FWI × EWS grid" = "grid"),
+                             selected = "weather"),
+                conditionalPanel("input.tune_ens_mode == 'weather'",
+                  radioButtons("tune_ens_wx_source", "Weather source",
+                               choices = c("Runtime: LANDIS climate file" = "runtime",
+                                           "Calibration: ERA/GRIDMET FWI + wind" = "calibration"),
+                               selected = "runtime"),
+                  numericInput("tune_ens_nfires", "Fires to simulate",
+                               value = 150, min = 20, max = 1000, step = 10),
+                  p(class = "text-muted small",
+                    "Ignition days are drawn from the weather record in proportion ",
+                    "to SCF's expected ignitions that day. Each fire then burns on ",
+                    "that year's real daily FWI and wind until it goes out or ",
+                    "reaches day 364. EWS = wind speed (flat terrain). ",
+                    "All coefficients, including ignitions, come from the Parameters ",
+                    "sidebar — click ", tags$b("← Load from Calibration"),
+                    " first, or it uses the placeholder defaults.")
+                ),
+                conditionalPanel("input.tune_ens_mode == 'grid'",
+                  numericInput("tune_ens_reps", "Runs per scenario",
+                               value = 12, min = 5, max = 50, step = 1),
+                  p(class = "text-muted small",
+                    "More runs = smoother distributions but slower (~1s per 10 runs).")
+                ),
                 uiOutput("tune_ens_grid_info_ui"),
                 sliderInput("tune_ens_ff", "FineFuels (0-1 scaled)",
                             min = 0, max = 1, value = 0.5, step = 0.05),
@@ -7550,7 +7574,56 @@ server <- function(input, output, session) {
       cell_area_ha <- p$cell_area
     }
 
-    withProgress(message = "Running fire ensemble…", value = 0, {
+    # ---- Real daily weather ----------------------------------------------
+    if (identical(input$tune_ens_mode %||% "weather", "weather")) {
+      wx <- ensemble_weather_table(input$tune_ens_wx_source %||% "runtime")
+      if (is.null(wx$df)) {
+        showNotification(wx$note, type = "error", duration = 12)
+        return()
+      }
+      # Tuned ignition coefficients if the Ignition tuning panel is filled in,
+      # else the fitted ones; without either, ignition days are equally likely.
+      ign <- tryCatch(isolate(tune_ign_coef_r()), error = function(e) NULL)
+      ign_src <- "the Parameters sidebar ignition coefficients"
+      if (is.null(ign) || nrow(ign) == 0 || !all(is.finite(ign$b0))) {
+        ign <- rv$ign_coef; ign_src <- "fitted ignition model"
+      }
+      if (is.null(ign)) ign_src <- "none (equal weights)"
+      n_fires <- max(20L, min(1000L, as.integer(input$tune_ens_nfires %||% 150L)))
+
+      ens <- tryCatch(
+        withProgress(message = "Running fires on real weather\u2026", value = 0, {
+          run_fire_ensemble_weather(
+            weather      = wx$df,
+            ign_coef     = ign,
+            n_fires      = n_fires,
+            grid_dim     = grid_dim,
+            ff_val       = ff_val,
+            msa_b0       = p$msa_b0, msa_b1 = p$msa_b1, msa_b2 = p$msa_b2,
+            sp_b0        = p$sp_b0,  sp_b1  = p$sp_b1,
+            sp_b2        = p$sp_b2,  sp_b3  = p$sp_b3,
+            cell_area_ha = cell_area_ha,
+            progress_fn  = function(k, n) setProgress(k / n,
+                                                      detail = sprintf("fire %d of %d", k, n))
+          )
+        }),
+        error = function(e) {
+          showNotification(paste("Ensemble failed:", conditionMessage(e)),
+                           type = "error", duration = 12)
+          NULL
+        })
+      if (is.null(ens)) return()
+      info <- attr(ens, "info")
+      info$wx_label  <- wx$label
+      info$wx_note   <- wx$note
+      info$ign_src   <- ign_src
+      attr(ens, "info") <- info
+      ensemble_rv(ens)
+      return()
+    }
+
+    # ---- Constant weather grid --------------------------------------------
+    withProgress(message = "Running fire ensemble\u2026", value = 0, {
       ens <- run_fire_ensemble(
         fwi_vals     = c(5, 15, 25, 35),
         ews_vals     = c(5, 15, 25),
@@ -7570,8 +7643,51 @@ server <- function(input, output, session) {
     })
   })
 
+  # Daily weather for the real-weather ensemble.  Returns list(df, label, note);
+  # df = NULL (and note = the reason) when the chosen source is not loaded.
+  # df has columns date, FWI, EWS (km/h; flat-terrain EWS = wind speed).
+  ensemble_weather_table <- function(source) {
+    wind_cal <- if (!is.null(rv$wind_daily) && "WindSpeed_kmh" %in% names(rv$wind_daily))
+      dplyr::select(rv$wind_daily, date, EWS = WindSpeed_kmh) else NULL
+    const_ews <- input$tune_sim_ews %||% 15
+    fill_wind <- function(df, label) {
+      note <- NULL
+      has_wind <- "EWS" %in% names(df) && any(is.finite(df$EWS) & df$EWS > 0)
+      if (!has_wind && !is.null(wind_cal)) {
+        df <- dplyr::left_join(dplyr::select(df, -dplyr::any_of("EWS")), wind_cal, by = "date")
+        note <- "Wind taken from the calibration wind series (none in the source)."
+      }
+      if (!("EWS" %in% names(df)) || !any(is.finite(df$EWS) & df$EWS > 0)) {
+        df$EWS <- const_ews
+        note <- sprintf("No daily wind available: EWS held at %g km/h (Fire Simulation slider).",
+                        const_ews)
+      }
+      list(df = df, label = label, note = note)
+    }
+    if (identical(source, "runtime")) {
+      d <- rv$landis_fwi$daily
+      if (is.null(d))
+        return(list(df = NULL, note = paste(
+          "No runtime weather loaded. Load the LANDIS climate file in the sidebar",
+          "('Runtime FWI check'), or choose the Calibration source.")))
+      fill_wind(dplyr::transmute(d, date = as.Date(date), FWI = FWI, EWS = wind_kmh),
+                "Runtime FWI (LANDIS climate file)")
+    } else {
+      if (is.null(rv$era_fwi_daily))
+        return(list(df = NULL, note = "No calibration FWI loaded (sidebar: FWI source)."))
+      df <- dplyr::transmute(rv$era_fwi_daily, date = as.Date(date), FWI = value)
+      if (!is.null(wind_cal)) df <- dplyr::left_join(df, wind_cal, by = "date")
+      fill_wind(df, "Calibration FWI (ERA/GRIDMET)")
+    }
+  }
+
   output$tune_ensemble_plot <- renderPlot({
     ens      <- ensemble_rv()
+    if (identical(attr(ens, "mode"), "weather")) {
+      obs <- if (!is.null(rv$ign_df) && "FIRE_SIZE_HA" %in% names(rv$ign_df))
+        rv$ign_df$FIRE_SIZE_HA else NULL
+      return(plot_fire_ensemble_weather(ens, obs_sizes = obs))
+    }
     MIN_HA   <- 4   # landscape-scale threshold — 86% of FOD fires are below this
 
     # ---- FPA FOD reference quantiles — filtered to landscape-scale fires ------
@@ -7712,6 +7828,30 @@ server <- function(input, output, session) {
     if (is.null(ens)) {
       tags$p(class = "text-muted small",
              "Click 'Run Ensemble' to generate fire size distributions.")
+    } else if (identical(attr(ens, "mode"), "weather")) {
+      info   <- attr(ens, "info")
+      spread <- ens$fire_ha[ens$n_cells > 1]
+      tags$div(
+        class = paste("alert p-2 mt-2", if (any(ens$hit_edge)) "alert-warning" else "alert-info"),
+        style = "font-size:0.82rem;",
+        tags$b(icon("circle-check"), sprintf(" %d fires on real weather", nrow(ens))),
+        tags$br(),
+        sprintf("%.0f%% stayed in the ignition cell", 100 * mean(ens$n_cells <= 1)),
+        tags$br(),
+        if (length(spread))
+          sprintf("Fires that spread: median %s ha, P90 %s ha, median %d days",
+                  scales::comma(round(stats::median(spread), 1)),
+                  scales::comma(round(stats::quantile(spread, 0.9), 1)),
+                  as.integer(stats::median(ens$days[ens$n_cells > 1]))),
+        tags$br(),
+        tags$span(class = "text-muted",
+                  sprintf("%s, %d\u2013%d; ignition days weighted by %s.",
+                          info$wx_label, info$years[1], info$years[2], info$ign_src)),
+        if (!is.null(info$wx_note)) tagList(tags$br(), tags$span(class = "text-muted", info$wx_note)),
+        if (any(ens$hit_edge)) tagList(tags$br(), sprintf(
+          "%.0f%% of fires reached the grid edge, so their sizes are truncated by the grid.",
+          100 * mean(ens$hit_edge)))
+      )
     } else {
       med_ha <- round(stats::median(ens$fire_ha), 1)
       p90_ha <- round(stats::quantile(ens$fire_ha, 0.90), 1)
