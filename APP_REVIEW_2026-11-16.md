@@ -32,13 +32,18 @@ and the MORA findings below.
 - **`MaximumSpreadAreaB0` = −134 ha.** MSA is negative below about FWI 4, so SCF
   burns one cell per day there. Fires ignited on low-FWI days creep along until a
   hot day lets them run.
-- **`SpreadProbabilityB2` (fine fuels) = −1.77.** That is the wrong sign: more
-  fuel lowers spread.
-- **B0 sweep on runtime weather:** best B0 ≈ −0.12 (fitted −1.65).
-  - It matches area burned (0.47 vs 0.55 %/yr) and the 90th-percentile fire size
-    (272 vs 283 ha).
-  - But the simulated median is ~35 ha against 5 ha observed. B0 alone cannot fix
-    the shape of the size distribution.
+- **The saved fit still has `SpreadProbabilityB2` = −1.77.** You had already
+  decided B2 = 0 for MORA (fuel load runs opposite to flammability in maritime
+  forest), so set it to 0 after "Load from Calibration".
+- **B0 sweep with the settled MORA choices** (B2 = 0, fire size only, since
+  annual area doesn't transfer from region to park; 200 fires, runtime weather):
+  - best B0 ≈ −1.56
+  - median fire 5.7 ha vs 4.9 observed
+  - **P90 only 17 ha vs 292 observed: the large-fire tail is far too thin**
+  - B0 alone cannot match both typical and large fires; a steeper B1 (fires grow
+    faster on hot days) is the obvious lever, hence the joint sweep in #9.
+  - Set the sweep weights to size = 1, area = 0 for MORA. An earlier run
+    (B2 = −1.77, 50/50 weights) gave B0 ≈ −0.12; disregard it.
 - **CLAUDE.md is out of date on `BurningSitesThreshold`.** It describes this
   setting as part of FireEvent.cs, but it is absent from SCF master (4b089af) and
   from every local SCF copy.
@@ -148,8 +153,8 @@ step has been done.
 
 ### 9. The spread-probability response is a daily rate, but SCF draws once per fire — B0 PART DONE 2026-11-16
 > B0 now comes from the B0 Sweep tab. B1/B3 are still taken from the GLM; a
-> joint sweep (B0 × B1) is the natural next step, given the MORA median-size
-> mismatch.
+> joint sweep (B0 × B1) is the natural next step: for MORA no single B0 matches
+> both the median and the P90 fire size.
 - The perimeter-pair frontier ring counts a cell as a failure if it is unburned
   at t+1, even if it burns at t+2. SCF never gives that cell a second chance.
 - This affects more than the intercept: it also distorts the B1 and B3 slopes,
@@ -212,7 +217,7 @@ the whole calibration region with fires simulated on the landscape.
    `/Users/jlamping/...` defaults.
 3. **#9 joint B0 × B1 sweep:** fixes the shape of the size distribution, not just
    its level.
-4. **MORA data fixes:** refit B6, positive MSA B0, fine-fuels sign.
+4. **MORA data fixes:** refit B6 (or set 0), positive MSA B0.
 5. **#15 tests:** turn this session's scratch checks into a `testthat` suite:
    - simulator vs SCF reference loop
    - scoring known-answer
