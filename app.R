@@ -2696,10 +2696,12 @@ ui <- page_navbar(
 
             h6("Fine Fuels Scaling"),
             numericInput("tune_max_ff", "MaximumFineFuels (g C m⁻²)",
-                         value = 18000, min = 1, step = 500),
+                         value = 900, min = 1, step = 50),
             p(class = "text-muted small",
               "SCF computes FF_scaled = min(FF_raw / MaxFF, 1.0).",
-              " Setting MaxFF too low saturates B2 — see the",
+              " Default 900 \u2248 9 t/ac (FBFM40 GR9), the load the calibration",
+              " scaled FineFuels = 1.0 to, so the fitted B2 (spread) and B5",
+              " (severity) apply as fitted. Setting MaxFF too low saturates B2 \u2014 see the",
               tags$b(" Fine Fuels tab"), " for the scaling diagnostic."),
             numericInput("tune_observed_max_ff",
                          "Observed LANDIS FineFuels max (g C/m², optional)",
@@ -7132,8 +7134,11 @@ server <- function(input, output, session) {
           pct_sat, obs_max, p$max_ff
         ),
         " B2 is effectively a constant offset — FineFuels has no real signal in SCF.",
-        tags$b(sprintf(" Suggested fix: raise MaximumFineFuels to ≈%.0f g/m² (95th pct of your range).",
-                       recommended_max_ff))
+        tags$b(sprintf(" Suggested fix: raise MaximumFineFuels to ≈%.0f g/m² (95th pct of your range)",
+                       recommended_max_ff)),
+        sprintf(paste0(" and multiply SpreadProbabilityB2 and SiteMortalityB5 by %.2f",
+                       " (new MaxFF / %.0f) so the fitted fuel effect is unchanged."),
+                recommended_max_ff / p$max_ff, p$max_ff)
       )
     } else if (pct_sat > 10) {
       div(class = "alert alert-warning p-2 small",
@@ -7142,7 +7147,9 @@ server <- function(input, output, session) {
           "%.1f%% of your LANDIS range exceeds MaxFF=%.0f — some saturation present.",
           pct_sat, p$max_ff
         ),
-        sprintf(" Consider raising MaximumFineFuels toward %.0f g/m².", recommended_max_ff)
+        sprintf(paste0(" Consider raising MaximumFineFuels toward %.0f g/m²; if you do, multiply",
+                       " SpreadProbabilityB2 and SiteMortalityB5 by %.2f to keep the fitted effect."),
+                recommended_max_ff, recommended_max_ff / p$max_ff)
       )
     } else if (!is.null(obs_max)) {
       div(class = "alert alert-success p-2 small",
