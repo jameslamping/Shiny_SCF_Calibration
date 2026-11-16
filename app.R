@@ -896,11 +896,15 @@ ui <- page_navbar(
         # ---- Step 3: FIA bark parameters ----------------------------------
         h6("Step 3 — Fetch FIA Bark Parameters"),
         p(class = "text-muted small",
-          "Reads FIA TREE table data (BARK_THICK, DIA, TOTAGE) for the selected ",
-          "states. Estimates ", tags$b("MaximumBarkThickness"), " (asymptotic ",
-          "bark thickness in cm) and ", tags$b("AgeDBH"), " (Michaelis-Menten ",
-          "half-saturation age) from SCF Eq. 10. Reads local CSV files if ",
-          "available and non-empty; downloads via rFIA for any missing states."),
+          "Reads FIA TREE table data (DIA, TOTAGE, BHAGE) for the selected states. ",
+          "FIA supplies no bark thickness \u2014 only DBH outside bark \u2014 so bark comes ",
+          "from the FOFEM BT_coef in the FTM ", tags$code("Species_BarkThickness.csv"),
+          " (the same coefficients the cohort mortality GLM is fit on), falling back ",
+          "to a built-in FOFEM table. Estimates ", tags$b("MaximumBarkThickness"),
+          " = BT_coef \u00d7 P95 DBH (", tags$b("single-sided"), ", cm) and ",
+          tags$b("AgeDBH"), " (Michaelis-Menten half-saturation age) for SCF Eq. 10. ",
+          "Reads local CSV files if available and non-empty; downloads via rFIA for ",
+          "any missing states."),
 
         h6("FIA States"),
         selectizeInput("fia_states", label = NULL,
@@ -958,9 +962,13 @@ ui <- page_navbar(
               "MaximumBarkThickness. Lower values = faster bark development. ",
               "Typical range: 30\u2013150 years depending on species.",
               br(),
-              tags$b("MaximumBarkThickness:"), " Asymptotic bark thickness (cm, one side) ",
-              "approached at very large DBH. Ponderosa pine \u224840 mm, lodgepole pine ",
-              "\u22488 mm, Douglas-fir \u224825 mm."),
+              tags$b("MaximumBarkThickness:"), " Asymptotic ", tags$b("single-sided"),
+              " bark thickness (cm) approached at very large DBH, computed as ",
+              "FOFEM BT_coef \u00d7 P95 DBH. Ponderosa pine \u224844 mm, Douglas-fir ",
+              "\u224838 mm, lodgepole pine \u224810 mm. ",
+              tags$b("Do not enter double-sided values here"), " \u2014 SCF Eq. 10 and ",
+              "CohortMortalityB1 are both on the single-sided (Cansler/FOFEM) scale, ",
+              "so doubling would roughly halve simulated fire mortality."),
             br(),
             DTOutput("spp_table_dt"),
             br(),
@@ -1887,6 +1895,16 @@ ui <- page_navbar(
         p(class = "text-muted small",
           "5% = 1 in 20 pixels per fire, sufficient for GLM fitting while ",
           "reducing memory use. Increase for larger calibration regions."),
+
+        numericInput("mtbs_min_dnbr", "Minimum dNBR to keep",
+                     value = 1, min = 0, max = 500, step = 1),
+        p(class = "text-muted small",
+          "Left truncation of the Gamma response. The Gamma family only needs ",
+          tags$code("dNBR > 0"), ", so keep this at 1. Higher values discard the ",
+          "low-severity tail, which inflates ", tags$code("SiteMortalityB0"),
+          " (and so the baseline severity SCF predicts) and flattens every slope. ",
+          "SCF assigns a dNBR to every cell inside a perimeter, including barely ",
+          "burned ones, so the calibration sample should too."),
         actionButton("load_mtbs_dnbr", "Load MTBS dNBR Pixels",
                      class = "btn-sm btn-secondary w-100"),
         uiOutput("mtbs_dnbr_status_ui"),
@@ -1948,15 +1966,41 @@ ui <- page_navbar(
         # ---- A: Ladder fuels --------------------------------------------------
         h6("Ladder Fuels (Canopy Base Height)"),
         radioButtons("ladder_fuels_source", NULL,
-                     choices  = c("Fetch LANDFIRE CBH (remote)"     = "landfire",
-                                  "Local file (ladder fuel index 0-1)" = "local",
-                                  "None \u2014 placeholder (0.5)"   = "none"),
+                     choices  = c("Fetch LANDFIRE canopy biomass (remote)" = "landfire",
+                                  "Local file (ladder fuel biomass, g m\u207b\u00b2)" = "local",
+                                  "None \u2014 SiteMortalityB6 = 0"       = "none"),
                      selected = "landfire"),
+        p(class = "text-muted small mt-1",
+          tags$b("Units must be g m\u207b\u00b2."), " SCF Eq. 7 multiplies B6 by the raw ",
+          "summed biomass of ladder-species cohorts (FireEvent.cs:319-325), typically ",
+          "0\u20133000 g m\u207b\u00b2 \u2014 not a 0\u20131 index. An index would yield a B6 about ",
+          "1000\u00d7 too large, driving the linear predictor negative and pinning dNBR at ",
+          "its 2000 ceiling everywhere. Choosing ", tags$b("None"),
+          " is the safe option when biomass is unavailable."),
+        conditionalPanel(
+          condition = "input.ladder_fuels_source == 'landfire'",
+          numericInput("ladder_ceiling_m",
+                       "Ladder-fuel stratum top (m)",
+                       value = 8, min = 1, max = 30, step = 1),
+          p(class = "text-muted small",
+            "Ladder biomass = CBD \u00d7 (min(canopy height, this) \u2212 canopy base height) ",
+            "\u00d7 1000. Set this to roughly the height of a cohort at ",
+            tags$code("LadderFuelMaxAge"), " for your ladder species.")
+        ),
         conditionalPanel(
           condition = "input.ladder_fuels_source == 'local'",
-          textInput("ladder_fuels_path", "Ladder fuel index raster",
-                    placeholder = "/path/to/ladder_fuels.tif")
+          textInput("ladder_fuels_path", "Ladder fuel biomass raster (g m\u207b\u00b2)",
+                    placeholder = "/path/to/ladder_fuel_biomass.tif")
         ),
+        numericInput("ladder_max_age", "LadderFuelMaxAge (years)",
+                     value = 20, min = 1, max = 200, step = 1),
+        selectizeInput("ladder_species", "LadderFuelSpeciesList",
+                       choices = NULL, multiple = TRUE,
+                       options = list(placeholder = "Select ladder-fuel species...")),
+        p(class = "text-muted small",
+          "Written straight into the parameter snippet. These define the biomass ",
+          "SCF sums into the B6 term, so they should describe the same sub-canopy ",
+          "stratum the ladder raster above represents."),
         uiOutput("ladder_status_ui"),
 
         hr(),
@@ -2046,7 +2090,7 @@ ui <- page_navbar(
             p(class = "text-muted small",
               "Run ", tags$strong("Fit Cohort Mortality"), " to populate these plots. ",
               "The yr1status distribution (top-left) is the most critical: ",
-              tags$code("yr1status=2"), " (confirmed dead) trees must be present. ",
+              tags$code("yr1status"), " must include both 0 (alive) and 1 (dead). ",
               "Bark thickness should be ", tags$em("lower"), " in dead trees; ",
               "mortality rate should ", tags$em("decrease"), " with thicker bark and ",
               tags$em("increase"), " with higher severity."),
@@ -2237,6 +2281,36 @@ ui <- page_navbar(
             plotOutput("val_fwi_size_park_plot", height = "380px"),
             br(),
             downloadButton("dl_val_fwi_size", "Download PNG (300 dpi)",
+                           class = "btn-sm btn-outline-secondary"),
+            hr(),
+            h6(class = "mt-2", icon("wind"), " Fire Size \u2013 Effective Wind Relationship"),
+            p(class = "text-muted small",
+              "The same figure binned on ", tags$b("effective wind speed"), " instead of FWI. ",
+              "EWS is the second weather term in both spread equations \u2014 ",
+              tags$code("SpreadProbabilityB3"), " in ",
+              tags$code("P = logit\u207B\u00B9(B0 + B1\u00B7FWI + B2\u00B7FineFuels + B3\u00B7EWS)"),
+              " and ", tags$code("MaximumSpreadAreaB2"), " in ",
+              tags$code("MaxSpreadArea = B0 + B1\u00B7FWI + B2\u00B7EWS"),
+              ". Reading it alongside the FWI panels tells you which coefficient a size ",
+              "mismatch belongs to: a line that tracks observed against FWI but runs steep ",
+              "against EWS means the wind coefficients are carrying too much of the spread signal."),
+            p(class = "text-muted small",
+              tags$b("Two caveats on comparability."),
+              " Observed EWS is evaluated at the ignition point on the discovery date at the ",
+              "calibration Cb (set on the Spread tab); simulated ",
+              tags$code("MeanEffectiveWindSpeed"), " is a mean over every burned cell in the ",
+              "event. And SCF escalates Cb to 25 (Intensity > 3) and 50 (> 6) internally, so ",
+              "simulated EWS well above Cb is often that escalation rather than stronger wind, ",
+              "and the observed series (one fixed Cb) has no counterpart for it \u2014 the figure ",
+              "reports the share of simulated events falling outside the observed EWS range. ",
+              "Requires ERA5 wind + terrain, i.e. run Spread Calibration first."),
+            h6(class = "mt-2", icon("globe"), " Calibration Boundary Scale"),
+            plotOutput("val_ews_size_plot",      height = "440px"),
+            br(),
+            h6(class = "mt-2", icon("map"), " LANDIS Landscape Scale"),
+            plotOutput("val_ews_size_park_plot", height = "440px"),
+            br(),
+            downloadButton("dl_val_ews_size", "Download PNG (300 dpi)",
                            class = "btn-sm btn-outline-secondary")
           ),
 
@@ -2478,6 +2552,48 @@ ui <- page_navbar(
           open     = "msa_acc",
           multiple = TRUE,
 
+          # -- Ignitions
+          bslib::accordion_panel(
+            title = tagList(icon("bolt"), " Ignitions"),
+            value = "ign_acc",
+            uiOutput("tune_ign_badges"),
+            p(class = "text-muted small",
+              "λ = exp(b0 + b1·FWI); ZIP skips the draw with ",
+              "π = plogis(bz0 + bz1·FWI), so E[n] = (1−π)×λ. ",
+              "b1 sits inside the exponential — it controls the high-FWI tail."),
+
+            radioButtons("tune_ign_dist", "Distribution",
+                         choices  = c("Zero-inflated Poisson" = "ZeroInflatedPoisson",
+                                      "Poisson"               = "Poisson"),
+                         selected = "ZeroInflatedPoisson"),
+
+            h6(icon("bolt"), " Lightning"),
+            numericInput("tune_ign_l_b0",  "b0 — Intercept (log)",
+                         value = -5, step = 0.1),
+            numericInput("tune_ign_l_b1",  "b1 × FWI (log per unit)",
+                         value = 0.08, step = 0.005),
+            numericInput("tune_ign_l_bz0", "bz0 — Zero-inflation intercept",
+                         value = 0, step = 0.1),
+            numericInput("tune_ign_l_bz1", "bz1 × FWI (zero-inflation)",
+                         value = -0.05, step = 0.005),
+
+            hr(),
+            h6(icon("person"), " Accidental"),
+            numericInput("tune_ign_a_b0",  "b0 — Intercept (log)",
+                         value = -4, step = 0.1),
+            numericInput("tune_ign_a_b1",  "b1 × FWI (log per unit)",
+                         value = 0.09, step = 0.005),
+            numericInput("tune_ign_a_bz0", "bz0 — Zero-inflation intercept",
+                         value = 0, step = 0.1),
+            numericInput("tune_ign_a_bz1", "bz1 × FWI (zero-inflation)",
+                         value = -0.05, step = 0.005),
+
+            p(class = "text-muted small mt-2",
+              "These are the ", tags$b("regional"), " coefficients — the same",
+              " ones the Ignition tab diagnostics are drawn from. The area",
+              " offset to landscape scale is applied on the Scale Adjustment tab.")
+          ),
+
           # -- MaxSpreadArea
           bslib::accordion_panel(
             title = tagList(icon("arrows-up-down"), " Max Spread Area"),
@@ -2534,10 +2650,11 @@ ui <- page_navbar(
                          value = -0.000001, step = 0.0000001),
             numericInput("tune_sm_b5", "B5 × FineFuels (0-1)",
                          value = 0.00005, step = 0.00001),
-            numericInput("tune_sm_b6", "B6 × LadderFuels (g C/m²)",
+            numericInput("tune_sm_b6", "B6 × LadderFuels (g/m²)",
                          value = -0.000002, step = 0.0000001),
             p(class = "text-muted small",
-              "B6 units: LANDIS LadderFuels is raw biomass (g C/m²).",
+              "B6 units: SCF sums raw cohort biomass (g/m²) for ladder species ",
+              "below LadderFuelMaxAge \u2014 never a 0\u20131 index.",
               " Set to 0 if calibrated on a normalized 0-1 index.")
           ),
 
@@ -2586,10 +2703,10 @@ ui <- page_navbar(
                          value = 50, min = 0, step = 5),
             numericInput("tune_ff_sm", "FineFuels (0-1 scaled)",
                          value = 0.3, min = 0, max = 1, step = 0.05),
-            numericInput("tune_lf_sm", "LadderFuels (g C/m²)",
+            numericInput("tune_lf_sm", "LadderFuels (g/m²)",
                          value = 100, min = 0, step = 10),
             p(class = "text-muted small",
-              "LadderFuels used for Eta Decomposition preview.")
+              "LadderFuels (g/m\u00b2) used for Eta Decomposition preview.")
           )
         ),
 
@@ -2652,6 +2769,8 @@ ui <- page_navbar(
                     tags$th("Parameter"), tags$th("Sign"), tags$th("Reason")
                   )),
                   tags$tbody(
+                    tags$tr(tags$td("Ign b1 (FWI)"),    tags$td(tags$span(class="text-success","+")), tags$td("Drier weather → more ignitions")),
+                    tags$tr(tags$td("Ign bz1 (FWI)"),   tags$td(tags$span(class="text-danger","−")),  tags$td("Drier weather → fewer structural zeros")),
                     tags$tr(tags$td("MSA B1 (FWI)"),    tags$td(tags$span(class="text-success","+")), tags$td("Higher FWI → larger daily burn ceiling")),
                     tags$tr(tags$td("MSA B2 (EWS)"),    tags$td(tags$span(class="text-success","+")), tags$td("Stronger wind → larger daily burn ceiling")),
                     tags$tr(tags$td("SP B1 (FWI)"),     tags$td(tags$span(class="text-success","+")), tags$td("Drier fuel → more likely to spread")),
@@ -2663,6 +2782,36 @@ ui <- page_navbar(
                     tags$tr(tags$td("CM B2 (dNBR)"),    tags$td(tags$span(class="text-success","+")), tags$td("Higher severity kills more cohorts"))
                   )
                 )
+              )
+            )
+          ),
+
+          # ---- Ignitions ------------------------------------------------------
+          nav_panel("Ignitions",
+            br(),
+            uiOutput("tune_ign_status_ui"),
+            p(class = "text-muted small",
+              "The same four diagnostics as the Ignition tab, redrawn live from ",
+              "the coefficients on the left. The dashed grey curve is the fit as ",
+              "it came out of the regression, so you can see how far a hand ",
+              "adjustment moves it."),
+
+            navset_pill(
+              nav_panel("Observed vs Fitted",
+                br(),
+                plotOutput("tune_ign_fit_plot", height = "420px")
+              ),
+              nav_panel("Zero-Inflation (π)",
+                br(),
+                plotOutput("tune_ign_zi_plot", height = "420px")
+              ),
+              nav_panel("Count Component (λ)",
+                br(),
+                plotOutput("tune_ign_count_plot", height = "420px")
+              ),
+              nav_panel("Residuals",
+                br(),
+                plotOutput("tune_ign_resid_plot", height = "420px")
               )
             )
           ),
@@ -2967,7 +3116,9 @@ server <- function(input, output, session) {
     mortality <- c("solus_clay_dir","sg_clay_dir","mtbs_source","mtbs_out_dir",
                    "mtbs_dnbr_dir","mtbs_sample_frac","et_cwd_source","tc_cache_dir",
                    "et_local_path","cwd_local_path","fine_fuels_source","fine_fuels_path",
-                   "ladder_fuels_source","ladder_fuels_path","ftm_dir","mtbs_local_path")
+                   "ladder_fuels_source","ladder_fuels_path","ladder_ceiling_m",
+                   "ladder_max_age","ladder_species","mtbs_min_dnbr",
+                   "ftm_dir","mtbs_local_path")
     species   <- c("fia_local_dir","lookup_csv_path","spp_filter_mode","necn_csv_path")
     dplyr::case_when(
       id %in% landscape ~ "Landscape",
@@ -4040,6 +4191,69 @@ server <- function(input, output, session) {
                           plot_title   = "Fire Size – Climate Relationship (LANDIS Landscape)")
   })
 
+  # ---- Fire size vs EFFECTIVE WIND SPEED -------------------------------------
+  # Observed EWS is derived per fire (terrain at the ignition point x wind on
+  # the discovery date), so it is computed once in a reactive rather than on
+  # every render of the two panels + the download handler.
+  .val_obs_ews_cal <- reactive({
+    if (is.null(rv$ign_df)) return(NULL)
+    add_obs_ews(rv$ign_df, rv$wind_daily, rv$slope_r, rv$aspect_r,
+                combustion_buoyancy = as.numeric(input$combustion_buoyancy))
+  })
+
+  .val_obs_ews_park <- reactive({
+    if (is.null(rv$park_ign_df)) return(NULL)
+    add_obs_ews(rv$park_ign_df, rv$wind_daily, rv$slope_r, rv$aspect_r,
+                combustion_buoyancy = as.numeric(input$combustion_buoyancy))
+  })
+
+  .val_ews_needs_wind <- function(title) {
+    ggplot() +
+      annotate("text", x = 0.5, y = 0.5, size = 4.5, hjust = 0.5,
+               label = paste0(
+                 "ERA5 wind and terrain not loaded.\n",
+                 "Run Spread Calibration on the Spread tab to enable this panel.")) +
+      labs(title = title) +
+      theme_void() + theme(plot.title = element_text(size = 13, face = "bold"))
+  }
+
+  output$val_ews_size_plot <- renderPlot({
+    req(rv$simulated_events)
+    if (is.null(rv$wind_daily))
+      return(.val_ews_needs_wind("Fire Size \u2013 Effective Wind Relationship (Calibration Boundary)"))
+    plot_val_fire_ews(
+      .val_obs_ews_cal(), rv$simulated_events,
+      wind_daily          = rv$wind_daily,
+      slope_r             = rv$slope_r,
+      aspect_r            = rv$aspect_r,
+      combustion_buoyancy = as.numeric(input$combustion_buoyancy),
+      min_ha              = 4,
+      plot_title = "Fire Size \u2013 Effective Wind Relationship (Calibration Boundary)")
+  })
+
+  output$val_ews_size_park_plot <- renderPlot({
+    req(rv$simulated_events)
+    title_park <- "Fire Size \u2013 Effective Wind Relationship (LANDIS Landscape)"
+    if (is.null(rv$wind_daily)) return(.val_ews_needs_wind(title_park))
+    if (is.null(rv$park_ign_df)) {
+      return(ggplot() +
+               annotate("text", x = 0.5, y = 0.5, size = 4.5, hjust = 0.5,
+                        label = paste0(
+                          "LANDIS landscape fires not loaded.\n",
+                          "Load FPA FOD on the Ignition tab (Option B) to see this panel.")) +
+               labs(title = title_park) +
+               theme_void() + theme(plot.title = element_text(size = 13, face = "bold")))
+    }
+    plot_val_fire_ews(
+      .val_obs_ews_park(), rv$simulated_events,
+      wind_daily          = rv$wind_daily,
+      slope_r             = rv$slope_r,
+      aspect_r            = rv$aspect_r,
+      combustion_buoyancy = as.numeric(input$combustion_buoyancy),
+      min_ha              = 4,
+      plot_title = title_park)
+  })
+
   output$val_count_fwi_plot <- renderPlot({
     req(rv$simulated_events, rv$era_fwi_daily)
     cal_ha  <- if (!is.null(rv$landscape_areas)) rv$landscape_areas$cal_area_ha  else NULL
@@ -4242,6 +4456,20 @@ server <- function(input, output, session) {
                             min_ha       = 4)
     },
     "validation_fire_climate_relationship.png"
+  )
+
+  output$dl_val_ews_size <- .make_val_png_handler(
+    function() {
+      req(rv$simulated_events, rv$wind_daily)
+      plot_val_fire_ews(
+        .val_obs_ews_cal(), rv$simulated_events,
+        wind_daily          = rv$wind_daily,
+        slope_r             = rv$slope_r,
+        aspect_r            = rv$aspect_r,
+        combustion_buoyancy = as.numeric(input$combustion_buoyancy),
+        min_ha              = 4)
+    },
+    "validation_fire_ews_relationship.png"
   )
 
   output$dl_val_count_fwi <- .make_val_png_handler(
@@ -6380,6 +6608,35 @@ server <- function(input, output, session) {
   # ---------------------------------------------------------------------------
   # Load from Calibration: copies fitted coefficients into tuning inputs
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Copies the fitted ignition coefficients into the tuning inputs.  Uses the
+  # regional fit so the tuned curve and the observed bars share a spatial
+  # extent — the same pairing the Ignition tab diagnostics use.
+  # ---------------------------------------------------------------------------
+  load_ign_tuning <- function() {
+    cf <- rv$ign_coef
+    if (is.null(cf) || nrow(cf) == 0) return(invisible(NULL))
+
+    updateRadioButtons(
+      session, "tune_ign_dist",
+      selected = if (any(cf$distribution == "Poisson")) "Poisson"
+                 else "ZeroInflatedPoisson"
+    )
+
+    for (spec in list(list(typ = "Lightning",  pre = "l"),
+                      list(typ = "Accidental", pre = "a"))) {
+      row <- cf[cf$ignition_type == spec$typ, , drop = FALSE]
+      if (nrow(row) == 0) next
+      for (fld in c("b0", "b1", "bz0", "bz1")) {
+        v <- row[[fld]][1]
+        updateNumericInput(session, sprintf("tune_ign_%s_%s", spec$pre, fld),
+                           value = if (is.null(v) || !is.finite(v)) 0
+                                   else round(v, 6))
+      }
+    }
+    invisible(NULL)
+  }
+
   observeEvent(input$load_tuning_from_cal, {
 
     # Helper: extract estimate by term name prefix from a coef tibble
@@ -6388,6 +6645,9 @@ server <- function(input, output, session) {
       if (is.na(idx) || !is.finite(coef_df$estimate[idx])) fallback
       else coef_df$estimate[idx]
     }
+
+    # ---- Ignitions -----------------------------------------------------------
+    load_ign_tuning()
 
     # ---- MaxSpreadArea (75th percentile fit) ----------------------------------
     if (!is.null(rv$max_area_fit)) {
@@ -6442,6 +6702,15 @@ server <- function(input, output, session) {
   # ---------------------------------------------------------------------------
   tuning_r <- reactive({
     list(
+      ign_dist   = input$tune_ign_dist,
+      ign_l_b0   = input$tune_ign_l_b0,
+      ign_l_b1   = input$tune_ign_l_b1,
+      ign_l_bz0  = input$tune_ign_l_bz0,
+      ign_l_bz1  = input$tune_ign_l_bz1,
+      ign_a_b0   = input$tune_ign_a_b0,
+      ign_a_b1   = input$tune_ign_a_b1,
+      ign_a_bz0  = input$tune_ign_a_bz0,
+      ign_a_bz1  = input$tune_ign_a_bz1,
       msa_b0     = input$tune_msa_b0,
       msa_b1     = input$tune_msa_b1,
       msa_b2     = input$tune_msa_b2,
@@ -6473,6 +6742,80 @@ server <- function(input, output, session) {
       sim_ff     = input$tune_sim_ff
     )
   }) |> debounce(350)
+
+  # ---------------------------------------------------------------------------
+  # Ignition tuning — coefficient tibble built from the current inputs
+  # ---------------------------------------------------------------------------
+  tune_ign_coef_r <- reactive({
+    p <- tuning_r()
+    req(is.numeric(p$ign_l_b0), is.numeric(p$ign_a_b0))
+    ign_tune_coef_df(
+      l_b0 = p$ign_l_b0, l_b1 = p$ign_l_b1,
+      l_bz0 = p$ign_l_bz0, l_bz1 = p$ign_l_bz1,
+      a_b0 = p$ign_a_b0, a_b1 = p$ign_a_b1,
+      a_bz0 = p$ign_a_bz0, a_bz1 = p$ign_a_bz1,
+      distribution = p$ign_dist %||% "ZeroInflatedPoisson"
+    )
+  })
+
+  output$tune_ign_badges <- renderUI({
+    cf <- tune_ign_coef_r()
+
+    # Expected sign checks, matching the other tuning panels.
+    b1_ok  <- all(is.finite(cf$b1) & cf$b1 > 0)
+    zip    <- !identical(cf$distribution[1], "Poisson")
+    bz1_ok <- !zip || all(is.finite(cf$bz1) & cf$bz1 < 0)
+
+    tagList(
+      span(class = paste("badge me-1", if (b1_ok) "bg-success" else "bg-danger"),
+           if (b1_ok) "✓ b1 positive" else "⚠ b1 should be positive"),
+      if (zip)
+        span(class = paste("badge", if (bz1_ok) "bg-success" else "bg-danger"),
+             if (bz1_ok) "✓ bz1 negative" else "⚠ bz1 should be negative")
+      else NULL,
+      br(), br()
+    )
+  })
+
+  output$tune_ign_status_ui <- renderUI({
+    if (is.null(rv$ign_model_data) || is.null(rv$ign_coef))
+      div(class = "alert alert-warning p-2 small",
+          icon("triangle-exclamation"),
+          " Ignitions not fitted yet — run the Ignition tab first. The",
+          " diagnostics below need the observed daily counts to plot against.")
+    else
+      div(class = "alert alert-info p-2 small",
+          icon("circle-info"),
+          " Showing the fitted values. Edit any coefficient on the left to see",
+          " the curve move; click ", tags$b("Load from Calibration"),
+          " to snap back to the fit.")
+  })
+
+  # Each panel mirrors the Ignition tab diagnostic of the same name, with the
+  # tuned coefficients as the live curve and the fit as a dashed reference.
+  output$tune_ign_fit_plot <- renderPlot({
+    req(rv$ign_model_data)
+    plot_ignition_diagnostics(rv$ign_model_data, tune_ign_coef_r(),
+                              ref_coef = rv$ign_coef)
+  })
+
+  output$tune_ign_zi_plot <- renderPlot({
+    req(rv$ign_model_data)
+    plot_zero_inflation(rv$ign_model_data, tune_ign_coef_r(),
+                        ref_coef = rv$ign_coef)
+  })
+
+  output$tune_ign_count_plot <- renderPlot({
+    req(rv$ign_model_data)
+    plot_count_component(rv$ign_model_data, tune_ign_coef_r(),
+                         ref_coef = rv$ign_coef)
+  })
+
+  output$tune_ign_resid_plot <- renderPlot({
+    req(rv$ign_model_data)
+    plot_ignition_residuals(rv$ign_model_data, tune_ign_coef_r(),
+                            ref_coef = rv$ign_coef)
+  })
 
   # ---------------------------------------------------------------------------
   # Sign check badges
@@ -7273,6 +7616,20 @@ server <- function(input, output, session) {
       sprintf("scf_tuning_%s.txt", format(Sys.time(), "%Y%m%d_%H%M%S")),
     content = function(f) {
       p <- isolate(tuning_r())
+
+      # Tuned ignition coefficients are regional; the snippet's own comment
+      # says so, since b0 still needs the Scale Adjustment area offset.
+      ign <- NULL
+      if (is.numeric(p$ign_l_b0) && is.numeric(p$ign_a_b0)) {
+        ign <- ign_tune_coef_df(
+          l_b0 = p$ign_l_b0, l_b1 = p$ign_l_b1,
+          l_bz0 = p$ign_l_bz0, l_bz1 = p$ign_l_bz1,
+          a_b0 = p$ign_a_b0, a_b1 = p$ign_a_b1,
+          a_bz0 = p$ign_a_bz0, a_bz1 = p$ign_a_bz1,
+          distribution = p$ign_dist %||% "ZeroInflatedPoisson"
+        )
+      }
+
       writeLines(
         build_scf_tuning_snippet(
           p$msa_b0, p$msa_b1, p$msa_b2,
@@ -7280,7 +7637,8 @@ server <- function(input, output, session) {
           p$sm_b0,  p$sm_b1,  p$sm_b2,  p$sm_b3,
           p$sm_b4,  p$sm_b5,  p$sm_b6,
           p$cm_b0,  p$cm_b1,  p$cm_b2,
-          max_ff = coalesce(p$max_ff, 500)
+          max_ff   = coalesce(p$max_ff, 500),
+          ign_coef = ign
         ), f
       )
     }
@@ -7439,10 +7797,14 @@ server <- function(input, output, session) {
         }
 
         incProgress(0.7, detail = "Estimating bark parameters...")
+        # Pass the FTM directory so BT_coef comes from the same file the cohort
+        # mortality GLM uses (keeps MaximumBarkThickness on the scale B1 was fit on)
+        ftm_bark_dir <- resolve_ftm_data_dir(input$ftm_dir)
         params <- estimate_bark_params_from_fia(
           species_codes = rv$spp_codes,
           fia_trees     = rv$fia_trees,
-          lookup        = rv$spp_lookup
+          lookup        = rv$spp_lookup,
+          ftm_dir       = ftm_bark_dir
         )
         rv$spp_table <- params
 
@@ -7715,6 +8077,9 @@ server <- function(input, output, session) {
           cal_vect      = rv$cal_vect_proj,
           working_crs   = rv$working_crs,
           sample_frac   = input$mtbs_sample_frac,
+          min_dnbr      = if (is.null(input$mtbs_min_dnbr) ||
+                              !is.finite(input$mtbs_min_dnbr))
+                            1 else input$mtbs_min_dnbr,
           progress_fn   = function(msg) setProgress(detail = msg)
         )
       }, error = function(e) {
@@ -7825,25 +8190,39 @@ server <- function(input, output, session) {
     }
   })
 
+  # Keep the LadderFuelSpeciesList picker in sync with the loaded species list
+  observeEvent(rv$spp_codes, {
+    req(rv$spp_codes)
+    keep <- union(rv$spp_codes, input$ladder_species)
+    updateSelectizeInput(session, "ladder_species",
+                         choices  = keep,
+                         selected = input$ladder_species,
+                         server   = FALSE)
+  })
+
   # ---------------------------------------------------------------------------
   # Mortality: Fetch / load ladder fuels (runs before fitting, priority = 10)
   # ---------------------------------------------------------------------------
   observeEvent(input$run_site_mortality, {
     if (input$ladder_fuels_source == "landfire" && is.null(rv$ladder_fuels_r)) {
       req(rv$cal_vect_proj, rv$working_crs)
-      withProgress(message = "Fetching LANDFIRE CBH...", {
+      withProgress(message = "Fetching LANDFIRE canopy layers...", {
         tryCatch({
           spread_tmpl <- if (!is.null(rv$template_r)) rv$template_r else {
             rast(ext(rv$cal_vect_proj), resolution = 90, crs = rv$working_crs)
           }
-          rv$ladder_fuels_r <- fetch_landfire_cbh(
-            cal_vect        = rv$cal_vect_proj,
-            working_crs     = rv$working_crs,
-            spread_template = spread_tmpl,
-            progress_fn     = function(msg) setProgress(detail = msg)
+          rv$ladder_fuels_r <- fetch_landfire_ladder_fuels(
+            cal_vect         = rv$cal_vect_proj,
+            working_crs      = rv$working_crs,
+            spread_template  = spread_tmpl,
+            ladder_ceiling_m = if (is.null(input$ladder_ceiling_m) ||
+                                   !is.finite(input$ladder_ceiling_m))
+                                 8 else input$ladder_ceiling_m,
+            progress_fn      = function(msg) setProgress(detail = msg)
           )
         }, error = function(e) {
-          showNotification(paste("LANDFIRE CBH error:", conditionMessage(e)), type = "warning")
+          showNotification(paste("LANDFIRE ladder fuel error:", conditionMessage(e)),
+                           type = "warning")
           rv$ladder_fuels_r <- NULL
         })
       })
@@ -7864,15 +8243,27 @@ server <- function(input, output, session) {
       if (!is.null(input$ladder_fuels_source) && input$ladder_fuels_source == "none") {
         div(class = "alert alert-info p-2 small mt-1",
             icon("info-circle"),
-            " Using placeholder (0.5 everywhere) for ladder fuels.")
+            " Ladder fuels excluded \u2014 SiteMortalityB6 will be written as 0.0.")
       } else {
         NULL
       }
     } else {
-      rng <- range(values(rv$ladder_fuels_r, mat = FALSE), na.rm = TRUE)
-      div(class = "alert alert-success p-2 small mt-1",
-          icon("check"),
-          sprintf(" Ladder fuels loaded: range %.3f\u2013%.3f", rng[1], rng[2]))
+      lv  <- values(rv$ladder_fuels_r, mat = FALSE)
+      lv  <- lv[is.finite(lv)]
+      rng <- range(lv)
+      if (length(lv) > 0 && rng[2] <= 1.5) {
+        div(class = "alert alert-danger p-2 small mt-1",
+            icon("triangle-exclamation"),
+            sprintf(" Ladder fuels range %.3f\u2013%.3f \u2014 this looks like a 0\u20131 INDEX, not g m\u207b\u00b2. ",
+                    rng[1], rng[2]),
+            "SCF needs raw biomass; fitting on an index gives a B6 ~1000\u00d7 too large. ",
+            "Re-fetch from LANDFIRE or set the source to None.")
+      } else {
+        div(class = "alert alert-success p-2 small mt-1",
+            icon("check"),
+            sprintf(" Ladder fuel biomass loaded: %.0f\u2013%.0f g m\u207b\u00b2 (mean %.0f)",
+                    rng[1], rng[2], mean(lv)))
+      }
     }
   })
 
@@ -7899,7 +8290,10 @@ server <- function(input, output, session) {
           aspect_r        = rv$aspect_r,
           fine_fuels_r    = rv$fine_fuels_r,
           ladder_fuels_r  = rv$ladder_fuels_r,
-          working_crs     = rv$working_crs
+          working_crs     = rv$working_crs,
+          # Day-of-burn wind when MTBS gives us per-fire dates; the helper falls
+          # back to the annual fire-season mean (and warns) when it cannot.
+          wind_daily      = rv$wind_daily
         )
 
         setProgress(0.7, detail = "Fitting Gamma GLM (inverse link)...")
@@ -8071,7 +8465,19 @@ server <- function(input, output, session) {
 
   output$mortality_snippet <- renderText({
     req(rv$site_mort_fit)
-    write_mortality_snippet(rv$site_mort_fit, rv$cohort_mort_fit)
+    write_mortality_snippet(
+      rv$site_mort_fit, rv$cohort_mort_fit,
+      et_r             = rv$et_cal_r,
+      cwd_r            = rv$cwd_cal_r,
+      max_fine_fuels   = if (is.null(input$tune_max_ff) ||
+                             !is.finite(input$tune_max_ff)) NULL else input$tune_max_ff,
+      ladder_max_age   = if (is.null(input$ladder_max_age) ||
+                             !is.finite(input$ladder_max_age)) NULL else input$ladder_max_age,
+      ladder_species   = input$ladder_species,
+      ladder_ceiling_m = if (!is.null(input$ladder_fuels_source) &&
+                             input$ladder_fuels_source == "landfire")
+                           input$ladder_ceiling_m else NULL
+    )
   })
 
   # ---------------------------------------------------------------------------
@@ -8097,7 +8503,19 @@ server <- function(input, output, session) {
     filename = "mortality_parameters.txt",
     content  = function(f) {
       req(rv$site_mort_fit)
-      writeLines(write_mortality_snippet(rv$site_mort_fit, rv$cohort_mort_fit), f)
+      writeLines(write_mortality_snippet(
+      rv$site_mort_fit, rv$cohort_mort_fit,
+      et_r             = rv$et_cal_r,
+      cwd_r            = rv$cwd_cal_r,
+      max_fine_fuels   = if (is.null(input$tune_max_ff) ||
+                             !is.finite(input$tune_max_ff)) NULL else input$tune_max_ff,
+      ladder_max_age   = if (is.null(input$ladder_max_age) ||
+                             !is.finite(input$ladder_max_age)) NULL else input$ladder_max_age,
+      ladder_species   = input$ladder_species,
+      ladder_ceiling_m = if (!is.null(input$ladder_fuels_source) &&
+                             input$ladder_fuels_source == "landfire")
+                           input$ladder_ceiling_m else NULL
+    ), f)
     }
   )
 
@@ -8155,6 +8573,8 @@ server <- function(input, output, session) {
     et_local_path       = "text",   cwd_local_path    = "text",
     fine_fuels_source   = "radio",  fine_fuels_path   = "text",
     ladder_fuels_source = "radio",  ladder_fuels_path = "text",
+    ladder_ceiling_m    = "number", ladder_max_age    = "number",
+    ladder_species      = "select", mtbs_min_dnbr     = "number",
     ftm_dir             = "text",
     # -- FIA / species -----------------------------------------------------------
     fia_local_dir       = "text",   lookup_csv_path   = "text",
@@ -8372,7 +8792,17 @@ server <- function(input, output, session) {
         } else if (type == "radio") {
           updateRadioButtons(session, id, selected = as.character(val))
         } else if (type == "select") {
-          updateSelectInput(session, id, selected = as.character(val))
+          if (id == "ladder_species") {
+            # Choices for this one are populated later from the loaded species
+            # list, so seed them with the restored values or the selection is
+            # dropped on the way in.
+            updateSelectizeInput(session, id,
+                                 choices  = as.character(unlist(val)),
+                                 selected = as.character(unlist(val)),
+                                 server   = FALSE)
+          } else {
+            updateSelectInput(session, id, selected = as.character(val))
+          }
         } else if (type == "checkbox") {
           updateCheckboxInput(session, id, value = as.logical(val))
         } else if (type == "checkboxgroup") {

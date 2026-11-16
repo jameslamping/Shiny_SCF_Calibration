@@ -17,6 +17,7 @@
 #   plot_cm_curve()          P(cohort mort) vs BarkThickness at multiple dNBR
 #   plot_fire_map()          Fire grid from simulate_fire_simple() as ggplot
 #   plot_fire_timeline()     Cumulative area burned per day
+#   ign_tune_coef_df()       Hand-typed ignition coefficients -> coef tibble
 #   build_scf_tuning_snippet() SCF parameter file text from tuning inputs
 # =============================================================================
 
@@ -1172,6 +1173,41 @@ plot_fire_ensemble <- function(ensemble_df,
 
 
 # =============================================================================
+# Ignition tuning
+#
+# SCF draws a daily ignition count per type from
+#     lambda = exp(b0 + b1 * FWI_landscape_mean)
+# and, under the ZIP option, skips the draw entirely with probability
+#     pi = plogis(bz0 + bz1 * FWI)        [PlugIn.cs:816-818]
+# so the expected daily count is  E[n] = (1 - pi) * lambda.
+#
+# The tuning tab reuses the Ignition tab's own diagnostic plots rather than
+# defining new ones, so the only thing needed here is a way to feed hand-typed
+# coefficients into those functions in the shape they already expect.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# ign_tune_coef_df
+# Assembles a coefficient tibble in the same shape fit_ignition_models()
+# returns, from the flat per-type values held in the tuning inputs.
+# -----------------------------------------------------------------------------
+
+ign_tune_coef_df <- function(l_b0, l_b1, l_bz0, l_bz1,
+                              a_b0, a_b1, a_bz0, a_bz1,
+                              distribution = c("ZeroInflatedPoisson", "Poisson")) {
+  distribution <- match.arg(distribution)
+  dplyr::tibble(
+    ignition_type = c("Lightning", "Accidental"),
+    distribution  = distribution,
+    b0            = c(l_b0,  a_b0),
+    b1            = c(l_b1,  a_b1),
+    bz0           = c(l_bz0, a_bz0),
+    bz1           = c(l_bz1, a_bz1)
+  )
+}
+
+
+# =============================================================================
 # SCF snippet builder
 # =============================================================================
 
@@ -1179,13 +1215,48 @@ build_scf_tuning_snippet <- function(msa_b0, msa_b1, msa_b2,
                                       sp_b0, sp_b1, sp_b2, sp_b3,
                                       sm_b0, sm_b1, sm_b2, sm_b3, sm_b4, sm_b5, sm_b6,
                                       cm_b0, cm_b1, cm_b2,
-                                      max_ff = 500) {
+                                      max_ff = 500,
+                                      ign_coef = NULL) {
+
+  # ---- Ignition block (omitted entirely when no ignition coefficients set) ----
+  ign_lines <- character(0)
+  if (!is.null(ign_coef) && nrow(ign_coef) > 0) {
+    zip <- !identical(unique(ign_coef$distribution)[1], "Poisson")
+    ign_lines <- c(
+      ">> ---- Ignitions (lambda = exp(b0 + b1*FWI); landscape-mean FWI) -----",
+      unlist(lapply(seq_len(nrow(ign_coef)), function(i) {
+        r  <- ign_coef[i, ]
+        kw <- if (identical(r$ignition_type, "Lightning")) "Lightning" else "Accidental"
+        c(
+          sprintf("%-30s %12.6f", paste0(kw, "IgnitionsB0"), r$b0),
+          sprintf("%-30s %12.6f", paste0(kw, "IgnitionsB1"), r$b1),
+          if (zip && is.finite(r$bz0) && is.finite(r$bz1)) c(
+            sprintf("%-30s %12.6f", paste0(kw, "IgnitionsBinomialB0"), r$bz0),
+            sprintf("%-30s %12.6f", paste0(kw, "IgnitionsBinomialB1"), r$bz1)
+          )
+        )
+      })),
+      if (zip)
+        ">> Binomial keywords are the ZIP structural-zero terms: SCF draws from"
+      else
+        ">> Poisson only — no Binomial keywords written.",
+      if (zip)
+        ">> the Poisson only when runif() >= plogis(bz0 + bz1*FWI).",
+      "",
+      ">> NOTE: these are the REGIONAL (calibration boundary) coefficients as",
+      ">> tuned.  Before use in SCF, b0 must carry the log(landscape / boundary)",
+      ">> area offset from the Scale Adjustment tab.  b1 transfers unchanged.",
+      ""
+    )
+  }
+
   paste(c(
     ">> =====================================================================",
     ">> SCF Parameter Tuning Export",
     sprintf(">> Generated: %s", format(Sys.time(), "%Y-%m-%d %H:%M")),
     ">> =====================================================================",
     "",
+    ign_lines,
     ">> ---- Max Spread Area (B0 + B1*FWI + B2*EWS, result in hectares) ----",
     sprintf("MaximumSpreadAreaB0    %10.4f",  msa_b0),
     sprintf("MaximumSpreadAreaB1    %10.4f",  msa_b1),

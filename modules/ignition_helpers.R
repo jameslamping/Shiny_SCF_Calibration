@@ -420,6 +420,20 @@ make_kernel_surface <- function(points_df, template, bandwidth_m, maxdist_m) {
   }
 }
 
+# Colours / linetypes used whenever a diagnostic draws a tuned curve against
+# the as-fitted curve.  Kept in one place so all four panels agree.
+.IGN_SERIES_COL <- c("Tuned" = "#a0522d", "As fitted" = "#7f7f7f")
+.IGN_SERIES_LTY <- c("Tuned" = "solid",   "As fitted" = "dashed")
+
+# fill is added separately by the one panel that maps it (residual ribbons);
+# including it here would warn on the panels whose bars use a fixed fill.
+.ign_series_scales <- function() {
+  list(
+    scale_color_manual(name = NULL, values = .IGN_SERIES_COL),
+    scale_linetype_manual(name = NULL, values = .IGN_SERIES_LTY)
+  )
+}
+
 # Internal: observed mean count and zero-fraction per integer FWI bin
 .obs_binned <- function(model_data) {
   model_data %>%
@@ -435,21 +449,30 @@ make_kernel_surface <- function(points_df, template, bandwidth_m, maxdist_m) {
 # -----------------------------------------------------------------------------
 # plot_ignition_diagnostics
 # Observed mean daily ignitions (bars) vs. full model E[n] (line).
+#
+# ref_coef: optional second coefficient set drawn as a dashed grey reference.
+#   The Parameter Tuning tab passes the as-fitted coefficients here so the
+#   hand-tuned curve can be read against the fit it started from.  NULL (the
+#   default) reproduces the single-curve Ignition tab panel exactly.
 # -----------------------------------------------------------------------------
 
-plot_ignition_diagnostics <- function(model_data, coef_df) {
+plot_ignition_diagnostics <- function(model_data, coef_df, ref_coef = NULL) {
 
   fwi_seq <- seq(0, max(model_data$FWI, na.rm = TRUE), length.out = 200)
 
-  pred_df <- map_dfr(seq_len(nrow(coef_df)), function(i) {
-    row <- coef_df[i, ]
-    tibble(FWI           = fwi_seq,
-           pred          = .predict_ign_row(fwi_seq, row),
-           ignition_type = row$ignition_type,
-           distribution  = row$distribution)
-  })
+  mk <- function(cdf, label) {
+    map_dfr(seq_len(nrow(cdf)), function(i) {
+      row <- cdf[i, ]
+      tibble(FWI           = fwi_seq,
+             pred          = .predict_ign_row(fwi_seq, row),
+             ignition_type = row$ignition_type,
+             distribution  = row$distribution,
+             series        = label)
+    })
+  }
 
-  obs <- .obs_binned(model_data)
+  pred_df <- mk(coef_df, "Tuned")
+  obs     <- .obs_binned(model_data)
 
   dist_label <- unique(pred_df$distribution)
   subtitle <- if (length(dist_label) == 1 && dist_label == "Poisson") {
@@ -458,11 +481,23 @@ plot_ignition_diagnostics <- function(model_data, coef_df) {
     "Bars = observed mean daily ignitions per FWI bin  |  Line = ZIP E[n] = (1\u2212\u03c0)\u00d7\u03bb"
   }
 
-  ggplot() +
+  p <- ggplot() +
     geom_col(data = obs, aes(FWI_bin, mean_n),
-             fill = "#c8d8c8", width = 1) +
-    geom_line(data = pred_df, aes(FWI, pred),
-              color = "#a0522d", linewidth = 1.1) +
+             fill = "#c8d8c8", width = 1)
+
+  if (is.null(ref_coef) || nrow(ref_coef) == 0) {
+    p <- p + geom_line(data = pred_df, aes(FWI, pred),
+                       color = "#a0522d", linewidth = 1.1)
+  } else {
+    both <- bind_rows(mk(ref_coef, "As fitted"), pred_df)
+    p <- p +
+      geom_line(data = both,
+                aes(FWI, pred, color = series, linetype = series),
+                linewidth = 1.1) +
+      .ign_series_scales()
+  }
+
+  p +
     facet_wrap(~ignition_type, scales = "free_y") +
     labs(title    = "Observed vs. Fitted Ignition Rate",
          subtitle = subtitle,
@@ -477,7 +512,7 @@ plot_ignition_diagnostics <- function(model_data, coef_df) {
 # the observed fraction of zero-count days.  ZIP only.
 # -----------------------------------------------------------------------------
 
-plot_zero_inflation <- function(model_data, coef_df) {
+plot_zero_inflation <- function(model_data, coef_df, ref_coef = NULL) {
 
   zip_rows <- coef_df %>% filter(distribution != "Poisson")
   if (nrow(zip_rows) == 0) {
@@ -490,20 +525,41 @@ plot_zero_inflation <- function(model_data, coef_df) {
 
   fwi_seq <- seq(0, max(model_data$FWI, na.rm = TRUE), length.out = 200)
 
-  pi_df <- map_dfr(seq_len(nrow(zip_rows)), function(i) {
-    row <- zip_rows[i, ]
-    tibble(FWI           = fwi_seq,
-           pi            = plogis(row$bz0 + row$bz1 * fwi_seq),
-           ignition_type = row$ignition_type)
-  })
+  mk <- function(cdf, label) {
+    z <- cdf %>% filter(distribution != "Poisson")
+    if (nrow(z) == 0) return(NULL)
+    map_dfr(seq_len(nrow(z)), function(i) {
+      row <- z[i, ]
+      tibble(FWI           = fwi_seq,
+             pi            = plogis(row$bz0 + row$bz1 * fwi_seq),
+             ignition_type = row$ignition_type,
+             series        = label)
+    })
+  }
 
-  obs <- .obs_binned(model_data) %>% filter(n_days >= 5)
+  pi_df <- mk(zip_rows, "Tuned")
+  obs   <- .obs_binned(model_data) %>% filter(n_days >= 5)
 
-  ggplot() +
+  p <- ggplot() +
     geom_col(data = obs, aes(FWI_bin, zero_frac),
-             fill = "#e8d5b0", width = 1) +
-    geom_line(data = pi_df, aes(FWI, pi),
-              color = "#6a3d9a", linewidth = 1.2) +
+             fill = "#e8d5b0", width = 1)
+
+  ref_df <- if (is.null(ref_coef)) NULL else mk(ref_coef, "As fitted")
+
+  if (is.null(ref_df)) {
+    p <- p + geom_line(data = pi_df, aes(FWI, pi),
+                       color = "#6a3d9a", linewidth = 1.2)
+  } else {
+    p <- p +
+      geom_line(data = bind_rows(ref_df, pi_df),
+                aes(FWI, pi, color = series, linetype = series),
+                linewidth = 1.2) +
+      scale_color_manual(name = NULL,
+                         values = c("Tuned" = "#6a3d9a", "As fitted" = "#7f7f7f")) +
+      scale_linetype_manual(name = NULL, values = .IGN_SERIES_LTY)
+  }
+
+  p +
     geom_hline(yintercept = 0.5, linetype = "dotted", color = "grey40") +
     facet_wrap(~ignition_type) +
     scale_y_continuous(labels = scales::percent_format(), limits = c(0, 1)) +
@@ -527,35 +583,53 @@ plot_zero_inflation <- function(model_data, coef_df) {
 # Helps explain how b0/b1 differ when zeros are modelled separately.
 # -----------------------------------------------------------------------------
 
-plot_count_component <- function(model_data, coef_df) {
+plot_count_component <- function(model_data, coef_df, ref_coef = NULL) {
 
   fwi_seq <- seq(0, max(model_data$FWI, na.rm = TRUE), length.out = 200)
 
-  lambda_df <- map_dfr(seq_len(nrow(coef_df)), function(i) {
-    row   <- coef_df[i, ]
-    label <- if (row$distribution == "Poisson") "Poisson \u03bb" else "ZIP \u03bb (count component)"
-    tibble(FWI           = fwi_seq,
-           lambda        = exp(row$b0 + row$b1 * fwi_seq),
-           model         = label,
-           ignition_type = row$ignition_type)
-  })
+  mk <- function(cdf, label) {
+    map_dfr(seq_len(nrow(cdf)), function(i) {
+      row <- cdf[i, ]
+      tibble(FWI           = fwi_seq,
+             lambda        = exp(row$b0 + row$b1 * fwi_seq),
+             model         = if (row$distribution == "Poisson")
+                               "Poisson \u03bb" else "ZIP \u03bb (count component)",
+             ignition_type = row$ignition_type,
+             series        = label)
+    })
+  }
 
-  obs <- .obs_binned(model_data)
+  lambda_df <- mk(coef_df, "Tuned")
+  obs       <- .obs_binned(model_data)
 
-  ggplot() +
+  p <- ggplot() +
     geom_col(data = obs, aes(FWI_bin, mean_n),
-             fill = "#c8d8c8", width = 1) +
-    geom_line(data = lambda_df,
-              aes(FWI, lambda, color = model, linetype = model),
-              linewidth = 1.1) +
-    scale_color_manual(
-      values = c("Poisson \u03bb" = "#a0522d",
-                 "ZIP \u03bb (count component)" = "#2980b9")
-    ) +
-    scale_linetype_manual(
-      values = c("Poisson \u03bb" = "solid",
-                 "ZIP \u03bb (count component)" = "dashed")
-    ) +
+             fill = "#c8d8c8", width = 1)
+
+  if (is.null(ref_coef) || nrow(ref_coef) == 0) {
+    p <- p +
+      geom_line(data = lambda_df,
+                aes(FWI, lambda, color = model, linetype = model),
+                linewidth = 1.1) +
+      scale_color_manual(
+        values = c("Poisson \u03bb" = "#a0522d",
+                   "ZIP \u03bb (count component)" = "#2980b9")
+      ) +
+      scale_linetype_manual(
+        values = c("Poisson \u03bb" = "solid",
+                   "ZIP \u03bb (count component)" = "dashed")
+      )
+  } else {
+    # Tuned and reference share a distribution, so `model` would be constant \u2014
+    # map the aesthetics to the series instead.
+    p <- p +
+      geom_line(data = bind_rows(mk(ref_coef, "As fitted"), lambda_df),
+                aes(FWI, lambda, color = series, linetype = series),
+                linewidth = 1.1) +
+      .ign_series_scales()
+  }
+
+  p +
     facet_wrap(~ignition_type, scales = "free_y") +
     labs(
       title    = "Count Component (\u03bb) by Model",
@@ -576,33 +650,48 @@ plot_count_component <- function(model_data, coef_df) {
 # Mean (observed - predicted) per 2-unit FWI bin.  Flags systematic bias.
 # -----------------------------------------------------------------------------
 
-plot_ignition_residuals <- function(model_data, coef_df) {
+plot_ignition_residuals <- function(model_data, coef_df, ref_coef = NULL) {
 
-  fwi_seq_full <- model_data$FWI
+  mk <- function(cdf, label) {
+    map_dfr(seq_len(nrow(cdf)), function(i) {
+      row <- cdf[i, ]
+      d   <- model_data %>% filter(ignition_type == row$ignition_type, !is.na(FWI))
+      tibble(FWI           = d$FWI,
+             residual      = d$n - .predict_ign_row(d$FWI, row),
+             model         = if (row$distribution == "Poisson") "Poisson" else "ZIP",
+             ignition_type = row$ignition_type,
+             series        = label)
+    }) %>%
+      mutate(FWI_bin = round(FWI / 2) * 2) %>%
+      group_by(FWI_bin, ignition_type, model, series) %>%
+      summarise(mean_r = mean(residual),
+                sd_r   = sd(residual),
+                .groups = "drop")
+  }
 
-  resid_df <- map_dfr(seq_len(nrow(coef_df)), function(i) {
-    row   <- coef_df[i, ]
-    d     <- model_data %>% filter(ignition_type == row$ignition_type, !is.na(FWI))
-    mu    <- .predict_ign_row(d$FWI, row)
-    label <- if (row$distribution == "Poisson") "Poisson" else "ZIP"
-    tibble(FWI           = d$FWI,
-           residual      = d$n - mu,
-           model         = label,
-           ignition_type = row$ignition_type)
-  }) %>%
-    mutate(FWI_bin = round(FWI / 2) * 2) %>%
-    group_by(FWI_bin, ignition_type, model) %>%
-    summarise(mean_r = mean(residual),
-              sd_r   = sd(residual),
-              .groups = "drop")
+  resid_df <- mk(coef_df, "Tuned")
 
-  ggplot(resid_df, aes(FWI_bin, mean_r, color = model)) +
-    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
-    geom_ribbon(aes(ymin = mean_r - sd_r, ymax = mean_r + sd_r, fill = model),
-                alpha = 0.15, color = NA) +
-    geom_line(linewidth = 1.0) +
-    scale_color_manual(values = c("Poisson" = "#a0522d", "ZIP" = "#2980b9")) +
-    scale_fill_manual(values  = c("Poisson" = "#a0522d", "ZIP" = "#2980b9")) +
+  if (is.null(ref_coef) || nrow(ref_coef) == 0) {
+    p <- ggplot(resid_df, aes(FWI_bin, mean_r, color = model)) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+      geom_ribbon(aes(ymin = mean_r - sd_r, ymax = mean_r + sd_r, fill = model),
+                  alpha = 0.15, color = NA) +
+      geom_line(linewidth = 1.0) +
+      scale_color_manual(values = c("Poisson" = "#a0522d", "ZIP" = "#2980b9")) +
+      scale_fill_manual(values  = c("Poisson" = "#a0522d", "ZIP" = "#2980b9"))
+  } else {
+    # Same distribution on both curves, so colour by series rather than model.
+    p <- ggplot(bind_rows(mk(ref_coef, "As fitted"), resid_df),
+                aes(FWI_bin, mean_r, color = series)) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+      geom_ribbon(aes(ymin = mean_r - sd_r, ymax = mean_r + sd_r, fill = series),
+                  alpha = 0.12, color = NA) +
+      geom_line(aes(linetype = series), linewidth = 1.0) +
+      .ign_series_scales() +
+      scale_fill_manual(name = NULL, values = .IGN_SERIES_COL)
+  }
+
+  p +
     facet_wrap(~ignition_type, scales = "free_y") +
     labs(
       title    = "Model Residuals by FWI Bin",

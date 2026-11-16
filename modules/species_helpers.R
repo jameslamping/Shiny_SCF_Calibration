@@ -3,7 +3,7 @@
 # FIA-based bark parameter estimation for SCF Fire_Spp_Table.csv
 #
 # SCF Eq. 10:  BarkThickness = (MaximumBarkThickness * Age) / (Age + AgeDBH)
-#   MaximumBarkThickness : double-sided bark thickness (cm) at maximum observed DBH
+#   MaximumBarkThickness : SINGLE-SIDED bark thickness (cm) at maximum observed DBH
 #   AgeDBH               : age (yr) at which bark thickness = MaximumBarkThickness / 2
 #                          Derived here as the half-saturation constant from a
 #                          Michaelis-Menten DBH~Age growth curve:
@@ -16,11 +16,27 @@
 #   BHAGE     : age at breast height (more common; missing years-to-BH)
 #   STATUSCD  : 1 = live only
 #
+# NOTE ON FIA AND BARK: FIA supplies NO bark thickness. load_fia_trees() reads
+# only SPCD, DIA (DBH *outside bark*, inches), TOTAGE, BHAGE and STATUSCD.
+# Bark thickness comes entirely from the FOFEM bark-thickness coefficient
+# (bt_coef) below.  This matters because FIA-adjacent mensuration usually
+# expresses bark via the diameter-inside-bark ratio, where DOB - DIB is
+# DOUBLE bark thickness.  We never touch that quantity, so no halving is needed.
+#
 # MaximumBarkThickness is estimated as:
-#   2 × bark_ratio × P95_DBH_cm
-# where bark_ratio (one-side BT / DBH, dimensionless) comes from the built-in
-# Cansler / Ryan & Reinhardt literature table, and P95_DBH_cm is the 95th-
-# percentile DBH for the species across FIA plots in the selected states.
+#   bt_coef × P95_DBH_cm                    (SINGLE-sided, cm)
+# where bt_coef is the FOFEM bark thickness coefficient (single bark thickness
+# per cm DBH) and P95_DBH_cm is the 95th-percentile DBH for the species across
+# FIA plots in the selected states.
+#
+# There is NO factor of 2.  SCF User Guide Eq. 10 defines MaxBarkThickness as
+# "the bark thickness of the largest DBH observed within the species" derived by
+# "linear scaling from the Fire Tree Mortality Database (Cansler et al. 2020)",
+# and FireEvent.cs:436-444 cites the same source.  Cansler BT_coef is documented
+# in the FTM metadata as "Bark thickness coefficient in FOFEM" — FOFEM computes
+# SINGLE bark thickness as BT = BT_coef × DBH.  fit_cohort_mortality() calibrates
+# CohortMortalityB1 against exactly that quantity, so the species table must use
+# the same convention or B1 is applied on the wrong scale at runtime.
 # =============================================================================
 
 pacman::p_load(dplyr, tibble, readr, stringr, purrr)
@@ -31,55 +47,114 @@ if (!requireNamespace("rFIA", quietly = TRUE)) {
 }
 
 # =============================================================================
-# Built-in bark thickness ratio table
-# bark_ratio = one-side bark thickness (cm) / DBH (cm)
-# MaximumBarkThickness (double-sided, cm) = 2 × bark_ratio × DBH_cm
+# Built-in FOFEM bark thickness coefficient table  (FALLBACK ONLY)
 #
-# Primary sources:
-#   Ryan & Reinhardt (1988) Predicting postfire mortality of seven western conifers.
-#   Can. J. For. Res. 18:1291–1297.  [R&R88]
-#   Cansler et al. (2020) Fire Tree Mortality Database.
-#   USFS RDS-2020-0002.  [C20]
-#   Silvics of North America (Burns & Honkala 1990).  [SNA]
+# bt_coef = SINGLE bark thickness (cm) / DBH (cm), dimensionless.
+# MaximumBarkThickness (cm, single-sided) = bt_coef x DBH_cm
+#
+# Values are the FOFEM coefficients as published in the Fire and Tree Mortality
+# database species table (Cansler et al. 2020, USFS RDS-2020-0001-2,
+# Species_BarkThickness.csv, column BT_coef), which in turn derive from
+# Ryan & Reinhardt (1988) Can. J. For. Res. 18:1291-1297.
+#
+# PREFER THE LIVE FTM FILE.  estimate_bark_params_from_fia() will read the
+# user's own Species_BarkThickness.csv when a path is supplied and use it in
+# preference to this table, which guarantees that the species table and
+# fit_cohort_mortality() use literally the same coefficients.  This table exists
+# so the app still produces sane values when FTM data are not on disk.
+#
+# bt_note records congener substitutions for the four species FOFEM/Cansler
+# does not list.  Substitutions follow Cansler's own "Genus/Species for Species"
+# convention.
 # =============================================================================
 bark_ratio_table <- tribble(
-  ~fia_spcd, ~landis_code,               ~bark_ratio,  ~source,
-  # --- Firs (Abies) — thin-barked -------------------------------------------
-  11L,       "AbiesAmabilis",             0.017,        "SNA / C20",
-  17L,       "AbiesGrandis",              0.022,        "R&R88 / C20",
-  19L,       "AbiesLasiocarpa",           0.019,        "R&R88 / C20",
-  22L,       "AbiesProcera",              0.022,        "SNA / C20",
-  # --- Hardwoods ---------------------------------------------------------------
-  312L,      "AcerMacrophyllum",          0.018,        "SNA",
-  351L,      "AlnusRubra",                0.012,        "SNA",
-  361L,      "ArbutusMenziesii",          0.025,        "SNA",
-  375L,      "BetulaPapyrifera",          0.015,        "SNA",
-  # --- Yellow-cedar -----------------------------------------------------------
-  42L,       "ChamaecyparisNootkatensis", 0.025,        "SNA / C20",
-  # --- Larch (Larix) — moderate to thick bark ---------------------------------
-  72L,       "LarixLyallii",              0.030,        "SNA",
-  73L,       "LarixOccidentalis",         0.035,        "R&R88 / C20",
-  # --- Spruce (Picea) ---------------------------------------------------------
-  93L,       "PiceaEngelmannii",          0.025,        "R&R88 / C20",
-  98L,       "PiceaSitchensis",           0.020,        "SNA / C20",
-  # --- Pine (Pinus) -----------------------------------------------------------
-  101L,      "PinusAlbicaulis",           0.028,        "SNA / C20",
-  108L,      "PinusContorta",             0.021,        "R&R88 / C20",
-  119L,      "PinusMonticola",            0.038,        "SNA / C20",
-  122L,      "PinusPonderosa",            0.074,        "R&R88 / C20",  # thick-barked
-  # --- Poplar / Aspen — thin bark ----------------------------------------------
-  741L,      "PopulusBalsamifera",        0.015,        "SNA",
-  747L,      "PopulusBalsamifera",        0.015,        "SNA",  # trichocarpa (WA)
-  746L,      "PopulusTremuloides",        0.012,        "SNA",
-  # --- Douglas-fir — thick bark ------------------------------------------------
-  202L,      "PseudotsugaMenziesii",      0.041,        "R&R88 / C20",
-  # --- Oak, Yew, Cedars, Hemlocks ----------------------------------------------
-  815L,      "QuercusGarryana",           0.040,        "SNA",
-  231L,      "TaxusBrevifolia",           0.018,        "SNA",
-  242L,      "ThujaPlicata",              0.023,        "SNA / C20",
-  263L,      "TsugaHeterophylla",         0.021,        "SNA / C20",
-  264L,      "TsugaMertensiana",          0.018,        "R&R88 / C20"
+  ~fia_spcd, ~landis_code,               ~bark_ratio, ~source,      ~bt_note,
+  # --- Firs (Abies) ----------------------------------------------------------
+  11L,       "AbiesAmabilis",             0.047,      "C20/FOFEM",  "",
+  17L,       "AbiesGrandis",              0.046,      "C20/FOFEM",  "",
+  19L,       "AbiesLasiocarpa",           0.041,      "C20/FOFEM",  "",
+  22L,       "AbiesProcera",              0.039,      "C20/FOFEM",  "substitute: Abies magnifica (sister taxon; A. procera not in FOFEM)",
+  # --- Hardwoods -------------------------------------------------------------
+  312L,      "AcerMacrophyllum",          0.024,      "C20/FOFEM",  "",
+  351L,      "AlnusRubra",                0.026,      "C20/FOFEM",  "",
+  361L,      "ArbutusMenziesii",          0.060,      "C20/FOFEM",  "",
+  375L,      "BetulaPapyrifera",          0.030,      "C20/FOFEM",  "substitute: Betula lenta (only Betula in FOFEM)",
+  # --- Yellow-cedar ----------------------------------------------------------
+  42L,       "ChamaecyparisNootkatensis", 0.022,      "C20/FOFEM",  "",
+  # --- Larch (Larix) ---------------------------------------------------------
+  72L,       "LarixLyallii",              0.063,      "C20/FOFEM",  "substitute: Larix occidentalis; likely overestimates bark on this subalpine species",
+  73L,       "LarixOccidentalis",         0.063,      "C20/FOFEM",  "",
+  # --- Spruce (Picea) --------------------------------------------------------
+  93L,       "PiceaEngelmannii",          0.036,      "C20/FOFEM",  "",
+  98L,       "PiceaSitchensis",           0.027,      "C20/FOFEM",  "",
+  # --- Pine (Pinus) ----------------------------------------------------------
+  101L,      "PinusAlbicaulis",           0.030,      "C20/FOFEM",  "",
+  108L,      "PinusContorta",             0.028,      "C20/FOFEM",  "",
+  119L,      "PinusMonticola",            0.035,      "C20/FOFEM",  "",
+  122L,      "PinusPonderosa",            0.063,      "C20/FOFEM",  "",
+  # --- Poplar / Aspen --------------------------------------------------------
+  741L,      "PopulusBalsamifera",        0.040,      "C20/FOFEM",  "substitute: Populus deltoides (P. balsamifera/trichocarpa not in FOFEM)",
+  747L,      "PopulusBalsamifera",        0.040,      "C20/FOFEM",  "substitute: Populus deltoides (trichocarpa, WA)",
+  746L,      "PopulusTremuloides",        0.044,      "C20/FOFEM",  "",
+  # --- Douglas-fir -----------------------------------------------------------
+  202L,      "PseudotsugaMenziesii",      0.063,      "C20/FOFEM",  "",
+  # --- Oak, Yew, Cedars, Hemlocks --------------------------------------------
+  815L,      "QuercusGarryana",           0.029,      "C20/FOFEM",  "",
+  231L,      "TaxusBrevifolia",           0.025,      "C20/FOFEM",  "",
+  242L,      "ThujaPlicata",              0.035,      "C20/FOFEM",  "",
+  263L,      "TsugaHeterophylla",         0.040,      "C20/FOFEM",  "",
+  264L,      "TsugaMertensiana",          0.040,      "C20/FOFEM",  ""
 )
+
+
+# =============================================================================
+# resolve_ftm_data_dir
+# The FTM download unpacks as RDS-2020-0001-2/Data/<csvs>.  Users point the app
+# at either level, so accept both and return whichever actually holds the CSVs.
+# Returns NULL when neither does.
+# =============================================================================
+resolve_ftm_data_dir <- function(ftm_dir) {
+  if (is.null(ftm_dir) || !nzchar(trimws(ftm_dir))) return(NULL)
+  d <- trimws(ftm_dir)
+  cands <- c(d, file.path(d, "Data"), file.path(d, "RDS-2020-0001-2", "Data"))
+  hit <- cands[file.exists(file.path(cands, "Species_BarkThickness.csv"))]
+  if (length(hit) == 0) NULL else hit[1]
+}
+
+
+# =============================================================================
+# load_ftm_bt_coef
+# Read Cansler et al. (2020) Species_BarkThickness.csv and return a lookup of
+# scientific name -> BT_coef (FOFEM single bark thickness coefficient).
+#
+# ftm_dir : directory containing Species_BarkThickness.csv (the FTM Data folder)
+# Returns : tibble(Genus_species, BT_coef) with normalised names, or NULL if the
+#           file is not present / unreadable.
+# =============================================================================
+load_ftm_bt_coef <- function(ftm_dir) {
+  d <- resolve_ftm_data_dir(ftm_dir)
+  if (is.null(d)) return(NULL)
+  f <- file.path(d, "Species_BarkThickness.csv")
+
+  bark <- tryCatch(
+    readr::read_csv(f, show_col_types = FALSE,
+                    locale = readr::locale(encoding = "latin1")),
+    error = function(e) NULL
+  )
+  if (is.null(bark) || !all(c("Genus_Species", "BT_coef") %in% names(bark)))
+    return(NULL)
+
+  bark %>%
+    transmute(
+      Genus_species = trimws(gsub("\\s+", " ",
+                            iconv(as.character(Genus_Species),
+                                  from = "latin1", to = "UTF-8", sub = ""))),
+      BT_coef       = suppressWarnings(as.numeric(BT_coef))
+    ) %>%
+    filter(!is.na(BT_coef), BT_coef > 0, nzchar(Genus_species)) %>%
+    distinct(Genus_species, .keep_all = TRUE)
+}
+
 
 # Years-to-breast-height correction for BHAGE → approximate TOTAGE
 # Used only when TOTAGE is absent. Sources: Silvics of North America.
@@ -261,9 +336,10 @@ load_fia_trees <- function(states, fia_dir = NULL) {
 # estimate_bark_params_from_fia
 # Estimate MaximumBarkThickness and AgeDBH per species from FIA TREE data.
 #
-# MaximumBarkThickness (cm, double-sided):
-#   = 2 × bark_ratio × P95_DBH_cm
-#   bark_ratio from built-in table (literature coefficients)
+# MaximumBarkThickness (cm, SINGLE-sided):
+#   = bt_coef × P95_DBH_cm
+#   bt_coef preferred from the user's FTM Species_BarkThickness.csv (identical to
+#   what fit_cohort_mortality() uses), else the built-in FOFEM fallback table.
 #
 # AgeDBH (years):
 #   Half-saturation constant from Michaelis-Menten DBH~age growth curve:
@@ -272,10 +348,14 @@ load_fia_trees <- function(states, fia_dir = NULL) {
 #   Falls back to bark-class heuristic when < 15 aged records.
 #
 # lookup  : tibble from load_species_lookup() — SpeciesName / FIA_SPCD / SCIENTIFIC_NAME
+# ftm_dir : optional directory holding Species_BarkThickness.csv.  When present,
+#           its BT_coef values override the built-in table so that the species
+#           table and the cohort mortality GLM share one set of coefficients.
 # Returns : tibble with SpeciesCode, AgeDBH, MaximumBarkThickness,
 #           ScientificName, FIA_SPCD, Note
 # =============================================================================
-estimate_bark_params_from_fia <- function(species_codes, fia_trees, lookup) {
+estimate_bark_params_from_fia <- function(species_codes, fia_trees, lookup,
+                                          ftm_dir = NULL) {
 
   # Map LANDIS codes → FIA SPCD via user lookup
   mapped <- tibble(SpeciesCode = species_codes) %>%
@@ -296,20 +376,49 @@ estimate_bark_params_from_fia <- function(species_codes, fia_trees, lookup) {
       .groups    = "drop"
     )
 
+  # Built-in FOFEM fallback coefficients, one row per SPCD (741/747 share a value)
+  bt_builtin <- bark_ratio_table %>%
+    group_by(fia_spcd) %>%
+    slice(1) %>%
+    ungroup() %>%
+    select(fia_spcd, bt_builtin = bark_ratio, source, bt_note)
+
+  # Live FTM coefficients keyed by scientific name, when available
+  ftm_bt <- load_ftm_bt_coef(ftm_dir)
+  if (!is.null(ftm_bt))
+    message(sprintf("estimate_bark_params_from_fia: using FTM BT_coef for %d species",
+                    nrow(ftm_bt)))
+
+  # SPCD -> scientific name, so FTM values can be matched
+  spcd_names <- mapped %>%
+    filter(!is.na(FIA_SPCD)) %>%
+    transmute(SPCD = as.integer(FIA_SPCD),
+              sci  = trimws(gsub("\\s+", " ", as.character(SCIENTIFIC_NAME)))) %>%
+    filter(!is.na(sci), nzchar(sci)) %>%
+    distinct(SPCD, .keep_all = TRUE)
+
   bark_params <- dbh_summary %>%
+    left_join(bt_builtin, by = c("SPCD" = "fia_spcd")) %>%
+    left_join(spcd_names, by = "SPCD") %>%
     left_join(
-      bark_ratio_table %>%
-        group_by(fia_spcd) %>%
-        slice(1) %>%              # one row per SPCD (741/747 share ratio)
-        select(fia_spcd, bark_ratio, source),
-      by = c("SPCD" = "fia_spcd")
+      if (!is.null(ftm_bt)) ftm_bt %>% rename(sci = Genus_species, bt_ftm = BT_coef)
+      else tibble(sci = character(), bt_ftm = numeric()),
+      by = "sci"
     ) %>%
     mutate(
-      # Double-sided (× 2) bark thickness at 95th-pct DBH
-      MaximumBarkThickness = round(2 * bark_ratio * p95_dia_cm, 2),
-      bt_source = if_else(!is.na(bark_ratio),
-                          paste0("bark_ratio=", bark_ratio, " [", source, "]"),
-                          "No bark ratio — default used")
+      # FTM value wins; built-in FOFEM table is the fallback
+      bark_ratio = coalesce(bt_ftm, bt_builtin),
+      # SINGLE-sided bark thickness at 95th-pct DBH — NO factor of 2.
+      # Matches SCF Eq. 10 and the BT_coef x DBH convention used by
+      # fit_cohort_mortality(), so CohortMortalityB1 transfers on the right scale.
+      MaximumBarkThickness = round(bark_ratio * p95_dia_cm, 2),
+      bt_source = case_when(
+        !is.na(bt_ftm)     ~ paste0("BT_coef=", bt_ftm, " [FTM Species_BarkThickness.csv]"),
+        !is.na(bt_builtin) ~ paste0("BT_coef=", bt_builtin, " [", source, "]",
+                                    if_else(nzchar(coalesce(bt_note, "")),
+                                            paste0(" — ", bt_note), "")),
+        TRUE               ~ "No bark coefficient — default used"
+      )
     )
 
   # ---------------------------------------------------------------------------

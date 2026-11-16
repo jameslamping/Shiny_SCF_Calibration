@@ -1,0 +1,336 @@
+======================================================================
+SCF v4 CALIBRATION — METHODS SUMMARY
+For use with Claude Chat when writing up calibration methods.
+Generated: 2026-05-07
+======================================================================
+
+OVERVIEW
+--------
+The Social-Climate-Fire (SCF) v4 LANDIS-II extension requires four
+calibrated parameter sets: ignition coefficients (Lightning and
+Accidental), ignition allocation surfaces, spread probability
+coefficients, and maximum daily spread area coefficients. Calibration
+is performed for a defined regional calibration boundary and transfers
+parameters to a specific LANDIS landscape (the "park grid"). All
+calibration is implemented in a custom R Shiny application.
+
+
+SPATIAL FRAMEWORK
+-----------------
+Calibration boundary (cal_vect):
+  A regional polygon (e.g., Oregon + Washington states, or a specific
+  ecoregion) used to clip climate data, fire records, and perimeters.
+  Downloaded automatically from US Census TIGER/Line via the tigris
+  package, or supplied as a user shapefile.
+
+Park template (template_r):
+  The LANDIS landscape raster (e.g., Mount Rainier). Defines the
+  working CRS, resolution, and extent for the ignition allocation
+  surface. All spatial data are reprojected to match this grid using
+  terra::project().
+
+Spread grid:
+  Built to cover the full calibration boundary at ~90 m resolution
+  (matching the template). Substantially larger than the park grid;
+  captures fire behavior across the regional calibration dataset.
+
+Working CRS:
+  NAD83 / UTM Zone 10N (taken from the template raster; never
+  hardcoded).
+
+
+CLIMATE DATA
+------------
+Fire Weather Index (FWI):
+  Source: ERA-Interim daily FWI (Vitolo et al. 2019, Zenodo DOI
+  10.5281/zenodo.1065400), gridded global daily data 1980-2018.
+  Spatially averaged over the calibration boundary centroid for each
+  day; stored as a daily time series. Used as the primary fire danger
+  predictor in all calibration models.
+
+Wind Speed:
+  Source: GRIDMET (Abatzoglou 2013), fetched remotely via the
+  climateR package for CONUS at daily resolution.
+  Raw wind speed converted from m/s to km/h (multiply by 3.6) before
+  all calculations. This is required by the SCF climate library, which
+  expects wind in km/h.
+  Alternative: ERA5 u10/v10 wind components (Copernicus CDS),
+  converted to speed and direction then to km/h.
+
+Effective Wind Speed (EWS):
+  Computed using the Nelson (2002) vector formula (International
+  Journal of Wildland Fire, Eq. 5):
+
+    EWS = Cb * sqrt((Ua/Cb)^2 + 2*(Ua/Cb)*sin(theta)*cos(phi) + sin^2(theta))
+
+  where:
+    Ua    = ambient wind speed (km/h)
+    theta = slope angle (radians)
+    phi   = angle between wind direction and uphill aspect (radians)
+    Cb    = combustion buoyancy constant
+
+  Terrain: DEM fetched via elevatr::get_elev_raster() at zoom level
+  9, then slope and aspect computed with terra::terrain(). Aspect is
+  converted from downhill (terra convention) to uphill:
+    UphillAzimuth = (aspect + 180) %% 360
+
+  Combustion buoyancy (Cb): Default 10 (low-intensity starting point);
+  options 25 (moderate) and 50 (high) available. Matches the SCF
+  parameter CombustionBuoyancy.
+
+  EWS output is in km/h and maps directly to DailyWindSpeed as read
+  by SCF at runtime.
+
+
+FINE FUELS
+----------
+  Source: LANDFIRE FBFM40 (40-category fuel model) fetched via USGS
+  REST API, or a user-supplied 0-1 TIF.
+  Optionally normalized to a 0-1 index (min-max scaling across the
+  calibration domain).
+  NA values (water, urban, non-burnable) set to the pair-mean before
+  GLM fitting to avoid dropping observations.
+  Corresponds to SCF parameter SpreadProbabilityB2 (FineFuels
+  coefficient).
+
+
+IGNITION CALIBRATION
+--------------------
+Data:
+  FPA FOD (Short 2022, USFS), filtered to the calibration boundary
+  and date range. DISCOVERY_DATE parsed as "%m/%d/%Y". Year filter
+  uses the integer FIRE_YEAR column (not derived from date).
+
+Model:
+  Daily ignition counts regressed against daily FWI using Poisson
+  GLM, separately for Lightning and Accidental ignition types.
+  Zero-Inflated Poisson (ZIP, via pscl) optionally fitted when
+  zero-inflation is detected.
+
+SCF mapping:
+  lambda = exp(B0 + B1 * FWI)
+  Coefficients map directly to:
+    LightningIgnitionB0/B1
+    AccidentalIgnitionB0/B1
+    (ZIP: BZ0/BZ1 if used)
+
+Ignition surfaces:
+  Gaussian kernel density surface of historical ignition locations,
+  generated on the park template grid using terra::rasterize() +
+  terra::focal() (vectorized, not a cell loop). Separate surfaces
+  for Lightning and Accidental types.
+
+
+SPREAD PROBABILITY CALIBRATION
+-------------------------------
+
+  Perimeter Data Source
+  ---------------------
+  Two options are supported; FIRED is recommended and set as default.
+
+  Option 1 — GeoMAC (Historic Geospatial Multi-Agency Coordination,
+  2000-2018 GDB):
+    Hand-drawn perimeters from aerial surveys and GPS flights. Known
+    to have spatial incoherence between consecutive perimeters for the
+    same fire (survey method changes between dates).
+    Diagnosis: pct_proximal (see below) is near 0% for the majority
+    of consecutive pairs, indicating the "new" burned area is spatially
+    offset from the frontier of the previous perimeter rather than
+    adjacent to it. This spatial incoherence produces wrong-sign FWI
+    and FineFuels coefficients in the GLM.
+
+  Option 2 — FIRED (Fire Information for Resource Management System;
+  Balch et al. 2020, Remote Sensing 12(21):3498):
+    MODIS MCD64A1 burned area product (463 m), processed into daily
+    fire progression polygons. Methodologically consistent across all
+    fires and dates. Two products:
+
+    Daily (fired_conus_daily_nov2001-jan2019.gpkg):
+      One row per fire-day, incremental daily burned patch geometry.
+      Used for spread probability calibration.
+
+    Events (fired_events_conus_nov2001-jan2019.gpkg):
+      One row per fire event, final perimeter plus max_growth_ha and
+      max_growth_date. Used for MaxSpreadArea calibration.
+
+    FIRED daily geometry is incremental (new pixels only each day).
+    Cumulative perimeters are reconstructed by iteratively unioning
+    daily patches for each fire event using sf::st_union(), with
+    sf::sf_use_s2(FALSE) required for planar operations on the MODIS
+    Sinusoidal CRS. This cumulative union step is parallelized across
+    CPU cores using future::multisession + furrr::future_map().
+
+    Minimum fire size filter: 100 ha (removes MODIS detection
+    artefacts while retaining calibration-relevant events).
+
+  Perimeter Pair Construction
+  ---------------------------
+  Consecutive dated perimeters for each fire are matched into pairs
+  (t, t+1) using bind_climate_to_pairs():
+    - Maximum gap: 5 days (MAX_GAP_SP) — pairs with longer gaps
+      between survey dates are excluded
+    - Minimum net growth: pairs where t+1 area < t area by more than
+      NEG_TOL_HA = 10 ha are excluded (shrinkage filter)
+    - FWI and EWS are joined to each pair by the interval midpoint date
+
+  Rasterization and Cell Classification
+  --------------------------------------
+  Following Robbins et al. (2021):
+
+  Each perimeter is rasterized to the spread grid at ~90 m resolution
+  using terra::rasterize() with touches = TRUE.
+
+  Success cells (y = 1):
+    All grid cells newly burned between t and t+1:
+      (r_t1 == 1) AND (r_t == 0)
+
+  Failure cells (y = 0):
+    The "frontier ring" of the t perimeter — cells adjacent to the
+    burned area at time t that did NOT burn by t+1. The frontier ring
+    is computed via morphological dilation:
+      terra::focal(r_t, w = dil_kernel, fun = "max")
+    then masking out already-burned cells.
+
+  Dilation kernel:
+    A circular (disk) kernel of radius DILATION_CELLS cells
+    (default 5, giving an 11x11 kernel). Wider than the classic 3x3
+    rook neighborhood to accommodate MODIS 463 m pixel boundaries
+    being rasterized to 90 m cells.
+
+  Spatial Coherence Filter (pct_proximal)
+  ----------------------------------------
+  For each pair, the fraction of newly-burned success cells that fall
+  within the frontier ring is computed:
+
+    pct_proximal = 100 * (new burned cells intersect frontier ring)
+                       / (total new burned cells)
+
+    100% = fully contiguous growth (spatially coherent)
+    ~0%  = new burned area is spatially offset from the old frontier
+           (indicative of GeoMAC survey inconsistency)
+
+  Pairs below a minimum threshold (MIN_PCT_PROXIMAL, default 0 = no
+  filter) are excluded before GLM fitting. This is the primary
+  diagnostic for GeoMAC data quality.
+
+  Sub-sampling
+  ------------
+  Large fires can contribute tens of thousands of cells per pair. To
+  prevent any single fire from dominating the GLM:
+    - Success cells capped at MAX_SAMPLES / (1 + FAILURE_RATIO) per
+      pair (default: 25000 / 4 = 6250)
+    - Failure cells sampled at FAILURE_RATIO * n_success
+      (default ratio = 3:1 failure-to-success)
+
+  GLM Fitting — Multi-Model Comparison
+  --------------------------------------
+  Four candidate models (M1-M4) are fitted using binomial GLM with
+  logit link:
+
+    M1: y ~ FWI
+    M2: y ~ FWI + FineFuels
+    M3: y ~ FWI + EffectiveWind
+    M4: y ~ FWI + FineFuels + EffectiveWind  (full model — primary)
+
+  Each model is evaluated by:
+    - McFadden R2 = 1 - (residual deviance / null deviance)
+    - AUC (Wilcoxon/Mann-Whitney statistic)
+    - Coefficient sign correctness (B_FWI, B_FineFuels, B_EWS should
+      all be positive)
+    - VIF (variance inflation factor) for collinearity
+
+  The M4 coefficients map directly to SCF parameters:
+
+    SpreadProbabilityB0  <-- Intercept
+    SpreadProbabilityB1  <-- B_FWI        (expected positive)
+    SpreadProbabilityB2  <-- B_FineFuels  (expected positive)
+    SpreadProbabilityB3  <-- B_EWS        (expected positive)
+
+  SCF computes:
+    P(spread) = 1 / (1 + exp(-(B0 + B1*FWI + B2*FF + B3*EWS)))
+
+  Diagonal cell spread receives an internal 0.71x weight in SCF
+  (FireEvent.cs); no calibration adjustment is needed.
+
+  Known issue with GeoMAC:
+    Wrong-sign coefficients for FWI and FineFuels are consistently
+    observed regardless of collinearity. VIF was ruled out as the
+    cause by expanding from a single ecoregion to all of OR+WA,
+    dropping VIF from 2.34 to 1.03 with no improvement in signs.
+    Root cause is the spatial incoherence described above under
+    pct_proximal.
+
+
+MAXIMUM DAILY SPREAD AREA CALIBRATION
+--------------------------------------
+Data source (FIRED):
+  load_fired_events_for_max_area() uses the FIRED events product to
+  extract max_growth_ha (maximum single-day burned area) and
+  max_growth_date per fire, joined with FWI and EWS on that date.
+
+Data source (GeoMAC):
+  delta_ha from consecutive perimeter pairs.
+
+Model:
+  Linear OLS:
+    MaxSpreadArea = B0 + B1*FWI + B2*EWS
+  Fitted to raw hectares. NO log transform — coefficients enter SCF
+  directly without back-transformation.
+
+Calibration target:
+  75th percentile of observed daily increments. MaxSpreadArea is a
+  ceiling (SCF advances the fire to the next day when daily burned
+  area exceeds it), so calibrating to the mean systematically
+  underpredicts spread.
+
+Constraint:
+  B0 must be > 0 to avoid negative MaxSpreadArea at low FWI, which
+  generates warnings in SCF.
+
+SCF mapping:
+  MaximumSpreadAreaB0/B1/B2  (units: hectares)
+
+
+KEY PARAMETER DEFAULTS
+-----------------------
+  Calibration period          2000-2018    GeoMAC and FIRED CONUS
+  Spread grid resolution      ~90 m        Matches LANDIS cell size
+  Dilation cells              5            11x11 disk kernel
+  Max gap (spread prob)       5 days       Between consecutive perimeters
+  Max gap (daily area)        5 days
+  Negative growth tolerance   10 ha        Shrinkage filter
+  Failure:success ratio       3:1          GLM sub-sample balance
+  Max samples per pair        25,000
+  Min fire size (FIRED)       100 ha       MODIS artefact filter
+  Min pct proximal            0%           Filter off by default;
+                                           ~20% recommended for GeoMAC
+  Combustion buoyancy         10           Low intensity starting point
+  Fine fuels normalize        TRUE         0-1 index
+  Perimeter source            FIRED        Preferred over GeoMAC
+
+
+KEY REFERENCES
+--------------
+Balch, J.K., et al. (2020). FIRED (Fire Information for Resource
+  Management System): A daily fire perimeter dataset for the United
+  States from 2001-2019. Remote Sensing, 12(21), 3498.
+  https://doi.org/10.3390/rs12213498
+
+Nelson, R.M. (2002). An effective wind speed for models of fire
+  spread. International Journal of Wildland Fire, 11(2), 153-161.
+  https://doi.org/10.1071/WF02002
+
+Robbins, Z.J., et al. (2021). Linking the socioeconomic and
+  ecological drivers of fire activity to fire spread in the western
+  United States. Global Change Biology.
+
+Short, K.C. (2022). Spatial wildfire occurrence data for the United
+  States, 1992-2020. USFS Rocky Mountain Research Station Data
+  Archive. https://doi.org/10.2737/RDS-2013-0009.6
+
+Vitolo, C., et al. (2019). ERA-Interim based global fire weather
+  indices. Zenodo. https://doi.org/10.5281/zenodo.1065400
+
+======================================================================
+END OF METHODS SUMMARY
+======================================================================

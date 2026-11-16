@@ -56,3 +56,10 @@ paths.rtf
 
 # Claude Code project instructions (local only)
 CLAUDE.md
+
+# GRIDMET download cache (multi-GB, regenerated on demand by the app)
+gridmet_cache/
+
+# Generated diagnostic / analysis outputs
+spread_diag_report_*.txt
+analysis/plots/

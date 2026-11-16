@@ -146,8 +146,19 @@ process_clay_raster <- function(solus_clay_dir, sg_clay_dir,
 
 load_mtbs_dnbr_pixels <- function(mtbs_dnbr_dir, cal_vect, working_crs,
                                    sample_frac = 0.05,
-                                   min_dnbr = 100, max_dnbr = 2000,
+                                   min_dnbr = 1, max_dnbr = 2000,
+                                   dnbr_offset = 0,
                                    progress_fn = NULL) {
+
+  # min_dnbr is a LEFT TRUNCATION of the Gamma response.  It must stay low.
+  # The old default of 100 discarded the entire low-severity tail, which inflates
+  # the fitted intercept (and therefore the baseline dNBR SCF predicts) and biases
+  # every slope.  Gamma only needs strictly positive support, so 1 is enough.
+  if (min_dnbr > 50)
+    warning(sprintf(paste0(
+      "min_dnbr = %g truncates the low-severity tail of the response. ",
+      "Gamma only requires dNBR > 0; values above ~50 bias SiteMortalityB0 ",
+      "upward and flatten the fitted slopes."), min_dnbr))
 
   # ---- Discover files --------------------------------------------------------
   all_files <- list.files(mtbs_dnbr_dir, pattern = "_dnbr\\.tif$",
@@ -172,7 +183,8 @@ load_mtbs_dnbr_pixels <- function(mtbs_dnbr_dir, cal_vect, working_crs,
 
   # ---- Loop over files -------------------------------------------------------
   pixel_list <- vector("list", length(all_files))
-  n_loaded <- 0L
+  n_loaded    <- 0L
+  n_thematic  <- 0L
 
   for (i in seq_along(all_files)) {
     fpath <- all_files[i]
@@ -191,7 +203,13 @@ load_mtbs_dnbr_pixels <- function(mtbs_dnbr_dir, cal_vect, working_crs,
       next
     }
     fire_year <- as.integer(substr(date_blocks[1], 1, 4))
-    cat(sprintf("    fire_year=%d\n", fire_year))
+
+    # First 8-digit block is the ignition date for per-fire MTBS bundles, but is
+    # only the mosaic window start for the CONUS annual mosaics.  Keep it either
+    # way; extract_site_predictors() decides whether it is usable as a burn date.
+    fire_date <- suppressWarnings(as.Date(date_blocks[1], format = "%Y%m%d"))
+    cat(sprintf("    fire_year=%d  fire_date=%s\n", fire_year,
+                if (is.na(fire_date)) "NA" else format(fire_date)))
 
     # -- Load raster -----------------------------------------------------------
     r <- tryCatch(rast(fpath), error = function(e) {
@@ -241,11 +259,18 @@ load_mtbs_dnbr_pixels <- function(mtbs_dnbr_dir, cal_vect, working_crs,
     # Detect by checking whether ALL non-NA values are <= 6.
     # Use subst() for exact integer matching — classify() interval approach
     # silently produces empty intervals when from == to (e.g. (2,2] = {}).
-    if (raw_nonNA > 0 && max(raw_unique, na.rm = TRUE) <= 6) {
-      cat(sprintf("    reclassifying severity classes to dNBR midpoints\n"))
+    is_thematic <- raw_nonNA > 0 && max(raw_unique, na.rm = TRUE) <= 6
+    if (is_thematic) {
+      cat(sprintf("    THEMATIC product detected - reclassifying classes to dNBR midpoints\n"))
+      # Class 1 ("Unburned to Low") is now mapped to ~60 rather than dropped.
+      # SCF assigns a dNBR to EVERY cell inside the perimeter, including barely
+      # burned ones, so deleting class 1 made the calibration sample
+      # systematically more severe than what SCF has to reproduce.
+      # 5 = increased greenness and 6 = non-mapping remain NA.
       r <- subst(r,
                  from = c(0,  1,   2,   3,   4,   5,  6),
-                 to   = c(NA, NA, 185, 355, 600,  NA, NA))
+                 to   = c(NA, 60, 185, 355, 600,  NA, NA))
+      n_thematic <- n_thematic + 1L
     }
 
     # -- Project, crop, mask to cal_vect --------------------------------------
@@ -272,7 +297,11 @@ load_mtbs_dnbr_pixels <- function(mtbs_dnbr_dir, cal_vect, working_crs,
     df <- tibble(
       fire_id   = fire_id,
       fire_year = fire_year,
-      dNBR      = vals,
+      fire_date = fire_date,
+      # MTBS continuous products carry a per-fire dNBR offset in their metadata
+      # that should be removed before use.  Zero by default; set dnbr_offset when
+      # working from per-fire bundles whose offset you have read.
+      dNBR      = vals - dnbr_offset,
       x         = xy[[1]],
       y         = xy[[2]]
     ) %>%
@@ -297,6 +326,27 @@ load_mtbs_dnbr_pixels <- function(mtbs_dnbr_dir, cal_vect, working_crs,
 
   message(sprintf("load_mtbs_dnbr_pixels: %d fires loaded, %s pixels retained",
                   n_loaded, scales::comma(nrow(result))))
+
+  n_lvl <- length(unique(result$dNBR))
+  attr(result, "thematic_files") <- n_thematic
+  attr(result, "n_dnbr_levels")  <- n_lvl
+
+  if (n_thematic > 0) {
+    warning(sprintf(paste0(
+      "%d of %d MTBS files were THEMATIC (6-class) products, so the response ",
+      "takes only %d distinct values. A Gamma GLM fitted to a handful of class ",
+      "midpoints has a meaningless variance structure, compressed predicted ",
+      "range, and coefficients driven by the class breaks rather than by real ",
+      "severity gradients. Use continuous per-fire MTBS rasters (RdNBR preferred, ",
+      "as in Robbins' reference calibration) for anything beyond a smoke test."),
+      n_thematic, n_loaded, n_lvl))
+  } else if (n_lvl < 25) {
+    warning(sprintf(paste0(
+      "Only %d distinct dNBR values across %s pixels - the response is close to ",
+      "categorical and the Gamma fit will be poorly determined."),
+      n_lvl, scales::comma(nrow(result))))
+  }
+
   result
 }
 
@@ -787,45 +837,70 @@ compute_annual_fire_season_wind <- function(wind_daily, fire_months = 6:9) {
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# fetch_landfire_cbh
+# fetch_landfire_ladder_fuels
 #
-# Purpose: Download LANDFIRE LF2024 Canopy Base Height (CBH) via REST API,
-#   convert from decimetres to metres, compute a ladder fuel index (0-1), and
-#   resample to spread_template.
+# Purpose: Build a LADDER FUEL BIOMASS surface in g m-2, on the scale SCF
+#   actually uses, from LANDFIRE canopy products.
+#
+# WHY BIOMASS AND NOT AN INDEX (FireEvent.cs:319-325):
+#   SCF computes
+#       ladderFuelBiomass = SUM over cohorts of cohort.Data.Biomass
+#                           for species in LadderFuelSpeciesList
+#                           with Age <= LadderFuelMaxAge
+#   That is RAW summed cohort biomass in g m-2, typically 0 - 3000, and it enters
+#   Equation 7 unbounded and unscaled.  A 0-1 index fitted here would produce a
+#   B6 roughly 1000x too large: at 800 g m-2 the B6 term alone would drive the
+#   linear predictor negative, hit the max(eta, 0.0005) clamp in FireEvent.cs:371
+#   and pin dNBR to its 2000 ceiling across the landscape.  So the calibration
+#   predictor must be biomass, in g m-2.
+#
+# CONSTRUCTION:
+#   The ladder layer is the part of the canopy hanging below `ladder_ceiling_m`,
+#   i.e. the sub-canopy stratum that carries surface fire into the crown - the
+#   same stratum SCF represents with sub-LadderFuelMaxAge cohorts.
+#
+#       depth_m   = max(0, min(CH_m, ladder_ceiling_m) - CBH_m)
+#       ladder_g  = CBD_kg_m3 * depth_m * 1000
+#
+#   Where CBH >= ladder_ceiling_m the canopy starts above the ladder zone and
+#   ladder fuel is 0.  Where CBH is low and the canopy fills the zone, the full
+#   load is counted.  Units: kg m-3 * m = kg m-2, * 1000 -> g m-2.
+#
+# LANDFIRE native units (LF2024):
+#   CBH  metres * 10       CH  metres * 10       CBD  kg m-3 * 100
+#   -9999 / negative = nodata; 0 = non-forested (no canopy, no ladder fuel)
 #
 # Args:
-#   cal_vect        SpatVector of calibration boundary (any CRS)
-#   working_crs     CRS string
-#   spread_template SpatRaster defining the output grid
-#   progress_fn     optional function(msg)
+#   cal_vect          SpatVector of calibration boundary (any CRS)
+#   working_crs       CRS string
+#   spread_template   SpatRaster defining the output grid
+#   ladder_ceiling_m  top of the ladder-fuel stratum in metres (default 8).
+#                     Should correspond to the height of a cohort at
+#                     LadderFuelMaxAge for your ladder species.
+#   biomass_basis     "biomass" (default) returns g dry biomass m-2, matching
+#                     NECN cohort biomass.  "carbon" halves it for landscapes
+#                     whose succession extension reports g C m-2.
+#   progress_fn       optional function(msg)
 #
-# Returns: SpatRaster on spread_template grid, values 0-1 (high = more ladder fuels)
+# Returns: SpatRaster on spread_template grid, values in g m-2 (>= 0).
 # -----------------------------------------------------------------------------
 
-fetch_landfire_cbh <- function(cal_vect, working_crs, spread_template,
-                                progress_fn = NULL) {
-
-  # ---- Bounding box in WGS84 ------------------------------------------------
-  cal_wgs84 <- project(cal_vect, "EPSG:4326")
-  bb        <- as.vector(ext(cal_wgs84))   # xmin, xmax, ymin, ymax
+# Internal: pull one LANDFIRE LF2024 CONUS product as a SpatRaster over a bbox.
+.fetch_landfire_layer <- function(product, bb, progress_fn = NULL) {
 
   deg_per_30m <- 30 / 111320
   nx <- min(as.integer(ceiling((bb["xmax"] - bb["xmin"]) / deg_per_30m)), 4096L)
   ny <- min(as.integer(ceiling((bb["ymax"] - bb["ymin"]) / deg_per_30m)), 4096L)
-  message(sprintf(
-    "fetch_landfire_cbh: requesting CBH %d x %d pixels over bbox [%.4f %.4f %.4f %.4f]",
-    nx, ny, bb["xmin"], bb["ymin"], bb["xmax"], bb["ymax"]
-  ))
 
-  base_url <- paste0(
-    "https://lfps.usgs.gov/arcgis/rest/services/",
-    "Landfire_LF2024/LF2024_CBH_CONUS/ImageServer/exportImage"
-  )
+  if (!is.null(progress_fn))
+    progress_fn(sprintf("Downloading LANDFIRE %s...", product))
+  message(sprintf(".fetch_landfire_layer: %s at %d x %d px", product, nx, ny))
 
-  if (!is.null(progress_fn)) progress_fn("Downloading LANDFIRE CBH from USGS server...")
+  base_url <- sprintf(paste0("https://lfps.usgs.gov/arcgis/rest/services/",
+                             "Landfire_LF2024/LF2024_%s_CONUS/ImageServer/exportImage"),
+                      product)
 
   tmp_tif <- tempfile(fileext = ".tif")
-
   resp <- tryCatch(
     httr::GET(
       base_url,
@@ -844,44 +919,95 @@ fetch_landfire_cbh <- function(cal_vect, working_crs, spread_template,
       httr::timeout(300)
     ),
     error = function(e)
-      stop("LANDFIRE CBH HTTP request failed: ", conditionMessage(e))
+      stop(sprintf("LANDFIRE %s HTTP request failed: %s", product, conditionMessage(e)))
   )
 
   if (httr::http_error(resp))
-    stop("LANDFIRE CBH REST API returned HTTP ", httr::status_code(resp),
-         ". Check internet connection or try again later.")
+    stop(sprintf("LANDFIRE %s REST API returned HTTP %d.", product,
+                 httr::status_code(resp)))
 
-  # ---- Read, validate, convert units -----------------------------------------
-  cbh_r <- tryCatch(
-    rast(tmp_tif),
-    error = function(e)
-      stop("Could not read LANDFIRE CBH response as raster: ", conditionMessage(e))
-  )
+  r <- tryCatch(rast(tmp_tif), error = function(e)
+    stop(sprintf("Could not read LANDFIRE %s response as raster: %s",
+                 product, conditionMessage(e))))
 
-  raw_vals <- values(cbh_r, mat = FALSE)
-  message(sprintf("LANDFIRE CBH raw pixel range: [%.0f, %.0f] (decimetres)",
-                  min(raw_vals, na.rm = TRUE), max(raw_vals, na.rm = TRUE)))
-
-  # CBH in LANDFIRE = tenths of a metre (decimetres); 0 = non-forested
-  cbh_m <- cbh_r / 10.0
-  cbh_m[cbh_m < 0] <- NA   # -9999 nodata
-
-  if (!is.null(progress_fn)) progress_fn("Computing ladder fuel index from CBH...")
-
-  # Low CBH -> high ladder fuel risk
-  # LadderFuels = 1 / (CBH_m + 0.5) then normalize 0-1 by max
-  lf_r     <- 1 / (cbh_m + 0.5)
-  lf_vals  <- values(lf_r, mat = FALSE)
-  lf_max   <- max(lf_vals, na.rm = TRUE)
-  if (!is.finite(lf_max) || lf_max <= 0)
-    stop("Ladder fuel index calculation produced no valid values.")
-  lf_r <- lf_r / lf_max
-
-  # ---- Reproject and resample to spread grid ----------------------------------
-  if (!is.null(progress_fn)) progress_fn("Reprojecting and resampling CBH to working CRS...")
-  lf_proj <- project(lf_r, working_crs, method = "bilinear")
-  resample(lf_proj, spread_template, method = "bilinear")
+  rv <- values(r, mat = FALSE)
+  message(sprintf("  %s raw range: [%.0f, %.0f]",
+                  product, min(rv, na.rm = TRUE), max(rv, na.rm = TRUE)))
+  r
 }
+
+
+fetch_landfire_ladder_fuels <- function(cal_vect, working_crs, spread_template,
+                                        ladder_ceiling_m = 8,
+                                        biomass_basis    = c("biomass", "carbon"),
+                                        progress_fn      = NULL) {
+
+  biomass_basis <- match.arg(biomass_basis)
+
+  if (!is.finite(ladder_ceiling_m) || ladder_ceiling_m <= 0)
+    stop("ladder_ceiling_m must be a positive height in metres.")
+
+  cal_wgs84 <- project(cal_vect, "EPSG:4326")
+  bb        <- as.vector(ext(cal_wgs84))
+  names(bb) <- c("xmin", "xmax", "ymin", "ymax")
+
+  # ---- Pull the three canopy products ----------------------------------------
+  cbh_r <- .fetch_landfire_layer("CBH", bb, progress_fn)
+  cbd_r <- .fetch_landfire_layer("CBD", bb, progress_fn)
+  ch_r  <- .fetch_landfire_layer("CH",  bb, progress_fn)
+
+  # Align in case the service returns marginally different grids
+  cbd_r <- resample(cbd_r, cbh_r, method = "bilinear")
+  ch_r  <- resample(ch_r,  cbh_r, method = "bilinear")
+
+  if (!is.null(progress_fn)) progress_fn("Computing ladder fuel biomass...")
+
+  # ---- Native units -> SI ----------------------------------------------------
+  cbh_m    <- cbh_r / 10.0      # decimetres -> m
+  ch_m     <- ch_r  / 10.0      # decimetres -> m
+  cbd_kgm3 <- cbd_r / 100.0     # kg m-3 * 100 -> kg m-3
+
+  # Nodata (-9999 and friends). 0 is legitimate (non-forested) and is kept.
+  cbh_m[cbh_m    < 0] <- NA
+  ch_m[ch_m      < 0] <- NA
+  cbd_kgm3[cbd_kgm3 < 0] <- NA
+
+  # ---- Ladder-zone depth and load -------------------------------------------
+  top      <- min(ch_m, ladder_ceiling_m)          # terra: cellwise min vs scalar
+  depth_m  <- top - cbh_m
+  depth_m[depth_m < 0] <- 0                        # CBH above the ladder ceiling
+
+  ladder_g <- cbd_kgm3 * depth_m * 1000            # kg m-2 -> g m-2
+  if (biomass_basis == "carbon") ladder_g <- ladder_g * 0.5
+  ladder_g[ladder_g < 0] <- 0
+
+  lv <- values(ladder_g, mat = FALSE)
+  lv <- lv[is.finite(lv)]
+  if (length(lv) == 0)
+    stop("Ladder fuel biomass calculation produced no valid values. ",
+         "Check that the calibration boundary overlaps CONUS LANDFIRE coverage.")
+
+  message(sprintf(paste0("fetch_landfire_ladder_fuels: ladder fuel biomass ",
+                         "range [%.0f, %.0f] g m-2, mean %.0f, %.0f%% non-zero ",
+                         "(ceiling %.1f m, basis '%s')"),
+                  min(lv), max(lv), mean(lv), 100 * mean(lv > 0),
+                  ladder_ceiling_m, biomass_basis))
+
+  if (max(lv) < 1)
+    warning("Ladder fuel biomass is essentially zero everywhere. ",
+            "Either the landscape is non-forested or ladder_ceiling_m (",
+            ladder_ceiling_m, " m) is below the local canopy base height. ",
+            "SiteMortalityB6 will be unidentifiable — consider setting it to 0.")
+
+  # ---- Reproject and resample to the working grid ----------------------------
+  if (!is.null(progress_fn))
+    progress_fn("Reprojecting ladder fuels to working CRS...")
+  lf_proj <- project(ladder_g, working_crs, method = "bilinear")
+  out     <- resample(lf_proj, spread_template, method = "bilinear")
+  names(out) <- "ladder_fuel_g_m2"
+  out
+}
+
 
 
 # =============================================================================
@@ -903,17 +1029,21 @@ fetch_landfire_cbh <- function(cal_vect, working_crs, spread_template,
 #   slope_r         SpatRaster of slope (degrees) from rv$slope_r (may be small extent)
 #   aspect_r        SpatRaster of aspect (degrees) from rv$aspect_r (may be small extent)
 #   fine_fuels_r    SpatRaster of fine fuel index (0-1) or NULL
-#   ladder_fuels_r  SpatRaster of ladder fuel index (0-1) or NULL
+#   ladder_fuels_r  SpatRaster of ladder fuel BIOMASS in g m-2 (NOT a 0-1
+#                   index) from fetch_landfire_ladder_fuels(), or NULL
 #   working_crs     CRS string (pixel_df x,y are in this CRS)
 #
 # Returns: pixel_df with additional columns Clay, ET_mm, CWD_mm, EWS_kmh,
 #   FineFuels, LadderFuels; rows with any NA predictor dropped.
+#   Predictors that are entirely unavailable are left NA rather than filled with
+#   a constant, so fit_site_mortality() drops them and writes 0.0 into the slot.
 # -----------------------------------------------------------------------------
 
 extract_site_predictors <- function(pixel_df, clay_r, et_r, cwd_r,
                                      wind_annual_tbl, slope_r, aspect_r,
                                      fine_fuels_r, ladder_fuels_r,
-                                     working_crs = NULL) {
+                                     working_crs = NULL,
+                                     wind_daily  = NULL) {
 
   # ---- Build SpatVector of pixel locations -----------------------------------
   pv <- vect(pixel_df[, c("x", "y")], geom = c("x", "y"),
@@ -960,11 +1090,83 @@ extract_site_predictors <- function(pixel_df, clay_r, et_r, cwd_r,
   }
 
   # ---- Effective Wind Speed --------------------------------------------------
+  # SCF evaluates EWS with the wind of the DAY THE CELL BURNS
+  # (FireEvent.cs:604-606 reads DailyWindSpeed[day]).  Calibrating against an
+  # annual fire-season mean shrinks the predictor variance by roughly an order of
+  # magnitude, so B3 gets estimated over a narrow x-range and then extrapolated
+  # across the full daily distribution at runtime.  Because site severity also
+  # feeds back into combustion buoyancy (FireEvent.cs:606-610), an over-steep B3
+  # is exactly how the landscape ends up pinned at the dNBR ceiling.
+  #
+  # So: use per-fire ignition-date wind when pixel_df carries a usable fire_date,
+  # and fall back to the annual fire-season mean only when it does not.
   message("extract_site_predictors: computing EWS...")
-  if (!is.null(wind_annual_tbl)) {
+
+  have_dates <- "fire_date" %in% names(pixel_df) &&
+                sum(!is.na(pixel_df$fire_date)) > 0
+  # Annual CONUS mosaics all report 1 January - that is a mosaic window bound,
+  # not a burn date, so treat it as unusable.
+  if (have_dates) {
+    d <- pixel_df$fire_date[!is.na(pixel_df$fire_date)]
+    if (all(format(d, "%m-%d") == "01-01")) {
+      message("  fire_date is 1 Jan for every file (annual mosaic bound, not a ",
+              "burn date) - falling back to annual fire-season mean wind")
+      have_dates <- FALSE
+    }
+  }
+
+  use_daily <- have_dates && !is.null(wind_daily) && nrow(wind_daily) > 0
+
+  if (use_daily) {
+    # NB: temporary column names must NOT start with "." - dplyr 1.1.x fails to
+    # resolve bare column references inside a mutate that creates a dot-prefixed
+    # name, and as.Date(date) then silently picks up base::date and errors.
+    date_col <- intersect(c("date", "Date", "DATE"), names(wind_daily))[1]
+    if (is.na(date_col))
+      stop("wind_daily has no date column (expected one of: date, Date, DATE). ",
+           "Columns present: ", paste(names(wind_daily), collapse = ", "))
+
+    wd_tbl <- wind_daily
+    wd_tbl$burn_day <- as.Date(wd_tbl[[date_col]])
+    wd_tbl <- wd_tbl %>%
+      group_by(burn_day) %>%
+      summarise(mean_ws_kmh = mean(WindSpeed_kmh, na.rm = TRUE),
+                mean_wd_deg = mean(WindDir_deg,   na.rm = TRUE),
+                .groups = "drop")
+
+    pixel_df$burn_day <- as.Date(pixel_df$fire_date)
+    pixel_df <- pixel_df %>% left_join(wd_tbl, by = "burn_day")
+
+    n_hit <- sum(is.finite(pixel_df$mean_ws_kmh))
+    message(sprintf("  day-of-burn wind matched for %.1f%% of pixels (%d fires)",
+                    100 * mean(is.finite(pixel_df$mean_ws_kmh)),
+                    length(unique(pixel_df$fire_id))))
+
+    # Backfill any unmatched burn dates from the annual means
+    if (n_hit < nrow(pixel_df) && !is.null(wind_annual_tbl)) {
+      pixel_df <- pixel_df %>%
+        left_join(wind_annual_tbl %>%
+                    select(year, ws_yr = mean_ws_kmh, wd_yr = mean_wd_deg),
+                  by = c("fire_year" = "year")) %>%
+        mutate(mean_ws_kmh = coalesce(mean_ws_kmh, ws_yr),
+               mean_wd_deg = coalesce(mean_wd_deg, wd_yr)) %>%
+        select(-ws_yr, -wd_yr)
+    }
+    pixel_df <- pixel_df %>% select(-burn_day)
+  }
+
+  if (!use_daily && !is.null(wind_annual_tbl)) {
+    warning("Site mortality EWS is being built from ANNUAL fire-season mean wind ",
+            "because per-fire burn dates are unavailable. SCF uses day-of-burn ",
+            "wind, so SiteMortalityB3 will be fitted over a much narrower range ",
+            "than it is applied to. Load continuous per-fire MTBS rasters to get ",
+            "ignition dates.")
     pixel_df <- pixel_df %>%
       left_join(wind_annual_tbl %>% select(year, mean_ws_kmh, mean_wd_deg),
                 by = c("fire_year" = "year"))
+  }
+
+  if (use_daily || !is.null(wind_annual_tbl)) {
 
     # Try slope/aspect extraction; fall back to flat terrain if small extent
     slope_vals  <- rep(0, nrow(pixel_df))
@@ -1009,40 +1211,66 @@ extract_site_predictors <- function(pixel_df, clay_r, et_r, cwd_r,
     )
 
     pixel_df <- pixel_df %>% select(-mean_ws_kmh, -mean_wd_deg)
+    attr(pixel_df, "ews_wind_basis") <- if (use_daily) "day-of-burn" else "annual mean"
 
   } else {
     message("extract_site_predictors: no wind data, EWS set to NA")
     pixel_df$EWS_kmh <- NA_real_
+    attr(pixel_df, "ews_wind_basis") <- "none"
   }
 
   # ---- Fine fuels ------------------------------------------------------------
+  # NOTE: constant placeholders are NOT used any more.  A predictor with zero
+  # variance cannot be estimated, yet glm() will still return a coefficient for
+  # it that silently absorbs part of the intercept - and the intercept is what
+  # sets SCF's baseline severity.  Absent predictors are left NA so that
+  # fit_site_mortality() drops them and writes an honest 0.0 into the B slot.
   if (!is.null(fine_fuels_r)) {
     message("extract_site_predictors: extracting fine fuels...")
     pixel_df$FineFuels <- terra::extract(fine_fuels_r, pv)[, 2]
   } else {
-    message("extract_site_predictors: fine fuels not available, using placeholder 1.0")
-    pixel_df$FineFuels <- 1.0
+    message("extract_site_predictors: fine fuels not available - SiteMortalityB5 will be 0")
+    pixel_df$FineFuels <- NA_real_
   }
 
-  # ---- Ladder fuels ----------------------------------------------------------
+  # ---- Ladder fuels (g m-2 biomass, matching SCF) ----------------------------
   if (!is.null(ladder_fuels_r)) {
-    message("extract_site_predictors: extracting ladder fuels...")
+    message("extract_site_predictors: extracting ladder fuel biomass...")
     pixel_df$LadderFuels <- terra::extract(ladder_fuels_r, pv)[, 2]
+    lv <- pixel_df$LadderFuels[is.finite(pixel_df$LadderFuels)]
+    if (length(lv) > 0) {
+      message(sprintf("  ladder fuel biomass at pixels: range [%.0f, %.0f] g m-2, mean %.0f",
+                      min(lv), max(lv), mean(lv)))
+      if (max(lv) <= 1.5)
+        warning("Ladder fuel values look like a 0-1 INDEX, not biomass in g m-2. ",
+                "SCF Eq. 7 multiplies B6 by raw summed cohort biomass, so an index ",
+                "produces a B6 about three orders of magnitude too large. Rebuild ",
+                "with fetch_landfire_ladder_fuels(), or set the source to 'none'.")
+    }
   } else {
-    message("extract_site_predictors: ladder fuels not available, using placeholder 0.5")
-    pixel_df$LadderFuels <- 0.5
+    message("extract_site_predictors: ladder fuels not available - SiteMortalityB6 will be 0")
+    pixel_df$LadderFuels <- NA_real_
   }
 
   # ---- Drop rows with any NA predictor ---------------------------------------
-  pred_cols <- c("Clay", "ET_mm", "CWD_mm", "EWS_kmh", "FineFuels", "LadderFuels")
-  # ET_mm and CWD_mm may be all-NA if not fetched; keep them but don't require them
-  required_preds <- intersect(c("Clay", "EWS_kmh", "FineFuels", "LadderFuels"),
-                               names(pixel_df))
+  # Any predictor may be entirely absent; require only those that actually carry
+  # data, so a missing fuels layer no longer wipes out the whole sample.
+  candidates <- c("Clay", "ET_mm", "CWD_mm", "EWS_kmh", "FineFuels", "LadderFuels")
+  required_preds <- candidates[vapply(candidates, function(v)
+    v %in% names(pixel_df) && any(is.finite(pixel_df[[v]])), logical(1))]
   n_before <- nrow(pixel_df)
+  wind_basis <- attr(pixel_df, "ews_wind_basis")
   pixel_df <- pixel_df %>%
     filter(if_all(all_of(required_preds), is.finite))
   message(sprintf("extract_site_predictors: %d of %d rows retained after NA drop",
                   nrow(pixel_df), n_before))
+
+  # dplyr verbs drop attributes, so re-attach after the last one.
+  attr(pixel_df, "ews_wind_basis") <- wind_basis
+  # Calibration EWS uses Cb = 10 (SCF's low-intensity default). SCF escalates Cb
+  # to 25 above Intensity 3 and 50 above Intensity 6 (FireEvent.cs:606-610), so
+  # B3 is applied to systematically larger EWS in severe fire than it was fit on.
+  attr(pixel_df, "combustion_buoyancy") <- 10
 
   pixel_df
 }
@@ -1071,9 +1299,25 @@ fit_site_mortality <- function(pixel_df) {
   # ---- Determine which predictors are available (all-NA = skip) --------------
   candidate_preds <- c("Clay", "ET_mm", "EWS_kmh", "CWD_mm",
                        "FineFuels", "LadderFuels")
+
+  # A predictor needs data AND variance.  A constant column is not estimable:
+  # glm() would hand back a coefficient that quietly absorbs part of the
+  # intercept, and the intercept is what sets SCF's baseline severity.
   available_preds <- candidate_preds[vapply(candidate_preds, function(v) {
-    v %in% names(pixel_df) && sum(is.finite(pixel_df[[v]])) > 10
+    if (!v %in% names(pixel_df)) return(FALSE)
+    x <- pixel_df[[v]][is.finite(pixel_df[[v]])]
+    if (length(x) <= 10) return(FALSE)
+    if (sd(x) <= .Machine$double.eps * max(1, abs(mean(x)))) {
+      message(sprintf("fit_site_mortality: dropping '%s' - constant (%.4g)", v, x[1]))
+      return(FALSE)
+    }
+    TRUE
   }, logical(1))]
+
+  dropped <- setdiff(candidate_preds, available_preds)
+  if (length(dropped) > 0)
+    message("fit_site_mortality: not fitted (B slot written as 0.0): ",
+            paste(dropped, collapse = ", "))
 
   if (length(available_preds) == 0)
     stop("No predictor columns with sufficient non-NA data found in pixel_df.")
@@ -1190,6 +1434,77 @@ fit_site_mortality <- function(pixel_df) {
     fitted        = all_terms %in% names(coef_orig)   # flag fitted vs zero-padded
   )
 
+  # ---------------------------------------------------------------------------
+  # Diagnostic A — linear-predictor positivity / clamp exposure
+  #
+  # SCF computes siteMortality = max(eta, 0.0005)^-1 (FireEvent.cs:371).  The
+  # floor is a cliff, not a soft bound: any cell whose linear predictor reaches
+  # zero is assigned dNBR 2000, the maximum.  If that is firing anywhere in the
+  # calibration sample it will fire far more often at runtime, where predictors
+  # range wider than the fitted data.
+  # ---------------------------------------------------------------------------
+  eta_hat  <- as.numeric(predict(fit, type = "link"))
+  n_clamp  <- sum(eta_hat <= 0.0005, na.rm = TRUE)
+  pct_clamp <- 100 * n_clamp / length(eta_hat)
+
+  if (pct_clamp > 0)
+    warning(sprintf(paste0(
+      "%.2f%% of calibration pixels have a linear predictor at or below the SCF ",
+      "floor of 0.0005, so SCF would assign them the maximum dNBR of 2000. This ",
+      "almost always means a predictor is on the wrong scale - check that ladder ",
+      "fuels are in g m-2 and that fine fuels match MaximumFineFuels."), pct_clamp))
+
+  # ---------------------------------------------------------------------------
+  # Diagnostic B — predicted vs observed dNBR RANGE
+  #
+  # A GLM's fitted values compress variance.  If the site model spans only a
+  # narrow band while observed severity spans a wide one, then at runtime the
+  # cohort model sees a near-constant SiteMortality and CohortMortalityB2 stops
+  # doing anything - mortality becomes species-driven only.
+  # ---------------------------------------------------------------------------
+  pred_dnbr <- as.numeric(predict(fit, type = "response"))
+  obs_q  <- quantile(dat$dNBR,  c(0.05, 0.5, 0.95), na.rm = TRUE)
+  pred_q <- quantile(pred_dnbr, c(0.05, 0.5, 0.95), na.rm = TRUE)
+  span_ratio <- as.numeric(diff(pred_q[c(1, 3)]) / max(diff(obs_q[c(1, 3)]), 1e-9))
+
+  message(sprintf(
+    "fit_site_mortality: observed dNBR 5/50/95 = %.0f/%.0f/%.0f; predicted = %.0f/%.0f/%.0f (span ratio %.2f)",
+    obs_q[1], obs_q[2], obs_q[3], pred_q[1], pred_q[2], pred_q[3], span_ratio))
+
+  if (span_ratio < 0.25)
+    warning(sprintf(paste0(
+      "The site model reproduces only %.0f%% of the observed dNBR spread ",
+      "(predicted 5-95%%: %.0f-%.0f vs observed %.0f-%.0f). SCF will feed a ",
+      "nearly constant SiteMortality into cohort mortality, so CohortMortalityB2 ",
+      "will have little effect and severity will be driven almost entirely by ",
+      "species bark thickness."),
+      100 * span_ratio, pred_q[1], pred_q[3], obs_q[1], obs_q[3]))
+
+  # ---------------------------------------------------------------------------
+  # Diagnostic D — sign guard
+  #
+  # Inverse link: eta = 1/mu, so anything that INCREASES severity must carry a
+  # NEGATIVE coefficient, and B0 must be positive (B0 = 3e-3 -> baseline ~333).
+  # ---------------------------------------------------------------------------
+  b0 <- coef_df$estimate[coef_df$term == "(Intercept)"]
+  sign_warnings <- character(0)
+  if (length(b0) == 1 && b0 <= 0)
+    sign_warnings <- c(sign_warnings, sprintf(
+      "SiteMortalityB0 = %.3e is not positive; SCF needs a positive intercept (1/B0 is baseline dNBR).", b0))
+
+  expect_negative <- c(EWS_kmh = "SiteMortalityB3", FineFuels = "SiteMortalityB5",
+                       LadderFuels = "SiteMortalityB6")
+  for (v in names(expect_negative)) {
+    if (!v %in% available_preds) next
+    est <- coef_df$estimate[coef_df$term == v]
+    if (length(est) == 1 && est > 0)
+      sign_warnings <- c(sign_warnings, sprintf(
+        "%s (%s) = %+.3e is positive, implying MORE %s gives LESS severity. Under the inverse link this term should normally be negative.",
+        expect_negative[[v]], v, est, v))
+  }
+  if (length(sign_warnings) > 0)
+    warning(paste(c("Site mortality sign check:", sign_warnings), collapse = "\n  - "))
+
   list(
     model             = fit,
     coef_df           = coef_df,
@@ -1198,7 +1513,15 @@ fit_site_mortality <- function(pixel_df) {
     residual_deviance = fit$deviance,
     n                 = nrow(dat),
     link              = fit$family$link,
-    available_preds   = available_preds
+    available_preds   = available_preds,
+    dropped_preds     = dropped,
+    pct_clamped       = pct_clamp,
+    obs_dnbr_q        = obs_q,
+    pred_dnbr_q       = pred_q,
+    span_ratio        = span_ratio,
+    sign_warnings     = sign_warnings,
+    ews_wind_basis    = if (is.null(attr(pixel_df, "ews_wind_basis")))
+                          NA_character_ else attr(pixel_df, "ews_wind_basis")
   )
 }
 
@@ -1308,19 +1631,47 @@ plot_site_mortality_coef <- function(site_fit) {
 # Returns: character string (multi-line)
 # -----------------------------------------------------------------------------
 
-write_mortality_snippet <- function(site_fit, cohort_fit = NULL) {
+write_mortality_snippet <- function(site_fit, cohort_fit = NULL,
+                                    et_r = NULL, cwd_r = NULL,
+                                    max_fine_fuels   = NULL,
+                                    ladder_max_age   = NULL,
+                                    ladder_species   = NULL,
+                                    ladder_ceiling_m = NULL) {
 
-  now   <- format(Sys.time(), "%Y-%m-%d %H:%M")
+  now <- format(Sys.time(), "%Y-%m-%d %H:%M")
+
+  fmt_par <- function(name, value, note) {
+    sprintf("%-30s  %+.8f  %s", paste0(name, " ="), value, note)
+  }
+
   lines <- c(
     "# =============================================================================",
-    paste0("# SCF Mortality Parameters — generated ", now),
+    paste0("# SCF Mortality Parameters - generated ", now),
     "# =============================================================================",
-    "",
+    "#",
+    "# SITE MORTALITY (Equation 7, FireEvent.cs:363-379)",
+    "#   eta  = B0 + B1*Clay + B2*PET + B3*EWS + B4*CWD + B5*FineFuels + B6*LadderFuels",
+    "#   dNBR = max(eta, 0.0005) ^ -1        <- Gamma inverse link",
+    "#",
+    "#   The max(eta, 0.0005) floor is a CLIFF, not a soft bound: any cell whose",
+    "#   linear predictor reaches zero is assigned the maximum dNBR of 2000.",
+    "#   Because of the inverse link, SIGNS ARE INVERTED - a variable that",
+    "#   increases severity carries a NEGATIVE coefficient, and B0 must be",
+    "#   positive (1/B0 is the baseline dNBR).",
+    "#",
+    "# COHORT MORTALITY (Equations 8-9, FireEvent.cs:448-450)",
+    "#   P = exp(B0 + B1*BarkThickness + B2*SiteMortality);  p = P/(1+P)",
+    "#   One Bernoulli draw per cohort; a kill removes the ENTIRE cohort biomass.",
+    "#   BarkThickness is SINGLE-SIDED cm (Cansler/FOFEM BT_coef x DBH).",
+    "# =============================================================================",
+    ""
+  )
+
+  # ---- Site mortality --------------------------------------------------------
+  lines <- c(lines,
     "# ---------------------------------------------------------------------------",
-    "# Site Mortality (Eq. 7)",
-    "#   dNBR = 1 / (B0 + B1*Clay + B2*ET + B3*EWS + B4*CWD + B5*FineFuels + B6*LadderFuels)",
-    "#   Model: Gamma GLM with inverse link",
-    paste0("#   Link used: ", site_fit$link),
+    "# Site Mortality",
+    paste0("#   Model: Gamma GLM, link = ", site_fit$link),
     paste0("#   N pixels: ", scales::comma(site_fit$n)),
     paste0("#   Predictors fitted: ", paste(site_fit$available_preds, collapse = ", ")),
     sprintf("#   Residual deviance: %.4f  (null: %.4f)",
@@ -1329,54 +1680,154 @@ write_mortality_snippet <- function(site_fit, cohort_fit = NULL) {
     ""
   )
 
+  if (!is.null(site_fit$dropped_preds) && length(site_fit$dropped_preds) > 0)
+    lines <- c(lines,
+      paste0("# NOT FITTED (no data or no variance), written as 0.0: ",
+             paste(site_fit$dropped_preds, collapse = ", ")),
+      "")
+
   for (i in seq_len(nrow(site_fit$coef_df))) {
     row <- site_fit$coef_df[i, ]
     unit_note <- switch(row$term,
-      "(Intercept)" = "# intercept",
-      "Clay"        = "# clay fraction 0-1",
-      "ET_mm"       = "# potential ET mm/yr (previous water year; SCF PotentialEvapotranspiration)",
-      "EWS_kmh"     = "# effective wind speed km/h (Nelson 2002; SCF User Guide §2.51: climate library uses km/h)",
-      "CWD_mm"      = "# climatic water deficit mm/yr (previous water year)",
-      "FineFuels"   = "# fine fuel index 0-1 (LANDFIRE FBFM40)",
-      "LadderFuels" = "# ladder fuel index 0-1 (1 / (CBH_m + 0.5), normalized)",
+      "(Intercept)" = sprintf("# intercept -> baseline dNBR = %.0f",
+                              if (row$estimate > 0) 1 / row$estimate else NA_real_),
+      "Clay"        = "# clay FRACTION 0-1 (SCF User Guide 2.18: ClayMap values 0-1)",
+      "ET_mm"       = "# previous-year POTENTIAL ET, mm/yr (SCF Succession.PET)",
+      "EWS_kmh"     = "# effective wind speed km/h (Nelson 2002, Cb=10)",
+      "CWD_mm"      = "# previous-year climatic water deficit, mm/yr (SCF Succession.CWD)",
+      "FineFuels"   = "# fine fuel fraction 0-1 -- SEE MaximumFineFuels NOTE BELOW",
+      "LadderFuels" = "# ladder fuel BIOMASS, g m-2 (SCF sums raw cohort biomass)",
       ""
     )
-    # Mark zero-padded (not fitted) parameters clearly
-    if (!isTRUE(row$fitted) && row$term != "(Intercept)") {
-      unit_note <- paste(unit_note, "  [not fitted — set to 0]")
-    }
-    lines <- c(lines,
-               sprintf("%-30s  %+.8f  %s",
-                       paste0(row$scf_parameter, " ="),
-                       row$estimate,
-                       unit_note))
+    if (!isTRUE(row$fitted) && row$term != "(Intercept)")
+      unit_note <- paste(unit_note, "  [not fitted - set to 0]")
+    lines <- c(lines, fmt_par(row$scf_parameter, row$estimate, unit_note))
   }
 
+  # ---- Companion parameters that change what the B's mean --------------------
+  lines <- c(lines, "",
+    "# ---------------------------------------------------------------------------",
+    "# COMPANION PARAMETERS - these change the meaning of the coefficients above",
+    "# ---------------------------------------------------------------------------")
+
+  lines <- c(lines, "",
+    "# MaximumFineFuels rescales the fine fuel term in BOTH Equation 5 (spread)",
+    "# and Equation 7 (severity) -- User Guide 2.28. SCF computes",
+    "#     fineFuelPercent = min(SiteVars.FineFuels / MaximumFineFuels, 1.0)",
+    "# Calibration normalised FBFM40 by 9.0 t/ac (GR9 max), so MaximumFineFuels",
+    "# must be set to a comparable load or SiteMortalityB5 (and SpreadProbabilityB2)",
+    "# are on the wrong scale.")
+  lines <- c(lines,
+    if (!is.null(max_fine_fuels) && is.finite(max_fine_fuels))
+      sprintf("%-30s  %.2f", "MaximumFineFuels =", max_fine_fuels)
+    else
+      "# MaximumFineFuels           <SET THIS>   # ~900-1000 g m-2 to match the 9 t/ac normalisation")
+
+  # TimeZero fallbacks
+  lines <- c(lines, "",
+    "# SCF falls back to these at year 0, before NECN has produced PET/CWD",
+    "# (FireEvent.cs:344-360). Leaving them at 0.0 drops two terms from Eq. 7 in",
+    "# the first simulated fire year, which -- with negative B2/B4 -- lowers eta",
+    "# and therefore RAISES first-year severity.")
+
+  mean_of <- function(r) {
+    if (is.null(r)) return(NA_real_)
+    v <- try(terra::values(r, mat = FALSE), silent = TRUE)
+    if (inherits(v, "try-error")) return(NA_real_)
+    v <- v[is.finite(v)]
+    if (length(v) == 0) NA_real_ else mean(v)
+  }
+  tz_pet <- mean_of(et_r)
+  tz_cwd <- mean_of(cwd_r)
+  if (!is.finite(tz_pet) && "ET_mm"  %in% names(site_fit$data)) tz_pet <- mean(site_fit$data$ET_mm,  na.rm = TRUE)
+  if (!is.finite(tz_cwd) && "CWD_mm" %in% names(site_fit$data)) tz_cwd <- mean(site_fit$data$CWD_mm, na.rm = TRUE)
+
+  lines <- c(lines,
+    if (is.finite(tz_pet)) sprintf("%-30s  %.2f   # landscape mean PET, mm/yr", "TimeZeroPET =", tz_pet)
+    else "# TimeZeroPET                <SET THIS>   # landscape mean PET, mm/yr",
+    if (is.finite(tz_cwd)) sprintf("%-30s  %.2f   # landscape mean CWD, mm/yr", "TimeZeroCWD =", tz_cwd)
+    else "# TimeZeroCWD                <SET THIS>   # landscape mean CWD, mm/yr")
+
+  # Ladder fuel definition
+  b6 <- site_fit$coef_df$estimate[site_fit$coef_df$scf_parameter == "SiteMortalityB6"]
+  lines <- c(lines, "",
+    "# LadderFuelMaxAge / LadderFuelSpeciesList define the biomass SCF sums into",
+    "# the B6 term. They MUST match the stratum B6 was calibrated on.")
+  if (!is.null(ladder_ceiling_m) && is.finite(ladder_ceiling_m))
+    lines <- c(lines, sprintf(
+      "# Calibrated against LANDFIRE canopy biomass below %.1f m, in g m-2.",
+      ladder_ceiling_m))
+  if (length(b6) == 1 && b6 == 0) {
+    lines <- c(lines,
+      "# SiteMortalityB6 is 0.0, so the ladder fuel term is inactive. The two",
+      "# parameters below are still required by the parser.")
+  }
+  lines <- c(lines,
+    if (!is.null(ladder_max_age) && is.finite(ladder_max_age))
+      sprintf("%-30s  %d", "LadderFuelMaxAge =", as.integer(ladder_max_age))
+    else "# LadderFuelMaxAge           <SET THIS>   # age below which a cohort is ladder fuel",
+    if (!is.null(ladder_species) && length(ladder_species) > 0)
+      paste0("LadderFuelSpeciesList  ", paste(ladder_species, collapse = "  "))
+    else "# LadderFuelSpeciesList      <SET THIS>   # species codes acting as ladder fuel")
+
+  # ---- Diagnostics -----------------------------------------------------------
+  lines <- c(lines, "",
+    "# ---------------------------------------------------------------------------",
+    "# Diagnostics",
+    "# ---------------------------------------------------------------------------")
+
+  if (!is.null(site_fit$pct_clamped))
+    lines <- c(lines, sprintf(
+      "#   Clamp exposure: %.2f%% of calibration pixels have eta <= 0.0005 (SCF would give them dNBR 2000)",
+      site_fit$pct_clamped))
+  if (!is.null(site_fit$obs_dnbr_q) && !is.null(site_fit$pred_dnbr_q))
+    lines <- c(lines,
+      sprintf("#   Observed dNBR  5/50/95: %.0f / %.0f / %.0f",
+              site_fit$obs_dnbr_q[1], site_fit$obs_dnbr_q[2], site_fit$obs_dnbr_q[3]),
+      sprintf("#   Predicted dNBR 5/50/95: %.0f / %.0f / %.0f  (span ratio %.2f)",
+              site_fit$pred_dnbr_q[1], site_fit$pred_dnbr_q[2], site_fit$pred_dnbr_q[3],
+              site_fit$span_ratio),
+      "#   A low span ratio means SCF feeds a near-constant SiteMortality into",
+      "#   cohort mortality, leaving CohortMortalityB2 with little to act on.")
+  if (!is.null(site_fit$ews_wind_basis) && !is.na(site_fit$ews_wind_basis))
+    lines <- c(lines, sprintf("#   EWS wind basis: %s (SCF uses day-of-burn wind)",
+                              site_fit$ews_wind_basis))
+  if (!is.null(site_fit$sign_warnings) && length(site_fit$sign_warnings) > 0)
+    lines <- c(lines, "#   SIGN WARNINGS:",
+               paste0("#     - ", site_fit$sign_warnings))
+
+  # ---- Cohort mortality ------------------------------------------------------
   if (!is.null(cohort_fit)) {
-    lines <- c(
-      lines, "",
+    lines <- c(lines, "",
       "# ---------------------------------------------------------------------------",
-      "# Cohort Mortality (Eq. 8/9)",
-      "#   P(mortality) = exp(P)/(1+P)  where P = B0 + B1*BarkThickness + B2*dNBR",
-      "#   Model: Binomial GLM with logit link",
-      paste0("#   N trees: ", scales::comma(cohort_fit$n)),
+      "# Cohort Mortality (Equations 8-9)",
+      "#   P(mortality) = P/(1+P),  P = exp(B0 + B1*BarkThickness + B2*SiteMortality)",
+      "#   Model: Binomial GLM, logit link",
+      paste0("#   N trees: ", scales::comma(cohort_fit$n),
+             if (!is.null(cohort_fit$n_fires))
+               paste0(" across ", cohort_fit$n_fires, " fires") else ""),
+      paste0("#   SEs: ", if (isTRUE(cohort_fit$cluster_robust))
+                            "cluster-robust by fire" else
+                            "NAIVE - p-values are anticonservative"),
       "# ---------------------------------------------------------------------------",
       ""
     )
     for (i in seq_len(nrow(cohort_fit$coef_df))) {
       row <- cohort_fit$coef_df[i, ]
       unit_note <- switch(row$term,
-        "(Intercept)"  = "# intercept",
-        "BarkThickness" = "# bark thickness cm (from species table)",
-        "dNBR"         = "# site dNBR (from MTBS)",
+        "(Intercept)"   = "# intercept",
+        "BarkThickness" = "# SINGLE-SIDED bark thickness, cm -- must match Species_CSV_File MaximumBarkThickness",
+        "dNBR"          = "# site-level dNBR 0-2000 (SCF passes its own predicted dNBR here)",
         ""
       )
-      lines <- c(lines,
-                 sprintf("%-30s  %+.8f  %s",
-                         paste0(row$scf_parameter, " ="),
-                         row$estimate,
-                         unit_note))
+      lines <- c(lines, fmt_par(row$scf_parameter, row$estimate, unit_note))
     }
+    if (!is.null(cohort_fit$n_dnbr_levels))
+      lines <- c(lines, "",
+        sprintf("#   Distinct dNBR values available to B2: %d", cohort_fit$n_dnbr_levels))
+    if (!is.null(cohort_fit$sign_warnings) && length(cohort_fit$sign_warnings) > 0)
+      lines <- c(lines, "#   SIGN WARNINGS:",
+                 paste0("#     - ", cohort_fit$sign_warnings))
   }
 
   paste(lines, collapse = "\n")
@@ -1716,8 +2167,9 @@ load_ftm_cohort_data <- function(ftm_dir, cal_vect, working_crs,
 # plot_yr1status_distribution
 #
 # Purpose: Bar chart of raw yr1status values from FTM trees in the calibration
-#   area. This is the most diagnostic figure: if yr1status=2 (confirmed dead)
-#   is absent, cohort mortality cannot be estimated.
+#   area. This is the most diagnostic figure: FTM codes yr1status as
+#   0 = alive, 1 = dead, NA = not assessed (RDS-2020-0001-2). Both 0 and 1 must
+#   be present or the binomial GLM cannot be fitted.
 #
 # Args:
 #   yr1status_counts — tibble(yr1status, n) from load_ftm_cohort_data()$yr1status_counts
@@ -1947,6 +2399,60 @@ plot_mortality_by_severity <- function(tree_df) {
 #               null_deviance, residual_deviance)
 # -----------------------------------------------------------------------------
 
+# -----------------------------------------------------------------------------
+# cluster_robust_vcov
+#
+# Cluster-robust (CR0 / Liang-Zeger) covariance matrix for a fitted glm, with the
+# usual finite-sample correction.  Implemented directly so the app does not need
+# the 'sandwich' package; it reproduces sandwich::vcovCL(type = "HC0",
+# cadjust = TRUE) to numerical precision.
+#
+#   V = B * ( G/(G-1) * (N-1)/(N-K) * SUM_g s_g s_g' ) * B
+#
+# where B = vcov(fit) is the model "bread", and s_g is the sum of the score
+# (estimating-function) contributions within cluster g.  For a GLM the score
+# contribution of observation i is x_i * (y_i - mu_i) * w_i / dispersion.
+#
+# Args:
+#   fit      a glm object
+#   cluster  vector of cluster ids, length = nobs(fit)
+# Returns: covariance matrix with the same dim/names as vcov(fit)
+# -----------------------------------------------------------------------------
+cluster_robust_vcov <- function(fit, cluster) {
+
+  X <- stats::model.matrix(fit)
+  if (length(cluster) != nrow(X))
+    stop(sprintf("cluster length (%d) does not match model rows (%d). ",
+                 length(cluster), nrow(X)),
+         "This usually means rows were dropped by na.action after the cluster ",
+         "vector was built.")
+
+  # Score / estimating-function contributions, one row per observation
+  r  <- stats::residuals(fit, type = "response")
+  w  <- stats::weights(fit, type = "prior")
+  if (is.null(w)) w <- rep(1, nrow(X))
+  disp <- summary(fit)$dispersion
+  if (!is.finite(disp) || disp <= 0) disp <- 1
+  ef <- X * as.numeric(r * w) / disp
+
+  # Sum contributions within each cluster
+  cl  <- factor(cluster)
+  s_g <- rowsum(ef, group = cl, reorder = FALSE)
+
+  G <- nlevels(cl)
+  N <- nrow(X)
+  K <- ncol(X)
+  adj <- (G / (G - 1)) * ((N - 1) / (N - K))
+
+  bread <- stats::vcov(fit)
+  meat  <- crossprod(s_g) * adj
+  V     <- bread %*% meat %*% bread
+
+  dimnames(V) <- dimnames(bread)
+  V
+}
+
+
 fit_cohort_mortality <- function(tree_df) {
 
   dat <- tree_df %>%
@@ -1975,7 +2481,52 @@ fit_cohort_mortality <- function(tree_df) {
     }
   )
 
+  # ---------------------------------------------------------------------------
+  # CLUSTER-ROBUST STANDARD ERRORS
+  #
+  # FTM publishes fire-level coordinates only, so every tree in a fire carries
+  # the SAME dNBR (see load_ftm_cohort_data - one median per fire).  Thousands of
+  # rows therefore share one value of the key predictor.  Treating them as
+  # independent makes the naive SE on CohortMortalityB2 far too small and its
+  # p-value look decisive no matter how weak the evidence.  Cluster by fire.
+  #
+  # This affects INFERENCE only - the point estimates SCF consumes are unchanged.
+  # ---------------------------------------------------------------------------
+  n_clusters <- length(unique(dat$YrFireName))
+  cluster_ok <- FALSE
+
   tidy_fit <- broom::tidy(fit)
+
+  if (n_clusters > 1) {
+    vc <- tryCatch(
+      cluster_robust_vcov(fit, cluster = dat$YrFireName),
+      error = function(e) { message("cluster_robust_vcov failed: ", conditionMessage(e)); NULL }
+    )
+    if (!is.null(vc)) {
+      se_cl <- sqrt(diag(vc))
+      est   <- coef(fit)
+      keep  <- intersect(names(est), names(se_cl))
+      z     <- est[keep] / se_cl[keep]
+      tidy_fit <- tibble(
+        term      = keep,
+        estimate  = as.numeric(est[keep]),
+        std.error = as.numeric(se_cl[keep]),
+        p.value   = 2 * pnorm(abs(as.numeric(z)), lower.tail = FALSE)
+      )
+      cluster_ok <- TRUE
+      message(sprintf(
+        "fit_cohort_mortality: cluster-robust SEs over %d fires (naive SEs would be ~%.1fx smaller)",
+        n_clusters,
+        mean(sqrt(diag(vcov(fit)))[keep] / se_cl[keep], na.rm = TRUE)))
+    }
+  }
+
+  if (!cluster_ok) {
+    warning(sprintf(paste0(
+      "Cohort mortality SEs are NAIVE (independent-observation). Every tree in a ",
+      "fire shares one dNBR value, so across %d fires the reported p-values are ",
+      "anticonservative - do not read them as evidence for B2."), n_clusters))
+  }
 
   coef_df <- tidy_fit %>%
     rename(std_error = std.error, p_value = p.value) %>%
@@ -1995,6 +2546,29 @@ fit_cohort_mortality <- function(tree_df) {
     coef(fit)["dNBR"]
   ))
 
+  # ---- Sign guard ------------------------------------------------------------
+  # Logit link: thicker bark must REDUCE mortality (B1 < 0) and higher site
+  # severity must RAISE it (B2 > 0).
+  b1 <- coef(fit)[["BarkThickness"]]
+  b2 <- coef(fit)[["dNBR"]]
+  sign_warnings <- character(0)
+  if (is.finite(b1) && b1 >= 0)
+    sign_warnings <- c(sign_warnings, sprintf(
+      "CohortMortalityB1 = %+.4f is not negative - implies thicker bark increases mortality.", b1))
+  if (is.finite(b2) && b2 <= 0)
+    sign_warnings <- c(sign_warnings, sprintf(
+      "CohortMortalityB2 = %+.5f is not positive - implies higher site severity reduces mortality.", b2))
+  if (length(sign_warnings) > 0)
+    warning(paste(c("Cohort mortality sign check:", sign_warnings), collapse = "\n  - "))
+
+  # How much distinct severity information actually exists
+  n_dnbr_levels <- length(unique(dat$dNBR))
+  if (n_dnbr_levels < 5)
+    warning(sprintf(paste0(
+      "Only %d distinct dNBR values across %d fires. CohortMortalityB2 is being ",
+      "estimated from almost no severity contrast and should be treated as ",
+      "indicative only."), n_dnbr_levels, n_clusters))
+
   list(
     model             = fit,
     coef_df           = coef_df,
@@ -2002,6 +2576,10 @@ fit_cohort_mortality <- function(tree_df) {
     n                 = nrow(dat),
     n_dead            = sum(dat$dead),
     n_alive           = sum(dat$dead == 0),
+    n_fires           = n_clusters,
+    n_dnbr_levels     = n_dnbr_levels,
+    cluster_robust    = cluster_ok,
+    sign_warnings     = sign_warnings,
     null_deviance     = fit$null.deviance,
     residual_deviance = fit$deviance
   )

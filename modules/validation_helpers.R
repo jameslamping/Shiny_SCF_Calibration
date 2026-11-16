@@ -646,6 +646,270 @@ plot_val_fire_climate <- function(fpa_df, sim_events_df,
 
 
 # -----------------------------------------------------------------------------
+# add_obs_ews
+#
+# Attaches effective wind speed (km/h) to an observed fire table that carries
+# projected coordinates (x, y in working_crs) and a discovery date — i.e. the
+# output of load_fpa_fod().
+#
+# Mirrors add_mtbs_climate() but works off the projected x/y columns FPA FOD
+# already provides, so no re-projection round-trip is needed.  Terrain is
+# sampled at the ignition point and combined with the spatially-averaged daily
+# wind via the same Nelson (2002) formula SCF uses internally
+# (compute_effective_wind, spread_helpers.R).
+#
+# Arguments:
+#   obs_df               tibble with x, y (working CRS) and date columns
+#   wind_daily           tibble(date, WindSpeed_kmh, WindDir_deg)
+#   slope_r / aspect_r   terra SpatRasters in working CRS (from fetch_terrain)
+#   combustion_buoyancy  Cb; 10 = low intensity, the calibration default
+#
+# Returns obs_df with an EWS_obs column (NA where the date falls outside the
+# wind series).  Falls back to raw wind speed when terrain is unavailable.
+# -----------------------------------------------------------------------------
+
+add_obs_ews <- function(obs_df, wind_daily,
+                         slope_r = NULL, aspect_r = NULL,
+                         combustion_buoyancy = 10) {
+
+  if (is.null(obs_df) || nrow(obs_df) == 0) return(obs_df)
+  out <- obs_df
+  out$EWS_obs <- NA_real_
+
+  if (is.null(wind_daily) || !all(c("date", "WindSpeed_kmh") %in% names(wind_daily)) ||
+      !"date" %in% names(out)) return(out)
+
+  widx <- match(as.Date(out$date), as.Date(wind_daily$date))
+  ws   <- wind_daily$WindSpeed_kmh[widx]
+  wd   <- if ("WindDir_deg" %in% names(wind_daily))
+            wind_daily$WindDir_deg[widx] else rep(NA_real_, nrow(out))
+
+  slope_deg  <- rep(NA_real_, nrow(out))
+  aspect_deg <- rep(NA_real_, nrow(out))
+
+  if (all(c("x", "y") %in% names(out)) &&
+      !is.null(slope_r) && !is.null(aspect_r)) {
+    ok <- is.finite(out$x) & is.finite(out$y)
+    if (any(ok)) {
+      pts <- tryCatch(
+        terra::vect(data.frame(x = out$x[ok], y = out$y[ok]),
+                    geom = c("x", "y"), crs = terra::crs(slope_r)),
+        error = function(e) NULL)
+      if (!is.null(pts)) {
+        sv <- tryCatch(terra::extract(slope_r,  pts)[, 2], error = function(e) NULL)
+        av <- tryCatch(terra::extract(aspect_r, pts)[, 2], error = function(e) NULL)
+        if (!is.null(sv)) slope_deg[ok]  <- as.numeric(sv)
+        if (!is.null(av)) aspect_deg[ok] <- as.numeric(av)
+      }
+    }
+  }
+
+  ews <- tryCatch(
+    compute_effective_wind(wind_speed = ws, wind_dir = wd,
+                           slope_deg = slope_deg, aspect_deg = aspect_deg,
+                           combustion_buoyancy = combustion_buoyancy),
+    error = function(e) ws)          # fall back to raw wind if terrain missing
+
+  # Keep NA where there was no wind record at all, so those fires drop out of
+  # the binning rather than piling into the lowest bin at EWS = 0.
+  ews[!is.finite(ws)] <- NA_real_
+  out$EWS_obs <- ews
+  out
+}
+
+
+# -----------------------------------------------------------------------------
+# plot_val_fire_ews
+#
+# Companion to plot_val_fire_climate(): median fire size (IQR bar) per
+# EFFECTIVE WIND SPEED bin, observed vs simulated.
+#
+# WHY A SECOND PANEL: SCF's spread probability (FireEvent.cs::CanSpread) is
+#   P = logit^-1(B0 + B1*FWI + B2*FineFuels + B3*EWS)
+# so EWS is an independent lever on how fast fires grow — and the ONLY weather
+# term besides FWI in both the spread and max-daily-area equations
+#   MaxSpreadArea = B0 + B1*FWI + B2*EWS.
+# The FWI panel alone cannot tell you whether a size mismatch belongs to B1 or
+# B3 / MaximumSpreadAreaB2; reading the two panels together does.  A simulated
+# line that tracks observed against FWI but runs steep against EWS means the
+# wind coefficients are carrying too much of the spread signal.
+#
+# COMPARABILITY CAVEATS (stated in the caption, repeated here because they
+# change how the figure should be read):
+#   * Observed EWS is evaluated at the IGNITION POINT on the discovery date at
+#     the calibration Cb (default 10).  Simulated MeanEffectiveWindSpeed is the
+#     mean over every burned cell across the whole event.
+#   * SCF escalates Cb to 25 (Intensity > 3) and 50 (> 6) internally.  EWS is
+#     not capped at Cb, so a high simulated value is not proof of escalation —
+#     but escalation is the usual cause, and an observed series computed at one
+#     fixed Cb has no counterpart for it.  The subtitle reports the share of
+#     simulated events falling outside the observed EWS range; treat those bins
+#     as not like-for-like.
+#
+# Arguments mirror plot_val_fire_climate(), with wind + terrain replacing the
+# FWI series.
+# -----------------------------------------------------------------------------
+
+plot_val_fire_ews <- function(fpa_df, sim_events_df,
+                               wind_daily   = NULL,
+                               slope_r      = NULL,
+                               aspect_r     = NULL,
+                               combustion_buoyancy = 10,
+                               min_ha       = 4,
+                               ews_breaks   = c(0, 4, 6, 8, 10, 12, 15, 20, 25, Inf),
+                               plot_title   = "Fire Size \u2013 Effective Wind Relationship") {
+
+  if (is.null(sim_events_df)) return(NULL)
+
+  LBL_OBS <- "Observed \u2014 FPA FOD"
+  LBL_SIM <- "Simulated \u2014 SCF"
+
+  ews_labs <- paste0(
+    ews_breaks[-length(ews_breaks)], "\u2013",
+    ifelse(is.finite(ews_breaks[-1]), as.character(ews_breaks[-1]), "+"))
+
+  .bin_ews <- function(df, ews_col, size_col, source_label) {
+    df %>%
+      mutate(
+        size_ha = .data[[size_col]],
+        ews_bin = cut(.data[[ews_col]], breaks = ews_breaks, labels = ews_labs,
+                      right = FALSE, include.lowest = TRUE)
+      ) %>%
+      filter(!is.na(ews_bin), is.finite(size_ha)) %>%
+      group_by(ews_bin) %>%
+      summarise(
+        median_size = median(size_ha, na.rm = TRUE),
+        q25         = quantile(size_ha, 0.25, na.rm = TRUE),
+        q75         = quantile(size_ha, 0.75, na.rm = TRUE),
+        n           = n(),
+        .groups     = "drop"
+      ) %>%
+      filter(n >= 3) %>%
+      mutate(source = source_label)
+  }
+
+  # ---- Observed ---------------------------------------------------------------
+  obs_binned <- NULL
+  obs_ews    <- numeric(0)
+  if (!is.null(fpa_df) && "FIRE_SIZE_HA" %in% names(fpa_df)) {
+    obs_raw <- fpa_df
+    if (!"EWS_obs" %in% names(obs_raw)) {
+      obs_raw <- tryCatch(
+        add_obs_ews(obs_raw, wind_daily, slope_r, aspect_r, combustion_buoyancy),
+        error = function(e) obs_raw)
+    }
+    if ("EWS_obs" %in% names(obs_raw)) {
+      obs_raw <- obs_raw %>%
+        filter(is.finite(FIRE_SIZE_HA), FIRE_SIZE_HA >= min_ha,
+               is.finite(EWS_obs))
+      if (nrow(obs_raw) > 0) {
+        obs_ews    <- obs_raw$EWS_obs
+        obs_binned <- .bin_ews(obs_raw, "EWS_obs", "FIRE_SIZE_HA", LBL_OBS)
+      }
+    }
+  }
+
+  # ---- Simulated --------------------------------------------------------------
+  sim_binned <- NULL
+  sim_ews    <- numeric(0)
+  if (all(c("fire_size_ha", "EWS_event") %in% names(sim_events_df))) {
+    sim_raw <- sim_events_df %>%
+      filter(is.finite(fire_size_ha), fire_size_ha >= min_ha,
+             is.finite(EWS_event))
+    if (nrow(sim_raw) > 0) {
+      sim_ews    <- sim_raw$EWS_event
+      sim_binned <- .bin_ews(sim_raw, "EWS_event", "fire_size_ha", LBL_SIM)
+    }
+  }
+
+  if (is.null(obs_binned) && is.null(sim_binned)) {
+    return(ggplot() +
+             annotate("text", x = 0.5, y = 0.5, size = 4.5, hjust = 0.5,
+                      label = paste0(
+                        "No effective wind speed data available.\n",
+                        "Observed EWS needs ERA5 wind + terrain (run Spread Calibration);\n",
+                        "simulated EWS needs a MeanEffectiveWindSpeed column in the events log.")) +
+             labs(title = plot_title) +
+             theme_void() +
+             theme(plot.title = element_text(size = 13, face = "bold")))
+  }
+
+  plot_df <- bind_rows(obs_binned, sim_binned) %>%
+    mutate(source = factor(source, levels = c(LBL_OBS, LBL_SIM)))
+
+  # ---- Distribution summary so the two EWS axes can be judged for overlap -----
+  .rng <- function(v, lab) {
+    if (length(v) == 0) return(NULL)
+    sprintf("%s EWS: n=%s  median=%.1f  p90=%.1f  max=%.1f km/h",
+            lab, scales::comma(length(v)), median(v, na.rm = TRUE),
+            quantile(v, 0.90, na.rm = TRUE), max(v, na.rm = TRUE))
+  }
+  summ <- paste(Filter(Negate(is.null),
+                       list(.rng(obs_ews, LBL_OBS), .rng(sim_ews, LBL_SIM))),
+                collapse = "\n")
+
+  # Flag simulated events that sit outside the observed EWS range.  EWS is not
+  # capped at Cb (it tends to Ua as wind exceeds Cb), so a high value is not
+  # PROOF of escalation — but SCF stepping Cb to 25/50 for high-intensity fires
+  # is the usual cause, and those events have no counterpart in an observed
+  # series computed at a single fixed Cb.  Worded accordingly.
+  esc_note <- ""
+  if (length(sim_ews) > 0) {
+    thresh <- if (length(obs_ews) > 0) {
+      as.numeric(quantile(obs_ews, 0.99, na.rm = TRUE))
+    } else {
+      steps <- c(10, 25, 50)
+      steps <- steps[steps > combustion_buoyancy]
+      if (length(steps) > 0) steps[1] else Inf
+    }
+    n_esc <- sum(sim_ews > thresh, na.rm = TRUE)
+    if (is.finite(thresh) && n_esc > 0)
+      esc_note <- sprintf(
+        paste0("\n%s simulated events (%.0f%%) sit above %.0f km/h, outside the observed ",
+               "range \u2014 likely SCF\u2019s\nCb escalation to 25/50 at high intensity, ",
+               "which the observed series (fixed Cb=%.0f) cannot show."),
+        scales::comma(n_esc), 100 * n_esc / length(sim_ews), thresh,
+        combustion_buoyancy)
+  }
+
+  ggplot(plot_df,
+         aes(x = ews_bin, y = median_size, colour = source, group = source)) +
+    geom_linerange(aes(ymin = q25, ymax = q75), linewidth = 4.5, alpha = 0.25,
+                   position = position_dodge(width = 0.4)) +
+    geom_line(position = position_dodge(width = 0.4), linewidth = 0.9) +
+    geom_point(size = 3, position = position_dodge(width = 0.4)) +
+    geom_text(aes(y = q75, label = n), vjust = -0.7, size = 2.5,
+              position = position_dodge(width = 0.4), show.legend = FALSE) +
+    scale_colour_manual(values = setNames(c(.COL_OBS, .COL_SIM),
+                                          c(LBL_OBS, LBL_SIM)), drop = FALSE) +
+    scale_y_continuous(trans = "log10", labels = scales::label_comma()) +
+    labs(
+      title    = plot_title,
+      subtitle = paste0(
+        "Median fire size per EWS bin (IQR = thick bar); n above each point.  ",
+        "Bins with \u22653 fires only.\n", summ, esc_note),
+      x       = "Effective wind speed (km/h)",
+      y       = "Median fire size (ha, IQR bar)",
+      colour  = NULL,
+      caption = paste0(
+        sprintf(paste0(
+          "Observed EWS: ERA5 wind on the discovery date + terrain at the ignition\n",
+          "point, Nelson (2002) Eq. 5 at Cb=%.0f.\n"), combustion_buoyancy),
+        "Simulated EWS: MeanEffectiveWindSpeed per SCF event \u2014 a mean over all\n",
+        "burned cells; SCF raises Cb to 25/50 for high-intensity fires.\n",
+        "EWS drives SpreadProbabilityB3 and MaximumSpreadAreaB2 \u2014 read alongside\n",
+        "the FWI panel to tell which coefficient a size mismatch belongs to."
+      )
+    ) +
+    .pub_theme() +
+    theme(
+      axis.text.x     = element_text(angle = 30, hjust = 1),
+      legend.position = "bottom"
+    )
+}
+
+
+# -----------------------------------------------------------------------------
 # fetch_mtbs_fires
 #
 # Loads the MTBS burn severity fire occurrence point shapefile — either from
