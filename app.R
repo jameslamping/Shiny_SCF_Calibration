@@ -3047,6 +3047,53 @@ ui <- page_navbar(
               )
             )
           )
+
+          # ---- SpreadProbabilityB0 sweep ------------------------------------
+          ,nav_panel("B0 Sweep",
+            br(),
+            p(class = "text-muted small",
+              "Sets SpreadProbabilityB0 by simulation, which is the only way to ",
+              "set it: SCF spread is single-trial percolation and the regression ",
+              "intercept is biased by case-control sampling, so the fitted B0 is not ",
+              "usable as is. Each B0 runs the real-weather ensemble (same ignition ",
+              "days and random draws for every B0) and is scored against FPA FOD on ",
+              tags$b("fire size"), " (fires > 1 cell) and ", tags$b("annual area burned"),
+              " (SCF ignitions/yr on the landscape \u00d7 mean area per ignition vs ",
+              "the observed regional burn rate). All other coefficients come from the ",
+              "Parameters sidebar \u2014 click ", tags$b("\u2190 Load from Calibration"),
+              " first."),
+            fluidRow(
+              column(3,
+                numericInput("sweep_b0_min",  "B0 from",  value = -3,   step = 0.25),
+                numericInput("sweep_b0_max",  "B0 to",    value = 1.5,  step = 0.25),
+                numericInput("sweep_b0_step", "B0 step",  value = 0.25, min = 0.05, step = 0.05),
+                numericInput("sweep_nfires", "Fires per B0", value = 150, min = 30, max = 1000, step = 10),
+                radioButtons("sweep_wx_source", "Weather source",
+                             choices = c("Runtime: LANDIS climate file" = "runtime",
+                                         "Calibration: ERA/GRIDMET FWI + wind" = "calibration")),
+                numericInput("sweep_w_size", "Weight: fire size",   value = 0.5, min = 0, max = 1, step = 0.1),
+                numericInput("sweep_w_aab",  "Weight: annual area", value = 0.5, min = 0, max = 1, step = 0.1),
+                p(class = "text-muted small",
+                  "Stops once 3 B0 values in a row score worse than the best, then ",
+                  "refines around the best at step/4. FineFuels comes from the ",
+                  "Fire Size Distribution slider; grid from the LANDIS template."),
+                actionButton("run_b0_sweep", "Run B0 Sweep", class = "btn-success w-100",
+                             icon = icon("play")),
+                br(), br(),
+                uiOutput("sweep_status_ui"),
+                actionButton("sweep_use_best", "Use best B0 in Parameters",
+                             class = "btn-outline-primary btn-sm w-100", icon = icon("check")),
+                br(), br(),
+                downloadButton("dl_b0_sweep", "Download sweep table (.csv)",
+                               class = "btn-sm btn-outline-secondary w-100")
+              ),
+              column(9,
+                plotOutput("sweep_plot", height = "400px"),
+                plotOutput("sweep_best_plot", height = "380px"),
+                DTOutput("sweep_table")
+              )
+            )
+          )
         )
       )
     )
@@ -6792,8 +6839,9 @@ server <- function(input, output, session) {
     }
 
     # ---- SpreadProbability ---------------------------------------------------
-    if (!is.null(rv$spread_prob_fit)) {
-      cf <- rv$spread_prob_fit$coef
+    sp_cf <- if (!is.null(rv$spread_prob_fit)) rv$spread_prob_fit$coef else rv$spread_prob_coef
+    if (!is.null(sp_cf)) {
+      cf <- sp_cf
       updateNumericInput(session, "tune_sp_b0", value = round(get_est(cf, "B0"),  6))
       updateNumericInput(session, "tune_sp_b1", value = round(get_est(cf, "B1"),  6))
       updateNumericInput(session, "tune_sp_b2", value = round(get_est(cf, "B2"),  6))
@@ -7312,7 +7360,7 @@ server <- function(input, output, session) {
       annotate("text", x = c(p50, p75, p90) * 1.12,
                y    = c(0.50, 0.75, 0.90),
                label = sprintf(c("P50\n%.0f ha","P75\n%.0f ha","P90\n%.0f ha"),
-                               p50, p75, p90),
+                               c(p50, p75, p90)),
                hjust = 0, size = 3, colour = "#2171b5") +
       scale_x_log10(labels = scales::comma,
                     breaks = 10^(0:6)) +
@@ -7571,7 +7619,7 @@ server <- function(input, output, session) {
       cell_area_ha <- rv$cell_area_ha
     } else {
       grid_dim     <- max(50L, min(600L, as.integer(input$tune_ens_grid_dim %||% 200L)))
-      cell_area_ha <- p$cell_area
+      cell_area_ha <- rv$cell_area_ha %||% p$cell_area
     }
 
     # ---- Real daily weather ----------------------------------------------
@@ -7581,14 +7629,7 @@ server <- function(input, output, session) {
         showNotification(wx$note, type = "error", duration = 12)
         return()
       }
-      # Tuned ignition coefficients if the Ignition tuning panel is filled in,
-      # else the fitted ones; without either, ignition days are equally likely.
-      ign <- tryCatch(isolate(tune_ign_coef_r()), error = function(e) NULL)
-      ign_src <- "the Parameters sidebar ignition coefficients"
-      if (is.null(ign) || nrow(ign) == 0 || !all(is.finite(ign$b0))) {
-        ign <- rv$ign_coef; ign_src <- "fitted ignition model"
-      }
-      if (is.null(ign)) ign_src <- "none (equal weights)"
+      ig <- tuning_ign_coef(); ign <- ig$coef; ign_src <- ig$src
       n_fires <- max(20L, min(1000L, as.integer(input$tune_ens_nfires %||% 150L)))
 
       ens <- tryCatch(
@@ -7642,6 +7683,162 @@ server <- function(input, output, session) {
       ensemble_rv(ens)
     })
   })
+
+  # Ignition coefficients for the real-weather ensemble and the B0 sweep:
+  # the Parameters sidebar values if they are complete, else the fitted model;
+  # without either, ignition days are equally likely.  REGIONAL coefficients
+  # (the sweep applies the area offset itself where it needs counts).
+  tuning_ign_coef <- function() {
+    ign <- tryCatch(isolate(tune_ign_coef_r()), error = function(e) NULL)
+    if (!is.null(ign) && nrow(ign) > 0 && all(is.finite(ign$b0)))
+      return(list(coef = ign, src = "the Parameters sidebar ignition coefficients"))
+    if (!is.null(rv$ign_coef))
+      return(list(coef = rv$ign_coef, src = "fitted ignition model"))
+    list(coef = NULL, src = "none (equal weights)")
+  }
+
+  # ---------------------------------------------------------------------------
+  # SpreadProbabilityB0 sweep
+  # ---------------------------------------------------------------------------
+  sweep_rv <- reactiveVal(NULL)
+
+  observeEvent(input$run_b0_sweep, {
+    p <- isolate(tuning_r())
+    if (is.null(rv$ign_df)) {
+      showNotification("The B0 sweep needs observed fires: run Ignition Calibration (FPA FOD) first.",
+                       type = "error", duration = 10)
+      return()
+    }
+    b0_vals <- tryCatch(seq(input$sweep_b0_min, input$sweep_b0_max, by = input$sweep_b0_step),
+                        error = function(e) NULL)
+    if (length(b0_vals) < 2 || length(b0_vals) > 200) {
+      showNotification("Set a B0 range with 2 to 200 values (min < max, step > 0).",
+                       type = "error", duration = 10)
+      return()
+    }
+    wx <- ensemble_weather_table(input$sweep_wx_source %||% "runtime")
+    if (is.null(wx$df)) { showNotification(wx$note, type = "error", duration = 12); return() }
+    ig <- tuning_ign_coef()
+
+    if (!is.null(rv$template_r)) {
+      grid_dim     <- max(50L, min(800L, as.integer(max(nrow(rv$template_r), ncol(rv$template_r)))))
+      cell_area_ha <- rv$cell_area_ha
+    } else {
+      grid_dim     <- max(50L, min(600L, as.integer(input$tune_ens_grid_dim %||% 200L)))
+      cell_area_ha <- rv$cell_area_ha %||% p$cell_area
+    }
+
+    yrs  <- input$cal_years
+    obs_df <- dplyr::filter(rv$ign_df, FIRE_YEAR >= yrs[1], FIRE_YEAR <= yrs[2])
+    la   <- rv$landscape_areas
+    obs_rate <- if (!is.null(la))
+      .obs_fire_targets(rv$ign_df, yrs[1], yrs[2], la$cal_area_ha, cell_area_ha,
+                        la$tmpl_area_ha)$rate else NULL
+
+    sw <- tryCatch(
+      withProgress(message = "B0 sweep", value = 0, {
+        sweep_b0_weather(
+          b0_values    = b0_vals,
+          weather      = wx$df,
+          obs_sizes    = obs_df$FIRE_SIZE_HA,
+          obs_rate     = obs_rate,
+          ign_coef     = ig$coef,
+          area_ratio   = if (!is.null(la)) la$ratio else NULL,
+          tmpl_area_ha = if (!is.null(la)) la$tmpl_area_ha else NULL,
+          n_fires      = max(30L, min(1000L, as.integer(input$sweep_nfires %||% 150L))),
+          grid_dim     = grid_dim,
+          ff_val       = input$tune_ens_ff %||% 0.5,
+          msa_b0 = p$msa_b0, msa_b1 = p$msa_b1, msa_b2 = p$msa_b2,
+          sp_b1  = p$sp_b1,  sp_b2  = p$sp_b2,  sp_b3  = p$sp_b3,
+          cell_area_ha = cell_area_ha,
+          w_size = input$sweep_w_size %||% 0.5,
+          w_aab  = input$sweep_w_aab  %||% 0.5,
+          progress_fn = function(frac, detail) setProgress(frac, detail = detail))
+      }),
+      error = function(e) {
+        showNotification(paste("B0 sweep failed:", conditionMessage(e)),
+                         type = "error", duration = 12)
+        NULL
+      })
+    if (is.null(sw)) return()
+    sw$info$wx_label <- wx$label
+    sw$info$wx_note  <- wx$note
+    sw$info$ign_src  <- ig$src
+    sw$info$has_area <- !is.null(la)
+    sweep_rv(sw)
+  })
+
+  output$sweep_plot <- renderPlot({
+    sw <- sweep_rv(); req(sw)
+    plot_b0_sweep(sw)
+  })
+
+  output$sweep_best_plot <- renderPlot({
+    sw <- sweep_rv(); req(sw, is.finite(sw$best_b0))
+    ens <- sw$ensembles[[sprintf("%.4f", sw$best_b0)]]
+    yrs <- input$cal_years
+    obs <- rv$ign_df$FIRE_SIZE_HA[rv$ign_df$FIRE_YEAR >= yrs[1] & rv$ign_df$FIRE_YEAR <= yrs[2]]
+    plot_fire_ensemble_weather(ens, obs_sizes = obs)
+  })
+
+  output$sweep_table <- renderDT({
+    sw <- sweep_rv(); req(sw)
+    sw$table %>%
+      mutate(across(where(is.numeric), ~ signif(.x, 4))) %>%
+      datatable(options = list(pageLength = 10, scrollX = TRUE, order = list(list(0, "asc"))),
+                rownames = FALSE, class = "table-sm table-striped")
+  })
+
+  output$sweep_status_ui <- renderUI({
+    sw <- sweep_rv()
+    if (is.null(sw)) return(tags$p(class = "text-muted small", "Not run yet."))
+    info <- sw$info
+    best <- sw$table[which.min(sw$table$score_total), ]
+    tags$div(class = "alert alert-info p-2", style = "font-size:0.82rem;",
+      tags$b(sprintf("Best B0 = %.3f", sw$best_b0)),
+      sprintf("  (current %.3f)", isolate(input$tune_sp_b0) %||% NA_real_), tags$br(),
+      sprintf("Score %.2f: size %.2f, area %s", best$score_total, best$score_size,
+              if (is.finite(best$score_aab)) sprintf("%.2f", best$score_aab) else "n/a"), tags$br(),
+      sprintf("Size alone favours %.2f; area alone %s.", info$best_b0_size,
+              if (is.finite(info$best_b0_aab)) sprintf("%.2f", info$best_b0_aab) else "n/a"),
+      if (is.finite(info$best_b0_size) && is.finite(info$best_b0_aab) &&
+          abs(info$best_b0_size - info$best_b0_aab) > 0.5)
+        tagList(tags$br(), tags$b("They disagree by more than 0.5:"),
+                " fire sizes and burn rate cannot both be matched by B0 alone ",
+                "(check ignition counts, B1, MaxSpreadArea or fuels)."),
+      tags$br(),
+      sprintf("At best: %.0f%% never spread; median %s ha, P90 %s ha (observed %s / %s).",
+              best$pct_no_spread, scales::comma(round(best$median_ha, 1)),
+              scales::comma(round(best$p90_ha, 1)),
+              scales::comma(round(info$obs_median_ha, 1)), scales::comma(round(info$obs_p90_ha, 1))),
+      if (is.finite(best$sim_annual_pct) && !is.null(info$obs_rate))
+        tagList(tags$br(), sprintf("Area burned %.3f%%/yr vs observed %.3f%%/yr (%.1f ignitions/yr).",
+                                   best$sim_annual_pct, 100 * info$obs_rate, info$ign_per_yr)),
+      if (!isTRUE(info$has_area))
+        tagList(tags$br(), "No landscape areas loaded: scored on fire size only."),
+      tags$br(),
+      tags$span(class = "text-muted", sprintf("%s; ignitions from %s; %d fires per B0.",
+                                              info$wx_label, info$ign_src, info$n_fires)),
+      if (!is.null(info$wx_note)) tagList(tags$br(), tags$span(class = "text-muted", info$wx_note))
+    )
+  })
+
+  observeEvent(input$sweep_use_best, {
+    sw <- sweep_rv()
+    if (is.null(sw) || !is.finite(sw$best_b0)) {
+      showNotification("Run the B0 sweep first.", type = "warning"); return()
+    }
+    updateNumericInput(session, "tune_sp_b0", value = round(sw$best_b0, 4))
+    showNotification(sprintf("SpreadProbabilityB0 set to %.4f in Parameters.", sw$best_b0),
+                     type = "message")
+  })
+
+  output$dl_b0_sweep <- downloadHandler(
+    filename = function() sprintf("b0_sweep_%s.csv", format(Sys.time(), "%Y%m%d_%H%M%S")),
+    content  = function(f) {
+      sw <- sweep_rv(); req(sw)
+      write_csv(dplyr::mutate(sw$table, best_b0 = sw$best_b0), f)
+    })
 
   # Daily weather for the real-weather ensemble.  Returns list(df, label, note);
   # df = NULL (and note = the reason) when the chosen source is not loaded.

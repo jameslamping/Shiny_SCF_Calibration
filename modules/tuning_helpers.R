@@ -19,6 +19,8 @@
 #   plot_fire_timeline()     Area burned per day vs MaxSpreadArea
 #   run_fire_ensemble_weather() Fires on real daily weather, SCF-weighted ignition days
 #   plot_fire_ensemble_weather() Size CDF vs FPA FOD + size vs ignition FWI
+#   sweep_b0_weather()       SpreadProbabilityB0 by simulation (size + annual area)
+#   plot_b0_sweep()          Scores and fire sizes across the B0 sweep
 #   ign_tune_coef_df()       Hand-typed ignition coefficients -> coef tibble
 #   build_scf_tuning_snippet() SCF parameter file text from tuning inputs
 # =============================================================================
@@ -1252,6 +1254,208 @@ plot_fire_ensemble_weather <- function(ens, obs_sizes = NULL) {
 
   if (requireNamespace("patchwork", quietly = TRUE))
     patchwork::wrap_plots(pA, pB, ncol = 2)
+  else pA
+}
+
+
+# -----------------------------------------------------------------------------
+# sweep_b0_weather
+#
+# Sets SpreadProbabilityB0 the way CLAUDE.md says it has to be set: by
+# simulation, because the regression intercept is not identifiable (single-
+# trial percolation + case-control sampling).  For each candidate B0 the
+# real-weather ensemble (run_fire_ensemble_weather) is run with the SAME seed,
+# so every B0 sees the same ignition days and the same random draws (common
+# random numbers): score differences come from B0, not from noise.
+#
+# Scores (same scale as candidate scoring: mean |log ratio|, 0 = perfect,
+# 0.69 = off by a factor of two):
+#   score_size  fire-size distribution vs observed, both restricted to
+#               fires > 1 cell and <= the simulation grid area.
+#   score_aab   expected annual area burned as a fraction of the landscape,
+#               (SCF ignitions per year on the landscape) x (mean area per
+#               ignition), vs the observed regional fraction per year
+#               (obs_rate).  Ignitions per year use the ignition coefficients
+#               with the log(landscape / boundary) area offset applied
+#               (area_ratio = tmpl_area_ha / cal_area_ha), summed over days with
+#               known FWI and divided by the years in the record.
+#   score_total weighted mean of the available scores.
+#
+# Coarse pass over b0_values, stopping after `patience` consecutive values
+# worse than the best so far; then (refine = TRUE) a fine pass at step/4 within
+# one coarse step of the coarse best.  progress_fn(fraction, detail) is called
+# per fire within each B0 run.
+#
+# Returns list(table, ensembles (named by B0), best_b0, info).
+# -----------------------------------------------------------------------------
+
+sweep_b0_weather <- function(b0_values, weather,
+                             obs_sizes,
+                             obs_rate      = NULL,
+                             ign_coef      = NULL,
+                             area_ratio    = NULL,
+                             tmpl_area_ha  = NULL,
+                             n_fires       = 150L,
+                             grid_dim      = 200L,
+                             ff_val        = 0.5,
+                             msa_b0, msa_b1, msa_b2,
+                             sp_b1, sp_b2, sp_b3,
+                             cell_area_ha  = 0.09,
+                             w_size        = 0.5,
+                             w_aab         = 0.5,
+                             patience      = 3L,
+                             refine        = TRUE,
+                             seed          = 1L,
+                             progress_fn   = NULL) {
+
+  b0_values <- sort(unique(b0_values))
+  grid_ha   <- grid_dim^2 * cell_area_ha
+  obs_sz    <- obs_sizes[is.finite(obs_sizes) & obs_sizes > cell_area_ha &
+                         obs_sizes <= grid_ha]
+
+  # Expected SCF ignitions per year on the landscape
+  ign_per_yr <- NA_real_
+  if (!is.null(ign_coef) && nrow(ign_coef) > 0 && isTRUE(is.finite(area_ratio))) {
+    ign_land <- ign_coef
+    ign_land$b0 <- ign_land$b0 + log(area_ratio)
+    fwi_ok <- weather$FWI[is.finite(weather$FWI)]
+    n_yrs  <- length(unique(format(as.Date(weather$date[is.finite(weather$FWI)]), "%Y")))
+    ign_per_yr <- sum(ignition_day_weights(fwi_ok, ign_land)) / n_yrs
+  }
+
+  run_one <- function(b0, label) {
+    prog <- if (is.null(progress_fn)) NULL else
+      function(k, n) progress_fn(k / n, sprintf("%s: B0 = %.3f, fire %d of %d", label, b0, k, n))
+    ens <- run_fire_ensemble_weather(
+      weather = weather, ign_coef = ign_coef, n_fires = n_fires,
+      grid_dim = grid_dim, ff_val = ff_val,
+      msa_b0 = msa_b0, msa_b1 = msa_b1, msa_b2 = msa_b2,
+      sp_b0 = b0, sp_b1 = sp_b1, sp_b2 = sp_b2, sp_b3 = sp_b3,
+      cell_area_ha = cell_area_ha, seed = seed, progress_fn = prog)
+    ens_list[[sprintf("%.4f", b0)]] <<- ens
+
+    sim_sz   <- ens$fire_ha[ens$fire_ha > cell_area_ha]
+    s_size   <- score_size_quantiles(obs_sz, sim_sz)
+    sim_rate <- if (is.finite(ign_per_yr) && isTRUE(tmpl_area_ha > 0))
+                  ign_per_yr * mean(ens$fire_ha) / tmpl_area_ha
+                else NA_real_
+    s_aab    <- if (!is.null(obs_rate) && is.finite(sim_rate)) score_annual_area(obs_rate, sim_rate)
+                else NA_real_
+    s <- c(s_size, s_aab); w <- c(w_size, w_aab); keep <- !is.na(s) & w > 0
+    data.frame(
+      B0 = b0, pass = label,
+      pct_no_spread   = 100 * mean(ens$n_cells <= 1),
+      median_ha       = if (length(sim_sz)) stats::median(sim_sz) else NA_real_,
+      p90_ha          = if (length(sim_sz)) stats::quantile(sim_sz, 0.9, names = FALSE) else NA_real_,
+      mean_ha_per_ign = mean(ens$fire_ha),
+      median_days     = if (length(sim_sz)) stats::median(ens$days[ens$fire_ha > cell_area_ha]) else NA_real_,
+      pct_edge        = 100 * mean(ens$hit_edge),
+      sim_annual_pct  = 100 * sim_rate,
+      score_size      = s_size,
+      score_aab       = s_aab,
+      score_total     = if (any(keep)) sum(w[keep] * s[keep]) / sum(w[keep]) else NA_real_)
+  }
+
+  # Coarse pass.  Stop after `patience` consecutive values worse than the best
+  # so far: beyond the percolation cliff fires only get bigger (or saturate at
+  # MaxSpreadArea pace x days left), so the score cannot recover.
+  rows <- list(); ens_list <- list(); stopped_at <- NA_real_
+  best_sc <- Inf; worse <- 0L
+  for (j in seq_along(b0_values)) {
+    r <- run_one(b0_values[j], sprintf("Coarse %d/%d", j, length(b0_values)))
+    rows[[length(rows) + 1]] <- r
+    if (is.finite(r$score_total) && r$score_total < best_sc) {
+      best_sc <- r$score_total; worse <- 0L
+    } else if (is.finite(best_sc)) {
+      worse <- worse + 1L
+      if (worse >= patience && j < length(b0_values)) { stopped_at <- b0_values[j]; break }
+    }
+  }
+
+  # Fine pass around the coarse best (the cliff is steep, so a coarse grid
+  # can step right over the best value).
+  tab0 <- do.call(rbind, rows)
+  if (refine && length(b0_values) >= 3 && any(is.finite(tab0$score_total))) {
+    step  <- stats::median(diff(b0_values))
+    b_c   <- tab0$B0[which.min(tab0$score_total)]
+    fine  <- seq(b_c - step, b_c + step, by = step / 4)
+    fine  <- fine[!sapply(fine, function(x) any(abs(x - tab0$B0) < 1e-9))]
+    for (j in seq_along(fine))
+      rows[[length(rows) + 1]] <- run_one(fine[j], sprintf("Fine %d/%d", j, length(fine)))
+  }
+
+  tab <- do.call(rbind, rows)
+  tab <- tab[order(tab$B0), ]
+  rownames(tab) <- NULL
+  best <- if (any(is.finite(tab$score_total))) tab$B0[which.min(tab$score_total)] else NA_real_
+
+  list(table = tab, ensembles = ens_list, best_b0 = best,
+       info = list(ign_per_yr = ign_per_yr, obs_rate = obs_rate,
+                   obs_median_ha = if (length(obs_sz)) stats::median(obs_sz) else NA_real_,
+                   obs_p90_ha = if (length(obs_sz)) stats::quantile(obs_sz, 0.9, names = FALSE) else NA_real_,
+                   n_obs = length(obs_sz), grid_ha = grid_ha, n_fires = n_fires,
+                   stopped_at = stopped_at, w_size = w_size, w_aab = w_aab,
+                   best_b0_size = if (any(is.finite(tab$score_size)))
+                     tab$B0[which.min(tab$score_size)] else NA_real_,
+                   best_b0_aab  = if (any(is.finite(tab$score_aab)))
+                     tab$B0[which.min(tab$score_aab)] else NA_real_))
+}
+
+
+# -----------------------------------------------------------------------------
+# plot_b0_sweep
+#
+# A: the three scores against B0, best B0 marked.
+# B: simulated median / P90 fire size (fires > 1 cell) against B0, with the
+#    observed values as horizontal references, and % of ignitions that never
+#    left their cell on a secondary scale (as labels).
+# -----------------------------------------------------------------------------
+
+plot_b0_sweep <- function(sweep) {
+  tab  <- sweep$table
+  info <- sweep$info
+  sc <- rbind(
+    data.frame(B0 = tab$B0, score = tab$score_size,  what = "Fire size"),
+    data.frame(B0 = tab$B0, score = tab$score_aab,   what = "Annual area"),
+    data.frame(B0 = tab$B0, score = tab$score_total, what = "Total"))
+  sc <- sc[is.finite(sc$score), ]
+
+  pA <- ggplot(sc, aes(B0, score, colour = what, linewidth = what == "Total")) +
+    geom_line() + geom_point(size = 1.8) +
+    scale_linewidth_manual(values = c(`TRUE` = 1.4, `FALSE` = 0.7), guide = "none") +
+    scale_colour_manual(values = c("Fire size" = "#d94801", "Annual area" = "#2166ac",
+                                   "Total" = "black")) +
+    { if (is.finite(sweep$best_b0))
+        geom_vline(xintercept = sweep$best_b0, linetype = "dashed") } +
+    labs(title = sprintf("B0 sweep: best B0 = %.2f", sweep$best_b0),
+         subtitle = sprintf(
+           "Size alone favours %.2f, annual area alone %.2f%s",
+           info$best_b0_size, info$best_b0_aab,
+           if (is.finite(info$stopped_at))
+             sprintf("  |  stopped after %.2f (no further improvement)", info$stopped_at) else ""),
+         x = "SpreadProbabilityB0", y = "Score (mean |log ratio|)", colour = NULL) +
+    theme_bw(base_size = 12) + theme(legend.position = "bottom")
+
+  sz <- rbind(data.frame(B0 = tab$B0, ha = tab$median_ha, what = "Median"),
+              data.frame(B0 = tab$B0, ha = tab$p90_ha,    what = "P90"))
+  sz <- sz[is.finite(sz$ha) & sz$ha > 0, ]
+  ref <- data.frame(what = c("Median", "P90"),
+                    ha = c(info$obs_median_ha, info$obs_p90_ha))
+  pB <- ggplot(sz, aes(B0, ha, colour = what)) +
+    geom_line(linewidth = 0.9) + geom_point(size = 1.8) +
+    geom_hline(data = ref[is.finite(ref$ha), ], aes(yintercept = ha, colour = what),
+               linetype = "dashed") +
+    geom_text(data = tab[!grepl("^Fine", tab$pass), ],
+              aes(B0, Inf, label = sprintf("%.0f%%", pct_no_spread)),
+              inherit.aes = FALSE, vjust = 1.4, size = 2.8, colour = "grey40") +
+    scale_y_log10(labels = scales::comma) +
+    scale_colour_manual(values = c(Median = "#d94801", P90 = "#7f2704")) +
+    labs(title = "Simulated fire size vs B0",
+         subtitle = "Dashed = observed FPA FOD.  Top labels: % of ignitions that never spread",
+         x = "SpreadProbabilityB0", y = "Fire size, fires > 1 cell (ha, log)", colour = NULL) +
+    theme_bw(base_size = 12) + theme(legend.position = "bottom")
+
+  if (requireNamespace("patchwork", quietly = TRUE)) patchwork::wrap_plots(pA, pB, ncol = 2)
   else pA
 }
 
