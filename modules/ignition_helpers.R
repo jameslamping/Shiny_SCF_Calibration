@@ -903,25 +903,13 @@ summarise_expected_ignitions <- function(annual_df) {
 # -----------------------------------------------------------------------------
 
 load_scf_events_log <- function(path) {
-  if (!file.exists(path)) stop("Events log not found: ", path)
-
-  df <- read.csv(path, stringsAsFactors = FALSE)
-  names(df) <- trimws(names(df))
-
-  required <- c("SimulationYear", "IgnitionType")
-  missing  <- setdiff(required, names(df))
-  if (length(missing) > 0)
-    stop("Events log missing columns: ", paste(missing, collapse = ", "))
+  # Shared reader (validation_helpers.R) — same file lookup and column
+  # handling as candidate scoring and model validation.
+  df <- load_scf_events_full(path)
+  if (all(is.na(df$ignition_type)))
+    stop("Events log has no IgnitionType column: ", path)
 
   annual <- df %>%
-    mutate(
-      ignition_type = trimws(IgnitionType),
-      ignition_type = case_when(
-        grepl("lightning",  ignition_type, ignore.case = TRUE) ~ "Lightning",
-        grepl("accidental", ignition_type, ignore.case = TRUE) ~ "Accidental",
-        TRUE ~ ignition_type
-      )
-    ) %>%
     group_by(SimulationYear, ignition_type) %>%
     summarise(n_fires = n(), .groups = "drop")
 

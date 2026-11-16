@@ -429,7 +429,7 @@ library convention.
 | **Perimeter Pairs** | Cleaned perimeter progression table; download CSV |
 | **Candidate Grid** | Define parameter search grid, export SCF snippets, score candidates |
 | **Threshold Search** | Grid search over cleaning and sampling thresholds scored by AUC × R² |
-| **Score Candidates** | Import SCF FireEventLog outputs and rank candidate parameter sets |
+| **Score Candidates** | Read each run's `socialclimatefire-events-log.csv` from `<runs root>/candidate_NNNN/` and rank candidates by fire-size distribution and annual area burned (fire rotation) against FPA FOD |
 
 ---
 

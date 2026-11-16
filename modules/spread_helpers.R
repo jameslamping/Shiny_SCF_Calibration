@@ -2655,88 +2655,166 @@ solve_spread_b0 <- function(b1_fwi, b3_ews = 0, b2_ff = 0,
 
 
 # -----------------------------------------------------------------------------
-# score_candidates
+# Candidate scoring
+#
+# Each candidate is one SCF run, in <runs_root>/candidate_NNNN/ (any depth
+# below that folder; the events log is found by find_scf_events_log()).
+# Two scores, both on the same scale (mean absolute log ratio, so 0 = perfect
+# and log(2) = 0.69 = "off by a factor of two"), which makes the weights mean
+# what they say:
+#
+#   score_size  Fire-size distribution.  Mean |log(q_obs / q_sim)| over the
+#               10th..90th percentiles.  Both sides are restricted to fires the
+#               landscape can actually produce: larger than one cell and no
+#               larger than the landscape.  FPA FOD is dominated by sub-cell
+#               fires that SCF can only record as 1-cell events, and holds
+#               regional fires bigger than the whole LANDIS landscape.
+#
+#   score_aab   Annual area burned, as a FRACTION of the domain per year:
+#               observed = FPA FOD area / calibration-boundary area,
+#               simulated = SCF area / landscape area.
+#               |log(sim_rate / obs_rate)|, i.e. how many-fold the simulated
+#               fire rotation is off.  Assumes the per-hectare regional burn
+#               rate applies to the landscape (the same assumption as the
+#               ignition area offset).
+#
+# Simulation years are NOT calendar years, so nothing is matched year by
+# year: all simulated years are compared against the calibration period as a
+# whole.  A run that burns nothing scores Inf (ranks last), never 0.
 # -----------------------------------------------------------------------------
 
-score_candidates <- function(candidate_grid, runs_root, cell_area_ha,
-                              cal_start_year, cal_end_year,
-                              w_size = 0.5, w_aab = 0.5,
-                              fpa_sizes = NULL) {
-
-  map_dfr(seq_len(nrow(candidate_grid)), function(i) {
-    cand    <- candidate_grid[i, ]
-    run_dir <- file.path(runs_root,
-                         sprintf("candidate_%04d", cand$candidate_id),
-                         "output")
-
-    if (!dir.exists(run_dir)) {
-      return(cand %>% mutate(run_dir = run_dir,
-                             score_size = NA_real_,
-                             score_aab  = NA_real_,
-                             score_total = NA_real_))
-    }
-
-    ev <- read_scf_events(run_dir)
-    sim_sizes <- ev %>%
-      mutate(event_area_ha = sites_burned * cell_area_ha) %>%
-      filter(FIRE_YEAR >= cal_start_year, FIRE_YEAR <= cal_end_year,
-             is.finite(event_area_ha), event_area_ha > 0)
-
-    sim_annual <- sim_sizes %>%
-      group_by(FIRE_YEAR) %>%
-      summarise(area_burned_ha = sum(event_area_ha), .groups = "drop") %>%
-      complete(FIRE_YEAR = seq(cal_start_year, cal_end_year),
-               fill = list(area_burned_ha = 0))
-
-    s_size <- if (!is.null(fpa_sizes) && nrow(sim_sizes) > 0)
-      score_size_quantiles(fpa_sizes, sim_sizes$event_area_ha) else NA_real_
-
-    s_aab <- score_annual_area_rmse(sim_annual)
-
-    cand %>% mutate(run_dir = run_dir,
-                    score_size  = s_size,
-                    score_aab   = s_aab,
-                    score_total = w_size * replace_na(s_size, 1) +
-                                  w_aab  * replace_na(s_aab,  1))
-  }) %>% arrange(score_total)
+# Observed targets, computed once per scoring call.
+.obs_fire_targets <- function(obs_fires, cal_start_year, cal_end_year,
+                              cal_area_ha, cell_area_ha, tmpl_area_ha) {
+  obs <- obs_fires %>%
+    filter(FIRE_YEAR >= cal_start_year, FIRE_YEAR <= cal_end_year,
+           is.finite(FIRE_SIZE_HA), FIRE_SIZE_HA > 0)
+  annual <- obs %>%
+    group_by(year = FIRE_YEAR) %>%
+    summarise(area_ha = sum(FIRE_SIZE_HA), .groups = "drop") %>%
+    complete(year = seq(cal_start_year, cal_end_year),
+             fill = list(area_ha = 0)) %>%
+    mutate(pct_burned = 100 * area_ha / cal_area_ha)
+  list(
+    sizes  = obs$FIRE_SIZE_HA[obs$FIRE_SIZE_HA > cell_area_ha &
+                              obs$FIRE_SIZE_HA <= tmpl_area_ha],
+    annual = annual,
+    rate   = mean(annual$area_ha) / cal_area_ha     # fraction of area / yr
+  )
 }
 
+# Simulated summary for one events table (from load_scf_events_full()).
+.sim_fire_summary <- function(ev, cell_area_ha, tmpl_area_ha,
+                              n_sim_years = NULL) {
+  ev <- ev %>% filter(!is.na(SimulationYear))
+  yrs <- ev$SimulationYear
+  n_years <- if (!is.null(n_sim_years) && is.finite(n_sim_years) && n_sim_years > 0)
+    as.integer(n_sim_years)
+  else if (length(yrs) > 0)
+    max(yrs) - min(1L, min(yrs)) + 1L
+  else NA_integer_
+  sz <- ev$fire_size_ha[is.finite(ev$fire_size_ha) & ev$fire_size_ha > 0]
+  annual <- ev %>%
+    filter(is.finite(fire_size_ha)) %>%
+    group_by(year = SimulationYear) %>%
+    summarise(area_ha = sum(fire_size_ha), .groups = "drop")
+  if (is.finite(n_years) && length(yrs) > 0)
+    annual <- annual %>%
+      complete(year = seq(min(1L, min(yrs)), min(1L, min(yrs)) + n_years - 1L),
+               fill = list(area_ha = 0))
+  annual <- annual %>% mutate(pct_burned = 100 * area_ha / tmpl_area_ha)
+  list(
+    n_events = nrow(ev),
+    n_years  = n_years,
+    sizes    = sz[sz > cell_area_ha & sz <= tmpl_area_ha],
+    annual   = annual,
+    rate     = if (is.finite(n_years)) sum(sz) / n_years / tmpl_area_ha else NA_real_
+  )
+}
 
 score_size_quantiles <- function(obs, sim, probs = seq(0.1, 0.9, 0.1)) {
-  if (length(obs) == 0 || length(sim) == 0) return(NA_real_)
-  mean(abs(log1p(quantile(obs, probs, na.rm = TRUE)) -
-           log1p(quantile(sim, probs, na.rm = TRUE))))
+  if (length(obs) == 0) return(NA_real_)   # no target: component dropped
+  if (length(sim) == 0) return(Inf)        # nothing to compare: worst
+  mean(abs(log(quantile(obs, probs, names = FALSE)) -
+           log(quantile(sim, probs, names = FALSE))))
 }
 
-score_annual_area_rmse <- function(sim_annual) {
-  if (nrow(sim_annual) == 0) return(NA_real_)
-  sqrt(mean(sim_annual$area_burned_ha^2, na.rm = TRUE))
+score_annual_area <- function(obs_rate, sim_rate) {
+  if (!is.finite(obs_rate) || obs_rate <= 0) return(NA_real_)
+  if (!is.finite(sim_rate) || sim_rate <= 0) return(Inf)
+  abs(log(sim_rate / obs_rate))
 }
 
-read_scf_events <- function(run_dir) {
-  candidates <- c(
-    file.path(run_dir, "FireEventLog.csv"),
-    file.path(run_dir, "fire-event-log.csv"),
-    file.path(run_dir, "SCF-event-log.csv")
-  )
-  f <- candidates[file.exists(candidates)]
-  if (length(f) == 0)
-    return(tibble(FIRE_YEAR = integer(), sites_burned = integer()))
+candidate_run_dir <- function(runs_root, candidate_id) {
+  file.path(runs_root, sprintf("candidate_%04d", candidate_id))
+}
 
-  ev  <- read_csv(f[1], show_col_types = FALSE)
-  nm  <- tolower(names(ev))
-  yr  <- names(ev)[which(nm %in% c("year","fire_year","fireyear"))[1]]
-  st  <- names(ev)[which(nm %in% c("sites_burned","sitesburned","total_sites"))[1]]
+score_candidates <- function(candidate_grid, runs_root,
+                             obs_fires, cal_area_ha, tmpl_area_ha, cell_area_ha,
+                             cal_start_year, cal_end_year,
+                             w_size = 0.5, w_aab = 0.5,
+                             n_sim_years = NULL,
+                             progress_fn = NULL) {
 
-  if (is.na(yr) || is.na(st)) {
-    warning("Could not parse FireEventLog columns in: ", f[1])
-    return(tibble(FIRE_YEAR = integer(), sites_burned = integer()))
-  }
+  stopifnot(is.finite(cal_area_ha), is.finite(tmpl_area_ha),
+            is.finite(cell_area_ha), cell_area_ha > 0)
+  obs <- .obs_fire_targets(obs_fires, cal_start_year, cal_end_year,
+                           cal_area_ha, cell_area_ha, tmpl_area_ha)
 
-  ev %>%
-    transmute(FIRE_YEAR    = as.integer(.data[[yr]]),
-              sites_burned = as.numeric(.data[[st]])) %>%
-    filter(!is.na(FIRE_YEAR), is.finite(sites_burned))
+  blank <- list(events_file = NA_character_, n_events = NA_integer_,
+                n_sim_years = NA_integer_, sim_median_ha = NA_real_,
+                sim_annual_pct = NA_real_, sim_rotation_yr = NA_real_,
+                score_size = NA_real_, score_aab = NA_real_,
+                score_total = NA_real_)
+
+  rows <- map(seq_len(nrow(candidate_grid)), function(i) {
+    cand <- candidate_grid[i, ]
+    if (!is.null(progress_fn)) progress_fn(i, nrow(candidate_grid))
+    run_dir <- candidate_run_dir(runs_root, cand$candidate_id)
+    log_f   <- find_scf_events_log(run_dir)
+
+    out <- blank
+    out$run_dir <- run_dir
+    if (!dir.exists(run_dir)) {
+      out$status <- "no run folder"
+    } else if (is.na(log_f)) {
+      out$status <- "no events log"
+    } else {
+      ev  <- tryCatch(load_scf_events_full(log_f, cell_area_ha = cell_area_ha),
+                      error = function(e) e)
+      if (inherits(ev, "error")) {
+        out$status <- paste("read error:", conditionMessage(ev))
+      } else {
+        sim <- .sim_fire_summary(ev, cell_area_ha, tmpl_area_ha, n_sim_years)
+        s_size <- score_size_quantiles(obs$sizes, sim$sizes)
+        s_aab  <- score_annual_area(obs$rate, sim$rate)
+        s <- c(s_size, s_aab); w <- c(w_size, w_aab)
+        keep <- !is.na(s) & w > 0
+        out$events_file     <- log_f
+        out$n_events        <- sim$n_events
+        out$n_sim_years     <- sim$n_years
+        out$sim_median_ha   <- if (length(sim$sizes)) median(sim$sizes) else NA_real_
+        out$sim_annual_pct  <- 100 * sim$rate
+        out$sim_rotation_yr <- if (isTRUE(sim$rate > 0)) 1 / sim$rate else Inf
+        out$score_size      <- s_size
+        out$score_aab       <- s_aab
+        out$score_total     <- if (any(keep)) sum(w[keep] * s[keep]) / sum(w[keep])
+                               else NA_real_
+        out$status <- if (sim$n_events == 0) "log has no events"
+                      else if (length(sim$sizes) < 10) "ok (fewer than 10 scorable fires)"
+                      else "ok"
+      }
+    }
+    bind_cols(cand, as_tibble(out))
+  })
+
+  res <- bind_rows(rows) %>%
+    mutate(obs_median_ha   = if (length(obs$sizes)) median(obs$sizes) else NA_real_,
+           obs_annual_pct  = 100 * obs$rate,
+           obs_rotation_yr = if (isTRUE(obs$rate > 0)) 1 / obs$rate else Inf) %>%
+    arrange(score_total)
+  attr(res, "obs_targets") <- obs
+  res
 }
 
 
@@ -2838,39 +2916,38 @@ write_scf_snippet <- function(spread_coef_df, max_area_fit,
 # Scoring diagnostic plots
 # -----------------------------------------------------------------------------
 
-plot_candidate_cdf <- function(scores_df, obs_sizes, runs_root, cell_area_ha,
-                                cal_start_year, cal_end_year) {
+plot_candidate_cdf <- function(scores_df, obs_fires, cal_area_ha, tmpl_area_ha,
+                               cell_area_ha, cal_start_year, cal_end_year,
+                               n_top = 3) {
 
-  top <- scores_df %>% filter(is.finite(score_total)) %>% slice_head(n = 3)
-  if (nrow(top) == 0 || is.null(obs_sizes))
+  top <- scores_df %>% filter(is.finite(score_total)) %>% slice_head(n = n_top)
+  if (nrow(top) == 0 || is.null(obs_fires))
     return(ggplot() + labs(title = "No scored candidates yet.") + theme_bw())
 
-  obs_cdf <- tibble(size_ha = sort(obs_sizes),
-                    cdf     = seq_along(obs_sizes) / length(obs_sizes),
-                    source  = "Observed (FPA FOD)")
+  obs <- .obs_fire_targets(obs_fires, cal_start_year, cal_end_year,
+                           cal_area_ha, cell_area_ha, tmpl_area_ha)
+  .cdf <- function(x, label) {
+    if (length(x) == 0) return(NULL)
+    tibble(size_ha = sort(x), cdf = seq_along(x) / length(x), source = label)
+  }
 
   sim_list <- map(seq_len(nrow(top)), function(i) {
-    cand    <- top[i, ]
-    run_dir <- file.path(runs_root,
-                         sprintf("candidate_%04d", cand$candidate_id), "output")
-    ev  <- read_scf_events(run_dir)
-    sz  <- ev %>%
-      mutate(size_ha = sites_burned * cell_area_ha) %>%
-      filter(FIRE_YEAR >= cal_start_year, FIRE_YEAR <= cal_end_year,
-             is.finite(size_ha), size_ha > 0) %>%
-      pull(size_ha)
-    if (length(sz) == 0) return(NULL)
-    tibble(size_ha = sort(sz),
-           cdf     = seq_along(sz) / length(sz),
-           source  = sprintf("Candidate %d (score=%.3f)",
-                             cand$candidate_id, cand$score_total))
+    ev <- tryCatch(load_scf_events_full(top$events_file[i], cell_area_ha),
+                   error = function(e) NULL)
+    if (is.null(ev)) return(NULL)
+    sim <- .sim_fire_summary(ev, cell_area_ha, tmpl_area_ha)
+    .cdf(sim$sizes, sprintf("Candidate %d (score %.2f)",
+                            top$candidate_id[i], top$score_total[i]))
   }) %>% compact()
 
-  bind_rows(obs_cdf, sim_list) %>%
+  bind_rows(.cdf(obs$sizes, "Observed (FPA FOD)"), sim_list) %>%
     ggplot(aes(size_ha, cdf, color = source)) +
-    geom_line(linewidth = 1) +
+    geom_step(linewidth = 1) +
     scale_x_log10(labels = comma) +
     labs(title = "Event Size CDF: Observed vs Top Candidates",
+         subtitle = sprintf(
+           "Fires larger than one cell (%.2f ha) and no larger than the landscape (%s ha)",
+           cell_area_ha, comma(round(tmpl_area_ha))),
          x = "Fire Event Size (ha, log scale)",
          y = "Cumulative probability", color = NULL) +
     theme_bw(base_size = 12) +
@@ -2878,29 +2955,41 @@ plot_candidate_cdf <- function(scores_df, obs_sizes, runs_root, cell_area_ha,
 }
 
 
-plot_candidate_annual <- function(scores_df, runs_root, cell_area_ha,
-                                   cal_start_year, cal_end_year) {
+plot_candidate_annual <- function(scores_df, obs_fires, cal_area_ha, tmpl_area_ha,
+                                  cell_area_ha, cal_start_year, cal_end_year) {
 
   top <- scores_df %>% filter(is.finite(score_total)) %>% slice_head(n = 1)
   if (nrow(top) == 0)
     return(ggplot() + labs(title = "No scored candidates yet.") + theme_bw())
 
-  run_dir <- file.path(runs_root,
-                       sprintf("candidate_%04d", top$candidate_id[1]), "output")
-  ev <- read_scf_events(run_dir)
+  ev <- tryCatch(load_scf_events_full(top$events_file[1], cell_area_ha),
+                 error = function(e) NULL)
+  if (is.null(ev))
+    return(ggplot() + labs(title = "Could not read the top candidate's events log.") +
+             theme_bw())
+  sim <- .sim_fire_summary(ev, cell_area_ha, tmpl_area_ha)
+  obs <- .obs_fire_targets(obs_fires, cal_start_year, cal_end_year,
+                           cal_area_ha, cell_area_ha, tmpl_area_ha)
 
-  ev %>%
-    mutate(area_ha = sites_burned * cell_area_ha) %>%
-    filter(FIRE_YEAR >= cal_start_year, FIRE_YEAR <= cal_end_year) %>%
-    group_by(FIRE_YEAR) %>%
-    summarise(area_burned_ha = sum(area_ha), .groups = "drop") %>%
-    complete(FIRE_YEAR = cal_start_year:cal_end_year,
-             fill = list(area_burned_ha = 0)) %>%
-    ggplot(aes(FIRE_YEAR, area_burned_ha)) +
-    geom_bar(stat = "identity", fill = "#a0522d", alpha = 0.7) +
+  refs <- tibble(
+    label = c(sprintf("Observed mean %.3f%%/yr", 100 * obs$rate),
+              sprintf("Simulated mean %.3f%%/yr", 100 * sim$rate)),
+    pct   = c(100 * obs$rate, 100 * sim$rate)
+  )
+
+  ggplot(sim$annual, aes(year, pct_burned)) +
+    geom_col(fill = "#a0522d", alpha = 0.7) +
+    geom_hline(data = refs, aes(yintercept = pct, linetype = label),
+               colour = "grey20", linewidth = 0.8) +
+    scale_linetype_manual(values = c("dashed", "solid")) +
     labs(title = sprintf("Annual Area Burned — Candidate %d", top$candidate_id[1]),
-         x = "Year", y = "Area Burned (ha)") +
-    theme_bw(base_size = 12)
+         subtitle = paste0(
+           "Simulated: % of landscape per simulation year.  ",
+           "Observed: % of calibration boundary per year, ",
+           cal_start_year, "–", cal_end_year, "."),
+         x = "Simulation year", y = "Area burned (% of domain)", linetype = NULL) +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "bottom")
 }
 
 

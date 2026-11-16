@@ -1783,14 +1783,30 @@ ui <- page_navbar(
             br(),
             p(class = "text-muted",
               "After running LANDIS externally for each candidate, provide the ",
-              "root directory containing run outputs to score them."),
+              "root directory containing run outputs to score them. Each run goes ",
+              "in its own folder named ", tags$code("candidate_0001"), ", ",
+              tags$code("candidate_0002"), ", ... (matching the Candidate Grid IDs). ",
+              "The ", tags$code("socialclimatefire-events-log.csv"),
+              " can be anywhere inside that folder."),
+            p(class = "text-muted small",
+              "Needs the ignition FPA FOD data and the landscape template loaded. ",
+              "Both scores are mean |log ratio| (0 = perfect, 0.69 = off by a ",
+              "factor of 2). ", tags$b("Event size"), " compares the 10th–90th ",
+              "percentiles of fires larger than one cell and no larger than the ",
+              "landscape. ", tags$b("Annual area"), " compares the mean fraction ",
+              "burned per year (simulated: of the landscape; observed: of the ",
+              "calibration boundary), i.e. the fire rotation. Simulation years are ",
+              "not matched to calendar years. A run that burns nothing ranks last."),
             textInput("scf_runs_root", "SCF Runs Root Directory",
                       placeholder = "/path/to/scf_candidate_runs/PARK"),
             fluidRow(
-              column(6, numericInput("score_w_size", "Weight: Event Size",
+              column(4, numericInput("score_w_size", "Weight: Event Size",
                                      value = 0.5, min = 0, max = 1, step = 0.1)),
-              column(6, numericInput("score_w_aab",  "Weight: Annual Area",
-                                     value = 0.5, min = 0, max = 1, step = 0.1))
+              column(4, numericInput("score_w_aab",  "Weight: Annual Area",
+                                     value = 0.5, min = 0, max = 1, step = 0.1)),
+              column(4, numericInput("score_n_sim_years",
+                                     "Simulated years per run (blank = from log)",
+                                     value = NA, min = 1, step = 1))
             ),
             actionButton("run_scoring", "Score Candidates",
                          class = "btn-sm btn-success"),
@@ -3143,7 +3159,8 @@ server <- function(input, output, session) {
                    "neg_growth_tol","max_growth_factor","fwi_per_fire","fired_min_detection_days",
                    "cand_b0_min","cand_b0_max","cand_b0_step",
                    "cand_b1_min","cand_b1_max","cand_b1_step","scf_runs_root",
-                   "score_w_aab","score_w_size","val_cell_area_ha","val_events_path",
+                   "score_w_aab","score_w_size","score_n_sim_years",
+                   "val_cell_area_ha","val_events_path",
                    "events_log_path")
     mortality <- c("solus_clay_dir","sg_clay_dir","mtbs_source","mtbs_out_dir",
                    "mtbs_dnbr_dir","mtbs_sample_frac","et_cwd_source","tc_cache_dir",
@@ -4821,7 +4838,9 @@ server <- function(input, output, session) {
         return()
       }
 
-      zip(f, files = unlist(paths), flags = "-j")
+      # cherry-pick = store files without their directory (like zip -j);
+      # zip::zip works on Windows, utils::zip() needs an external zip program.
+      zip::zip(f, files = unlist(paths), mode = "cherry-pick")
     }
   )
 
@@ -6402,36 +6421,72 @@ server <- function(input, output, session) {
   # ---------------------------------------------------------------------------
 
   observeEvent(input$run_scoring, {
-    req(rv$candidate_grid, rv$pairs_clean)
+    req(rv$candidate_grid)
     req(nchar(trimws(input$scf_runs_root)) > 0)
+    missing <- c(
+      if (is.null(rv$ign_df))          "FPA FOD fires (run Ignition Calibration first)",
+      if (is.null(rv$landscape_areas)) "landscape template + calibration boundary",
+      if (is.null(rv$cell_area_ha))    "landscape template cell size"
+    )
+    if (length(missing) > 0) {
+      showNotification(paste("Scoring needs:", paste(missing, collapse = "; ")),
+                       type = "error", duration = 10)
+      return()
+    }
+    runs_root <- trimws(input$scf_runs_root)
+    if (!dir.exists(runs_root)) {
+      showNotification(paste("SCF runs root not found:", runs_root),
+                       type = "error", duration = 10)
+      return()
+    }
+    areas  <- rv$landscape_areas
+    n_yrs  <- if (is.numeric(input$score_n_sim_years) &&
+                  isTRUE(input$score_n_sim_years > 0)) input$score_n_sim_years else NULL
 
     withProgress(message = "Scoring candidates...", {
       rv$scores_df <- score_candidates(
         candidate_grid = rv$candidate_grid,
-        runs_root      = input$scf_runs_root,
+        runs_root      = runs_root,
+        obs_fires      = rv$ign_df,
+        cal_area_ha    = areas$cal_area_ha,
+        tmpl_area_ha   = areas$tmpl_area_ha,
         cell_area_ha   = rv$cell_area_ha,
         cal_start_year = input$cal_years[1],
         cal_end_year   = input$cal_years[2],
         w_size         = input$score_w_size,
         w_aab          = input$score_w_aab,
-        fpa_sizes      = if (!is.null(rv$ign_df)) rv$ign_df$FIRE_SIZE_HA else NULL
+        n_sim_years    = n_yrs,
+        progress_fn    = function(i, n) setProgress(i / n,
+                                                    detail = sprintf("%d of %d", i, n))
       )
     })
 
+    n_ok <- sum(is.finite(rv$scores_df$score_total))
+    showNotification(
+      sprintf("Scored %d of %d candidates (%d without a usable events log).",
+              n_ok, nrow(rv$scores_df),
+              sum(is.na(rv$scores_df$score_total))),
+      type = if (n_ok > 0) "message" else "warning", duration = 8)
+
     output$scores_table <- renderDT({
       rv$scores_df %>%
-        mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+        select(candidate_id, status, score_total, score_size, score_aab,
+               any_of(c("B0", "B1_FWI")),
+               n_events, n_sim_years, sim_median_ha, obs_median_ha,
+               sim_annual_pct, obs_annual_pct, sim_rotation_yr, obs_rotation_yr,
+               everything(), -any_of("events_file")) %>%
+        mutate(across(where(is.numeric), ~ signif(.x, 4))) %>%
         datatable(options = list(pageLength = 10, scrollX = TRUE),
                   rownames = FALSE, class = "table-sm table-striped")
     })
     output$cdf_plot <- renderPlot({
-      req(rv$ign_df)
-      plot_candidate_cdf(rv$scores_df, rv$ign_df$FIRE_SIZE_HA,
-                         input$scf_runs_root, rv$cell_area_ha,
+      plot_candidate_cdf(rv$scores_df, rv$ign_df,
+                         areas$cal_area_ha, areas$tmpl_area_ha, rv$cell_area_ha,
                          input$cal_years[1], input$cal_years[2])
     })
     output$annual_plot <- renderPlot({
-      plot_candidate_annual(rv$scores_df, input$scf_runs_root, rv$cell_area_ha,
+      plot_candidate_annual(rv$scores_df, rv$ign_df,
+                            areas$cal_area_ha, areas$tmpl_area_ha, rv$cell_area_ha,
                             input$cal_years[1], input$cal_years[2])
     })
   })
@@ -6613,20 +6668,27 @@ server <- function(input, output, session) {
     content  = function(f) {
       req(rv$candidate_grid, rv$spread_prob_coef, rv$max_area_fit)
       snip_dir <- file.path(tempdir(), "snippets")
+      unlink(snip_dir, recursive = TRUE)          # no stale files from a previous grid
       dir.create(snip_dir, showWarnings = FALSE)
-      # The calibrated spread probability coefficients are fixed; only B0 (intercept)
-      # varies across candidates.  Build per-candidate coef tables on the fly.
+      # The candidate grid varies spread-probability B0 AND B1 (FWI); B2/B3 and
+      # the MaxSpreadArea coefficients stay at their fitted values.  Write both
+      # varied coefficients, or the run would not be the candidate it is scored as.
       base_sp_coef <- rv$spread_prob_coef
       walk(seq_len(nrow(rv$candidate_grid)), function(i) {
         row       <- rv$candidate_grid[i, ]
-        # Override B0 with the candidate's B0 value for the snippet
         cand_coef <- base_sp_coef %>%
-          mutate(estimate = if_else(grepl("B0_Intercept", term), row$B0, estimate))
+          mutate(estimate = case_when(
+            grepl("B0_Intercept", term) ~ row$B0,
+            grepl("B1_FWI",       term) ~ row$B1_FWI,
+            TRUE                        ~ estimate))
         txt <- write_scf_snippet(cand_coef, rv$max_area_fit)
-        writeLines(c(sprintf(">> Candidate ID: %d", row$candidate_id), txt),
+        writeLines(c(sprintf(">> Candidate ID: %d  (run folder: candidate_%04d)",
+                             row$candidate_id, row$candidate_id), txt),
                    file.path(snip_dir, sprintf("candidate_%04d.txt", row$candidate_id)))
       })
-      zip(f, files = list.files(snip_dir, full.names = TRUE), flags = "-j")
+      # zip::zip is pure R/C and works on Windows; utils::zip() needs an external
+      # zip program that Windows does not ship with.
+      zip::zip(f, files = list.files(snip_dir), root = snip_dir)
     })
 
   output$dl_scores <- downloadHandler(
@@ -8595,7 +8657,8 @@ server <- function(input, output, session) {
     cand_b0_step        = "number", cand_b1_min       = "number",
     cand_b1_max         = "number", cand_b1_step      = "number",
     scf_runs_root       = "text",   score_w_aab       = "number",
-    score_w_size        = "number", val_cell_area_ha  = "number",
+    score_w_size        = "number", score_n_sim_years = "number",
+    val_cell_area_ha    = "number",
     val_events_path     = "text",   events_log_path   = "text",
     # -- Mortality ---------------------------------------------------------------
     solus_clay_dir      = "text",   sg_clay_dir       = "text",

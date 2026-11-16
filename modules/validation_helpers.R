@@ -50,17 +50,63 @@ pacman::p_load(dplyr, ggplot2, tidyr, purrr, scales, lubridate, stringr)
 
 
 # -----------------------------------------------------------------------------
+# find_scf_events_log
+#
+# Locates the SCF events log.  `path` may be the CSV itself or any directory
+# above it (a scenario folder, a candidate_NNNN folder, a run's output folder):
+# directories are searched recursively and the shallowest match wins.
+# Returns NA_character_ when nothing is found.
+# -----------------------------------------------------------------------------
+
+SCF_EVENTS_LOG_NAMES <- c("socialclimatefire-events-log.csv",
+                          "scf-events-log.csv",
+                          "fireeventlog.csv", "fire-event-log.csv")
+
+find_scf_events_log <- function(path) {
+  if (is.null(path) || is.na(path) || !nzchar(path)) return(NA_character_)
+  if (file.exists(path) && !dir.exists(path)) return(path)
+  if (!dir.exists(path)) return(NA_character_)
+  hits <- list.files(path, pattern = "\\.csv$", recursive = TRUE,
+                     full.names = TRUE, ignore.case = TRUE)
+  hits <- hits[tolower(basename(hits)) %in% SCF_EVENTS_LOG_NAMES]
+  if (length(hits) == 0) return(NA_character_)
+  depth <- lengths(regmatches(hits, gregexpr("/", hits)))
+  hits[order(depth, hits)][1]
+}
+
+
+# -----------------------------------------------------------------------------
 # load_scf_events_full
 #
-# Reads the full socialclimatefire-events-log.csv and returns a tidy
-# event-level tibble.  cell_area_ha converts TotalSitesBurned to ha.
+# THE reader for SCF events logs: every part of the app that consumes SCF
+# output (ignition validation, candidate scoring, model validation) goes
+# through this function so they all agree on file names and columns.
+#
+# `path` is the socialclimatefire-events-log.csv, or a directory containing it
+# (see find_scf_events_log).  Returns a tidy event-level tibble with
+# standardised columns: SimulationYear, ignition_type, sites_burned,
+# fire_size_ha (= TotalSitesBurned * cell_area_ha), FWI_event, MeanDNBR,
+# EWS_event, WindSpeed_event, duration_days.
 # -----------------------------------------------------------------------------
 
 load_scf_events_full <- function(path, cell_area_ha = 1.0) {
-  if (!file.exists(path)) stop("Events log not found: ", path)
+  log_path <- find_scf_events_log(path)
+  if (is.na(log_path))
+    stop("SCF events log not found at or under: ", path,
+         "\n  Expected a file named ", SCF_EVENTS_LOG_NAMES[1])
+  path <- log_path
 
-  df <- read.csv(path, stringsAsFactors = FALSE)
+  # check.names = FALSE: a header like "SimulationYear, TotalSitesBurned" would
+  # otherwise be mangled to "X.TotalSitesBurned" before trimws() could fix it.
+  df <- read.csv(path, stringsAsFactors = FALSE, check.names = FALSE,
+                 strip.white = TRUE)
   names(df) <- trimws(names(df))
+
+  # Simulation year (SCF v4: "SimulationYear")
+  yr_col <- intersect(c("SimulationYear", "Year", "FireYear"), names(df))[1]
+  if (is.na(yr_col))
+    stop("Events log has no SimulationYear column: ", path)
+  df$SimulationYear <- suppressWarnings(as.integer(df[[yr_col]]))
 
   # Standardise ignition type label
   if ("IgnitionType" %in% names(df)) {
@@ -76,8 +122,10 @@ load_scf_events_full <- function(path, cell_area_ha = 1.0) {
 
   # Convert burned cells to ha
   if ("TotalSitesBurned" %in% names(df)) {
-    df$fire_size_ha <- df$TotalSitesBurned * cell_area_ha
+    df$sites_burned <- suppressWarnings(as.numeric(df$TotalSitesBurned))
+    df$fire_size_ha <- df$sites_burned * cell_area_ha
   } else {
+    df$sites_burned <- NA_real_
     df$fire_size_ha <- NA_real_
   }
 
