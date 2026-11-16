@@ -22,8 +22,11 @@ Findings are ranked by how badly they could produce wrong SCF parameters.
   This covers the B0 part of #9.
 - Fixed the Observed Targets plot: its P75/P90 labels showed the P50 value.
 
-**Still open:** #4, #8, the B1/B3 part of #9, #10 in the Validation tab, #12–#16,
-and the MORA findings below.
+**Docs (later the same day):** #13 and #14 done (README rewrite,
+`docs/SCF_semantics.md`).
+
+**Still open:** #4, #8, the B1/B3 part of #9, #10 in the Validation tab, #12,
+#15, #16, and the MORA findings below.
 
 ### MORA findings from this session (data, not code)
 - **`SiteMortalityB6` is NA in the saved MORA site-mortality fit.** It is marked
@@ -184,11 +187,14 @@ the whole calibration region with fires simulated on the landscape.
     Merging them into one parser fixes #1 at the root.
 12. **Stale wind-unit comments.** `era_helpers.R:78–82` and `:193` say wind is
     returned in m/s, but the code returns km/h.
-13. **README out of date.** It was last updated 2026-04-29. It has no
+13. *(Fixed 2026-11-16: README rewritten for the current app.)*
+    **README out of date.** It was last updated 2026-04-29. It has no
     Mortality Calibration tab, GRIDMET/cffdrs FWI convention, FIRED/NIROPS
     perimeters, percolation diagnostics, `MaximumFineFuels` or
     `BurningSitesThreshold`.
-14. **CLAUDE.md is gitignored.** It holds the most important SCF-semantics notes:
+14. *(Fixed 2026-11-16: tracked `docs/SCF_semantics.md`; CLAUDE.md
+    BurningSitesThreshold note corrected.)*
+    **CLAUDE.md is gitignored.** It holds the most important SCF-semantics notes:
     plural keywords, single-trial percolation, suppression double-counting, wind
     units and mortality sign inversion. Your labmate never sees them. Move them
     into a tracked `docs/SCF_semantics.md`.
@@ -208,18 +214,13 @@ the whole calibration region with fires simulated on the landscape.
 ---
 
 ## Suggested order (remaining)
-1. **#14 + #13 handoff docs:** your labmate is using the app now.
-   - Move the SCF semantics out of the gitignored CLAUDE.md into a tracked
-     `docs/SCF_semantics.md`, and fix the BurningSitesThreshold note.
-   - Bring the README up to date: Mortality tab, real-weather ensemble, B0 Sweep,
-     scoring, exports.
-2. **#4 default paths:** a gitignored per-user config instead of
+1. **#4 default paths:** a gitignored per-user config instead of
    `/Users/jlamping/...` defaults.
-3. **#9 joint B0 × B1 sweep:** fixes the shape of the size distribution, not just
+2. **#9 joint B0 × B1 sweep:** fixes the shape of the size distribution, not just
    its level.
-4. **MORA data fixes:** refit B6 (or set 0), positive MSA B0.
-5. **#15 tests:** turn this session's scratch checks into a `testthat` suite:
+3. **MORA data fixes:** refit B6 (or set 0), positive MSA B0.
+4. **#15 tests:** turn this session's scratch checks into a `testthat` suite:
    - simulator vs SCF reference loop
    - scoring known-answer
    - snippet parser emulation
-6. #8, #10 (Validation tab), #12, #16
+5. #8, #10 (Validation tab), #12, #16

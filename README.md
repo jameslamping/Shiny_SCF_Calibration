@@ -6,10 +6,21 @@
 
 An interactive R Shiny application for calibrating the
 [LANDIS-II Social-Climate-Fire (SCF) v4](https://github.com/LANDIS-II-Foundation/Extension-Social-Climate-Fire)
-extension. The app derives ignition coefficients, spread probability
-coefficients, maximum daily spread area coefficients, site mortality
-parameters, bark thickness parameters, and all required spatial maps
-directly from publicly available fire and climate data.
+extension. It produces, from public fire and climate data:
+
+- ignition coefficients and ignition maps
+- spread probability coefficients
+- maximum daily spread area coefficients
+- site and cohort mortality coefficients
+- the species bark-thickness table
+
+It also tests parameter sets against observed fire sizes before (and after)
+you run LANDIS.
+
+> **Read [`docs/SCF_semantics.md`](docs/SCF_semantics.md) first.** It explains
+> what SCF actually does with each parameter: single-trial spread, MaxSpreadArea
+> as pacing, inverted mortality signs, keyword order and wind units. Several of
+> these behaviours mean a fitted coefficient cannot be pasted into SCF as is.
 
 ---
 
@@ -19,15 +30,17 @@ directly from publicly available fire and climate data.
 2. [Required Data](#2-required-data)
 3. [App Structure](#3-app-structure)
 4. [Sidebar — Landscape Setup](#4-sidebar--landscape-setup)
-5. [Tab 1 — Ignition Calibration](#5-tab-1--ignition-calibration)
-6. [Tab 2 — Species Table](#6-tab-2--species-table)
-7. [Tab 3 — Spread Calibration](#7-tab-3--spread-calibration)
-8. [Tab 4 — Parameter Tuning](#8-tab-4--parameter-tuning)
-9. [Tab 5 — Model Validation](#9-tab-5--model-validation)
-10. [SCF Parameter Mappings](#10-scf-parameter-mappings)
-11. [Output Files Reference](#11-output-files-reference)
-12. [Troubleshooting](#12-troubleshooting)
-13. [Data Sources & Citations](#13-data-sources--citations)
+5. [Ignition Calibration](#5-ignition-calibration)
+6. [Species Table](#6-species-table)
+7. [Spread Calibration](#7-spread-calibration)
+8. [Mortality Calibration](#8-mortality-calibration)
+9. [Model Validation](#9-model-validation)
+10. [Parameter Tuning](#10-parameter-tuning)
+11. [Session — Save and Restore](#11-session--save-and-restore)
+12. [Putting Parameters into SCF](#12-putting-parameters-into-scf)
+13. [Output Files Reference](#13-output-files-reference)
+14. [Troubleshooting](#14-troubleshooting)
+15. [Data Sources & Citations](#15-data-sources--citations)
 
 ---
 
@@ -35,7 +48,7 @@ directly from publicly available fire and climate data.
 
 ### Prerequisites
 
-- R ≥ 4.4.0 and RStudio (recommended)
+- R 4.4.x and RStudio (recommended)
 - The `renv` package for reproducible package management
 
 ### Installation
@@ -56,9 +69,8 @@ shiny::runApp()
 ```
 
 `renv::restore()` reads `renv.lock` and installs every package at the exact
-version used during development — including GitHub-sourced packages (`rFIA`,
-`climateR`, `ncmeta`). This ensures the app runs identically regardless of
-future package updates.
+version used during development, including GitHub-sourced packages
+(`climateR`, `rFIA`, `ncmeta`, `rnz`).
 
 To update the lockfile after adding or upgrading packages:
 
@@ -92,73 +104,29 @@ on both because renv installs the right binaries for each OS.
 
 ## 2. Required Data
 
-The app relies on several large external datasets that are too big for
-version control. Download them once and store locally; the app accepts file
-paths entered in the sidebar or tab inputs.
+Large inputs are not in the repository. Download the local ones once; the
+remote ones are fetched by the app when you click the matching button.
 
-### 2.1 ERA-Interim FWI Indices *(~28 GB total, four files)*
+| Data | Used for | How |
+|------|----------|-----|
+| ERA-Interim FWI (`fwi.nc`, `ffmc.nc`, `dmc.nc`, `dc.nc`) | FWI, if you choose the ERA source | Local, ~28 GB — Vitolo et al. 2019, <https://doi.org/10.5281/zenodo.1065400> |
+| GRIDMET meteorology | FWI (GRIDMET source) and all wind | Remote (OPeNDAP), CONUS 1979–present; cached in `gridmet_cache/` |
+| LANDIS daily climate CSV | Runtime FWI check | Local — the climate file your LANDIS runs use |
+| FPA FOD `FPA_FOD_20221014.gdb` | Ignitions, observed fire sizes | Local, ~500 MB — Short 2022, <https://doi.org/10.2737/RDS-2013-0009.6> |
+| Fire perimeters: NIROPS (2020–2024), FIRED daily + events (2001–2019) or GeoMAC (2000–2018) | Spread | Local |
+| DEM | Slope and aspect for effective wind | Remote (`elevatr`) |
+| LANDFIRE FBFM40 | Fine fuels (spread B2, severity B5) | Remote (LFPS REST) or a local 0–1 GeoTIFF |
+| LANDFIRE canopy (CBD, CBH, CH) | Ladder fuel biomass (severity B6) | Remote, or a local g m⁻² raster |
+| MTBS dNBR | Site severity response | Remote (MTBS ImageServer) or local per-fire TIFFs |
+| SOLUS100 / SoilGrids clay | Severity B1 | Local directories |
+| TerraClimate PET and CWD | Severity B2, B4 | Remote (4 km) or local annual rasters |
+| Fire and Tree Mortality database (Cansler et al. 2020) | Cohort mortality; bark coefficients | Local, RDS-2020-0001-2 |
+| FIA tree tables | Species table (DBH, age) | Remote via `rFIA`, or local `{STATE}_TREE.csv` |
 
-**Source:** Vitolo et al. (2019) — <https://doi.org/10.5281/zenodo.1065400>
-
-Download four NetCDF files:
-
-| File | Variable |
-|------|----------|
-| `fwi.nc`  | Fire Weather Index |
-| `ffmc.nc` | Fine Fuel Moisture Code |
-| `dmc.nc`  | Duff Moisture Code |
-| `dc.nc`   | Drought Code |
-
-Global daily reanalysis at ~80 km resolution, 1980–2018. Longitudes are
-stored 0→360; `terra` handles this transparently.
-
-### 2.2 ERA5 Wind *(~5 GB)*
-
-**Source:** Copernicus Climate Data Store —
-<https://cds.climate.copernicus.eu/datasets/reanalysis-era5-single-levels>
-
-Download daily 10 m u- and v-component wind at 12:00 UTC for 1980–2018 as
-NetCDF. Required for effective wind speed computation in spread calibration.
-All wind values are converted from m/s to km/h before use (SCF User Guide
-§2.43 requirement).
-
-### 2.3 FPA Fire Occurrence Database *(~500 MB)*
-
-**Source:** Short (2022) — <https://www.fs.usda.gov/rds/archive/Catalog/RDS-2013-0009.6>
-
-File: `FPA_FOD_20221014.gdb`
-
-All reported US wildfires 1992–2020 with ignition date, containment date,
-location, cause (lightning vs human), and final fire size. Used for
-ignition calibration and fire size ensemble comparison. The app uses both
-`DISCOVERY_DATE` and `CONT_DATE` to compute mean FWI and wind speed over
-each fire's full duration.
-
-### 2.4 GeoMAC Historic Fire Perimeters
-
-**Source:** NIFC / USGS GeoMAC
-
-File: `Historic_Geomac_Perimeters_All_Years_2000_2018.gdb`
-
-Daily fire perimeter progressions for major US wildfires 2000–2018. Used
-for spread calibration. Available from the
-[NIFC data portal](https://www.nifc.gov/fire-information/maps-imagery-data-products/historical-fire-data).
-
-### 2.5 LANDFIRE FBFM40 *(optional; fetched via REST API)*
-
-Fine fuel load index (Scott & Burgan 40 fire behavior fuel models) used as
-the B2 predictor in the spread probability equation. Select
-**Fetch LANDFIRE FBFM40** in the Spread Calibration inputs; the app
-downloads the raster for your calibration boundary via the LFPS REST API.
-Alternatively, supply any 0–1 scaled GeoTIFF via the **Local file** option.
-
-### 2.6 FIA Tree Data *(for species table only)*
-
-Downloaded automatically by state via the `rFIA` package when you click
-**Fetch FIA Bark Parameters** in the Species Table tab. To avoid
-re-downloading (~50–500 MB per state), provide the path to a directory of
-pre-downloaded FIA state CSV files (e.g. `OR_TREE.csv`). Files from the
-[USFS FIA DataMart](https://apps.fs.usda.gov/fia/datamart/) are compatible.
+**Choose one FWI source for everything.** SCF applies one FWI stream to both
+ignition and spread, so calibrate both on the same source and convention.
+NIROPS perimeters (2020–2024) need the GRIDMET source, because ERA-Interim
+ends in 2018.
 
 ---
 
@@ -169,513 +137,490 @@ scf_calibration_app/
 ├── app.R                        # UI + server (all tabs)
 ├── renv.lock                    # Pinned package versions
 ├── .Rprofile                    # Auto-activates renv on project open
-├── renv/
-│   ├── activate.R               # renv bootstrap (do not edit)
-│   └── settings.json
-└── modules/
-    ├── era_helpers.R            # ERA-Interim FWI extraction; ERA5 wind processing
-    ├── ignition_helpers.R       # FPA FOD loading, ZIP/Poisson fitting, kernel surfaces
-    ├── spread_helpers.R         # GeoMAC loading, perimeter pairs, spread fitting,
-    │                            #   effective wind (Nelson 2002), terrain, LANDFIRE REST
-    ├── mortality_helpers.R      # Site mortality (Gamma GLM) diagnostics
-    ├── species_helpers.R        # FIA bark thickness estimation, species lookup
-    ├── tuning_helpers.R         # Parameter tuning: fire ensemble simulator, SM diagnostics
-    ├── validation_helpers.R     # Model validation plots (annual area, fire-climate, ECDF)
-    └── ui_helpers.R             # Minor UI utilities
+├── docs/
+│   └── SCF_semantics.md         # What SCF does with each parameter — read first
+├── modules/
+│   ├── era_helpers.R            # ERA-Interim FWI, GRIDMET met + cffdrs FWI, GRIDMET wind,
+│   │                            #   LANDIS Climate Library runtime FWI, startup codes
+│   ├── ignition_helpers.R       # FPA FOD, Poisson/ZIP fitting, ignition surfaces, area offset
+│   ├── spread_helpers.R         # Perimeters (NIROPS/FIRED/GeoMAC), terrain, EWS, spread and
+│   │                            #   MaxSpreadArea fitting, candidate scoring, SCF snippet
+│   │                            #   formatting (scf_num / scf_kv)
+│   ├── mortality_helpers.R      # Clay, MTBS, TerraClimate, ladder fuels, site/cohort fits
+│   ├── species_helpers.R        # FIA DBH/age, FOFEM bark coefficients, species table
+│   ├── tuning_helpers.R         # SCF-faithful fire simulator, real-weather ensemble,
+│   │                            #   B0 sweep, tuning plots, tuning export
+│   └── validation_helpers.R     # SCF events-log reader, validation plots, FRI
+├── analysis/                    # Stand-alone analysis scripts
+└── spread_probability_diagnostic.R  # Step-through script for the spread pipeline
 ```
 
 ### Spatial design
 
-The app uses two distinct spatial extents:
-
 | Object | Purpose |
 |--------|---------|
-| **Calibration boundary** (`cal_vect`) | Large regional polygon (e.g. WA Cascades + Coast Range). Clips ERA FWI, ERA5 wind, FPA FOD, and GeoMAC perimeters. Should be large enough to capture the full fire climate driving your landscape. |
-| **LANDIS template raster** (`template_r`) | Your park-specific LANDIS grid raster. Defines the working CRS, cell size, and spatial extent for all output maps (ignition surfaces, terrain maps, suppression maps). Also sets fire ensemble grid dimensions. |
+| **Calibration boundary** (`cal_vect`) | Large regional polygon (e.g. an ecoprovince). Clips FWI, wind, FPA FOD and perimeters. Large enough to capture the fire climate driving your landscape. |
+| **LANDIS template raster** (`template_r`) | Your LANDIS grid. Sets the working CRS, cell size and extent for all output maps, and the grid used by the fire simulator. |
 
-All data are reprojected to the CRS of `template_r` during processing.
-Interactive maps display in EPSG:4326 (WGS84).
+All data are reprojected to the CRS of `template_r`. Maps display in EPSG:4326.
 
 ---
 
 ## 4. Sidebar — Landscape Setup
 
-Complete these steps before running any calibration tab.
+Complete these steps before any calibration tab.
 
 | Step | Input | Notes |
 |------|-------|-------|
-| 1 | **Calibration Boundary (.shp)** | Regional boundary shapefile. The `.dbf`, `.shx`, and `.prj` files must be in the same directory. |
-| 2 | **LANDIS Template Raster (.tif)** | Any LANDIS input raster (e.g. climate regions, initial communities). Defines cell size and working CRS. |
-| 3 | **ERA-Interim FWI Files** | Enter paths to `fwi.nc`, `ffmc.nc`, `dmc.nc`, `dc.nc`. |
-| 4 | **ERA5 Wind Files** | Enter paths to the u10 and v10 NetCDF files. Wind is converted from m/s to km/h. |
-| 5 | **Calibration Period** | Slider to set the year range used across all tabs (default 1992–2018). |
+| 1 | **Calibration Boundary** | A shapefile, or US states downloaded with `tigris`. |
+| 2 | **LANDIS Template Raster** | Any LANDIS input raster (e.g. ecoregions). Sets cell size and CRS. |
+| 3 | **Fire Weather Index** | **ERA-Interim** (local NetCDF, to 2018) or **GRIDMET-derived** (computed with `cffdrs`, to present). See the settings below this table. |
+| 4 | **GRIDMET Wind** | Daily wind speed and direction, fetched remotely, converted m/s → km/h. |
+| 5 | **Calibration Period** | Year range used across all tabs. |
 
-After loading the template raster, a landscape preview map appears at the
-bottom of the sidebar. Cell area and resolution are derived automatically
-and used as defaults throughout the app.
+GRIDMET FWI settings (step 3):
+
+- **FWI convention:** use `landis` (daily mean temperature and RH), the way the
+  Climate Library computes it.
+- **Climate Library version:** match the library your LANDIS runs use.
+- **Runtime FWI check:** load your LANDIS climate CSV to compute the FWI SCF
+  will actually see. It is used by the Spread diagnostics and by the Parameter
+  Tuning ensemble and B0 sweep.
 
 ---
 
-## 5. Tab 1 — Ignition Calibration
+## 5. Ignition Calibration
 
-Calibrates the fire ignition parameters in SCF using historical ignition
-records from the FPA FOD database. Open the **Method** sub-tab for a
-detailed walkthrough of the calibration pipeline.
-
-### Models
-
-**Poisson GLM**
-```
-E[count] = λ = exp(b0 + b1 × FWI)
-```
-Fit separately for Lightning and Accidental ignition types using daily
-counts joined to ERA-Interim FWI. Days with no ignitions are zero-filled.
-
-**Zero-Inflated Poisson (ZIP)** *(recommended)*
-```
-π  = P(structural zero) = logistic(bz0 + bz1 × FWI)
-λ  = exp(b0 + b1 × FWI)  [count component]
-```
-Handles the excess of zero-ignition days common in most landscapes.
-Fitted via `pscl::zeroinfl()`. ZIP adds `bz0` / `bz1` terms; `bz1` should
-be negative (higher FWI → fewer structural zeros → more fires).
-
-### Ignition surface
-
-Observed ignition point locations are smoothed with a 2D isotropic Gaussian
-kernel onto the LANDIS template grid:
+Fits daily ignition counts against FWI from FPA FOD, separately for
+Lightning and Accidental ignitions.
 
 ```
-w(d) = exp(−d² / (2 × bw²))   for d ≤ max_dist
+Poisson:  λ = exp(b0 + b1 × FWI)
+ZIP:      π = plogis(bz0 + bz1 × FWI)   (probability of a structural zero)
+          E[n] = (1 − π) × λ            (matches SCF, PlugIn.cs:818)
 ```
 
-- **Bandwidth (bw):** Controls the spatial spread of each ignition's influence
-  (typical range 5–15 km). Larger values distribute ignition probability more
-  broadly.
-- **Max distance:** Hard cutoff radius. Set to ~3–4× the bandwidth to retain
-  the full Gaussian tail. Prevents probability from bleeding into areas with
-  no nearby fire history.
-
-Output: INT4S rasters (0–100) for Lightning, Accidental, and Rx ignition maps.
+ZIP is fitted with `pscl::zeroinfl()`. Expect b1 > 0 and bz1 < 0.
 
 ### Workflow
 
-1. Enter path to `FPA_FOD_20221014.gdb`
-2. Select Poisson or ZIP distribution
-3. Adjust kernel bandwidth and max distance
-4. Click **Run Ignition Calibration**
-5. Review **Coefficients** and **Diagnostics** sub-tabs
-6. Open **Scale Adjustment** to adapt the regional b0 to your landscape size
-7. Download ignition maps and terrain maps from **Landscape Maps**
+1. Enter the path to `FPA_FOD_20221014.gdb`.
+2. Choose Poisson or ZIP.
+3. Click **Run Ignition Calibration**.
+4. Review **Coefficients** and **Diagnostics**.
+5. Open **Scale Adjustment** to convert the regional b0 to your landscape:
+   - **Option A (recommended):** add log(landscape area / boundary area).
+   - **Option B:** refit b0 on fires inside the template.
+6. Download ignition surfaces and terrain maps from **Landscape Maps**.
 
-### Scale Adjustment
+Ignition surfaces are a Gaussian kernel of observed ignitions on the template
+grid (`terra::focal`), written as INT4S 0–100 rasters.
 
-The model is calibrated on the large regional boundary. Before entering
-coefficients in SCF, b0 must be scaled to the LANDIS landscape size.
-Two methods are available:
-
-- **Option A — Area Offset (recommended):** adjusts b0 by
-  `log(landscape_area / calibration_area)`. Assumes uniform fire density.
-- **Option B — Park-Specific Intercept:** re-estimates b0 from FPA FOD fires
-  within the LANDIS template extent, holding b1 fixed. Requires ≥15 years of
-  fire history; falls back to Option A with fewer than 3 fires.
-
-### Output sub-tabs
+### Sub-tabs
 
 | Sub-tab | Content |
 |---------|---------|
-| **Method** | Full explanation of the calibration pipeline, models, and workflow |
-| **Overview Map** | FPA FOD ignition points coloured by type |
-| **Coefficients** | Fitted b0, b1, bz0, bz1 per ignition type; download CSV |
-| **Scale Adjustment** | Area-offset or park-intercept scaling; adjusted coefficient table |
-| **LANDIS Validation** | Compare SCF event log ignition counts against ERA-modelled expected range |
-| **Diagnostics** | Observed vs fitted counts, zero-inflation curve, count component, residuals |
-| **ERA Startup Codes** | Compute recommended FFMC/DMC/DC/FWI startup values from ERA climatology |
-| **Landscape Maps** | Download ignition surfaces, terrain maps, and blank suppression maps |
+| **Method** | Walkthrough of the pipeline |
+| **Overview Map** | FPA FOD ignitions by type |
+| **Coefficients** | b0, b1, bz0, bz1 per type; CSV |
+| **Scale Adjustment** | Area offset or park intercept; adjusted coefficients |
+| **LANDIS Validation** | SCF events-log ignition counts vs the expected range |
+| **Diagnostics** | Observed vs fitted, zero-inflation, count component, residuals |
+| **ERA Startup Codes** | FFMC/DMC/DC startup values from climatology |
+| **Landscape Maps** | Ignition surfaces, slope, uphill azimuth, blank suppression maps |
 
 ---
 
-## 6. Tab 2 — Species Table
+## 6. Species Table
 
-Generates `Fire_Spp_Table.csv`, which SCF uses to compute bark thickness
-and fire-induced tree mortality via:
+Builds `Fire_Spp_Table.csv`, which SCF uses for bark thickness:
 
-**SCF Equation 10:**
 ```
 BarkThickness = (MaximumBarkThickness × Age) / (Age + AgeDBH)
 ```
 
-where `MaximumBarkThickness` (cm, double-sided) is the asymptotic bark
-thickness at maximum observed DBH, and `AgeDBH` (years) is the age at which
-bark thickness equals half the maximum.
-
-Parameters are estimated from USFS FIA tree measurement data.
+**Bark thickness is single-sided, in cm.**
+`MaximumBarkThickness = BT_coef × P95_DBH_cm`, where `BT_coef` is the FOFEM
+coefficient. It is read from the Cansler FTM `Species_BarkThickness.csv` when
+the FTM directory is set, so the species table and the cohort mortality fit
+share one set of coefficients. There is **no factor of 2**: doubling it roughly
+halves simulated mortality. `AgeDBH` comes from a Michaelis–Menten DBH-age fit
+to FIA aged trees, with a heuristic fallback when fewer than 15 aged records
+exist.
 
 ### Workflow
 
-**Step 1 — Load Species Lookup CSV**
+1. **Load the species lookup CSV.** Columns:
+   - `SpeciesName`: the LANDIS species code
+   - `FIA_SPCD`: verify it against
+     [REF_SPECIES.csv](https://apps.fs.usda.gov/fia/datamart/CSV/REF_SPECIES.csv)
+   - `SCIENTIFIC_NAME`
 
-Provide the path to a CSV with three columns:
+   Check the SPCD mismatch warnings carefully.
+2. **Choose species:** all in the lookup, those in a NECN species CSV, or a
+   manual list. Click **Build Species Table**.
+3. **Fetch FIA Bark Parameters** for the selected states. Optionally point to
+   a local directory of `{STATE}_TREE.csv` files.
 
-| Column | Description |
-|--------|-------------|
-| `SpeciesName` | LANDIS species code (must match exactly what is used in your NECN and other extension files) |
-| `FIA_SPCD` | Integer FIA species code — verify against [REF_SPECIES.csv](https://apps.fs.usda.gov/fia/datamart/CSV/REF_SPECIES.csv) |
-| `SCIENTIFIC_NAME` | Scientific name (display only) |
-
-The app will flag any SPCD values that differ from its internal reference
-table. Mismatched SPCDs will pull data for the wrong species — check the
-warning banner carefully before proceeding.
-
-**Step 2 — Filter or Add Species**
-
-- *All species in lookup:* Uses every row in the lookup CSV.
-- *Filter to NECN CSV:* Loads the `SpeciesCode` column from a NECN species
-  parameter CSV and restricts the table to those species.
-- *Manual entry:* Type species codes one per line.
-
-Click **Build Species Table** to create a stub table with default values.
-
-**Step 3 — Fetch FIA Bark Parameters**
-
-1. Select the US states to query (multi-select; default OR, WA, ID, MT).
-2. Optionally enter a **local FIA directory** containing pre-downloaded
-   `{STATE}_TREE.csv` files.
-3. Click **Fetch FIA Bark Parameters**.
-
-For each species the app computes:
-- **MaximumBarkThickness:** `2 × bark_ratio × P95_DBH_cm`, where `bark_ratio`
-  comes from a built-in literature table (Ryan & Reinhardt 1988; Cansler et
-  al. 2020) and `P95_DBH_cm` is the 95th-percentile DBH across live FIA trees.
-- **AgeDBH:** Fitted from a Michaelis-Menten DBH growth curve using FIA aged
-  records (`TOTAGE` preferred; `BHAGE` + species-specific correction as
-  fallback). Falls back to a bark-thickness-class heuristic when fewer than
-  15 aged records exist.
-
-### Output sub-tabs
-
-| Sub-tab | Content |
-|---------|---------|
-| **Species Parameters** | Editable table — double-click cells to override values |
-| **Bark Thickness Curves** | SCF Eq. 10 preview curves for all species |
-| **Species Lookup Table** | Contents of the loaded lookup CSV |
+Sub-tabs: **Species Parameters** (editable), **Bark Thickness Curves**,
+**Species Lookup Table**.
 
 ---
 
-## 7. Tab 3 — Spread Calibration
+## 7. Spread Calibration
 
-Calibrates fire spread parameters using historical daily fire perimeter
-progressions from GeoMAC. Open the **Method** sub-tab for a full explanation
-of the calibration pipeline. 
+Fits SCF's spread probability and maximum daily spread area from daily fire
+perimeter progressions.
 
 ### Models
 
-**Cell-to-Cell Spread Probability (Logistic GLM)**
 ```
-P(spread) = 1 / (1 + exp(−(B0 + B1·FWI + B2·FineFuels + B3·EWS)))
-```
-Response: binary (1 = spread pixel, 0 = no-spread pixel) from rasterized
-sequential perimeter pairs. All coefficients should be positive (higher
-FWI, fuels, and wind → more spread). Diagonal spread receives a 0.71×
-weight inside SCF at runtime; this does not affect calibrated coefficients.
-
-**Maximum Daily Spread Area (Linear OLS)**
-```
-MaxSpreadArea (ha) = B0 + B1·FWI + B2·EWS
-```
-Response: daily burned area increment (ha) from perimeter pairs. Fit on
-**raw hectares — no log transform**. Coefficients enter SCF directly without
-back-transformation. B0 must be positive to prevent negative MaxSpreadArea
-at low FWI. Calibrated to the **75th percentile** of daily area increments
-(MaxSpreadArea is a ceiling, not a mean — fitting to the mean underpredicts
-daily spread).
-
-**Effective Wind Speed (Nelson 2002)**
-```
-EWS = Cb × √( (Ua/Cb)² + 2·(Ua/Cb)·sin(θ)·cos(φ) + sin²(θ) )
+P(spread)     = 1 / (1 + exp(−(B0 + B1·FWI + B2·FineFuels + B3·EWS)))
+MaxSpreadArea = (int)(B0 + B1·FWI + B2·EWS)      hectares per day
+EWS           = Cb·√((Ua/Cb)² + 2(Ua/Cb)·sin θ·cos φ + sin² θ)   (Nelson 2002, km/h)
 ```
 
-| Symbol | Meaning |
-|--------|---------|
-| `Ua` | ERA5 wind speed in km/h |
-| `θ` | Slope angle at fire centroid (radians) |
-| `φ` | Angle between wind direction and uphill azimuth |
-| `Cb` | Combustion buoyancy: 10 (low), 25 (moderate), 50 (high) |
-
-Slope and aspect are extracted from a DEM fetched via `elevatr` at each
-perimeter pair centroid. EWS is always in km/h to match the SCF climate
-library convention.
+- **Spread probability:** a binomial GLM on sequential perimeter pairs. The
+  default calibration level is the **fire-day aggregate**, which models the
+  fraction of frontier cells that burned per fire-day (B2 is 0 in this mode).
+  By default each perimeter gets the FWI of the GRIDMET cell it sits in
+  ("Use per-fire FWI").
+  - **Only the slopes (B1, B3) come from the regression.** Spread in SCF is
+    single-trial percolation, and case-control sampling biases the intercept,
+    so **B0 must be set by simulation**. Use Parameter Tuning > **B0 Sweep**,
+    then confirm with LANDIS runs in **Score Candidates**.
+- **MaxSpreadArea:** quantile regression (`quantreg`) on raw ha/day, with no
+  log transform; the 75th percentile is recommended.
+  - It **paces** the fire (cells per day). It does not cap fire size.
+  - Keep B0 > 0. Below zero, SCF burns one cell per day. The
+    coefficient-constraint option enforces B0 ≥ 50 ha.
+- **EWS:** wind in km/h; slope and aspect from a DEM; combustion buoyancy Cb
+  chosen in the inputs (10, 25 or 50).
 
 ### Workflow
 
-1. Enter path to `Historic_Geomac_Perimeters_All_Years_2000_2018.gdb`
-2. Adjust cleaning thresholds and rasterization cell size
-3. Set sampling controls for the logistic regression
-4. Select fine fuels source (None / LANDFIRE / local GeoTIFF)
-5. Click **Run Spread Fitting**
-6. Review **Fit Coefficients** and **Diagnostics**
-7. Check **Terrain** tab — verify EWS > raw wind for upslope-driven fires
-8. Optionally use **Threshold Search** to optimise cleaning thresholds
-
-### Output sub-tabs
-
-| Sub-tab | Content |
-|---------|---------|
-| **Method** | Full explanation of the calibration pipeline, models, EWS, and workflow |
-| **Fit Coefficients** | Coefficient tables for both models; download CSV |
-| **Maps** | Fine fuels index map; GeoMAC calibration fires coloured by year |
-| **Diagnostics** | Spread probability vs FWI and wind; ROC curve; observed vs predicted daily area |
-| **Terrain** | EWS vs raw wind comparison; slope distribution; wind-to-upslope alignment; slope and aspect maps |
-| **Perimeter Pairs** | Cleaned perimeter progression table; download CSV |
-| **Candidate Grid** | Define parameter search grid, export SCF snippets, score candidates |
-| **Threshold Search** | Grid search over cleaning and sampling thresholds scored by AUC × R² |
-| **Score Candidates** | Read each run's `socialclimatefire-events-log.csv` from `<runs root>/candidate_NNNN/` and rank candidates by fire-size distribution and annual area burned (fire rotation) against FPA FOD |
-
----
-
-## 8. Tab 4 — Parameter Tuning
-
-An interactive workspace for exploring parameter interactions before running
-full LANDIS simulations. Adjusts spread, mortality, and ignition parameters
-via sliders and immediately shows predicted behaviour.
-
-### Sub-tabs
-
-**Fire Size Distribution**
-
-Runs a lightweight cellular-automaton fire simulator across a grid of
-FWI × EWS scenarios. The simulated grid dimensions and cell area are
-derived automatically from the loaded LANDIS template raster (falls back
-to manual input if no template is loaded).
-
-Observed FPA FOD fires are overlaid as dodged boxplots against simulated
-distributions. FWI and EWS for each observed fire are computed as the
-**mean over the full fire duration** (discovery date → containment date)
-using ERA FWI and ERA5 wind daily series. Fires < 4 ha are excluded from
-the observed overlay (86% of FPA FOD fires nationally are below this
-threshold; the remaining fires represent the landscape-scale events SCF
-is designed to model).
-
-**Site Mortality**
-
-Explores the Gamma GLM site mortality model:
-```
-eta = B0 + B1·Clay + B2·ET + B3·EWS + B4·CWD + B5·FineFuels + B6·LadderFuels
-dNBR = 1 / eta
-```
-
-Four diagnostic panels:
-- **Predicted dNBR vs Wind Speed** — curves at multiple ladder fuel loads
-- **MTBS Observed Severity** — histogram of observed dNBR from MTBS data
-- **Eta Decomposition** — horizontal bar chart showing each term's
-  contribution to eta; blue = increases eta (less severe), red = decreases
-  eta (more severe)
-- **EWS × LadderFuels Severity Map** — 2D heatmap of severity class across
-  the full EWS × LadderFuels space with white contour lines at dNBR
-  185/355/600/1000 thresholds
-- **Marginal Effects** — 2×3 grid of panels showing predicted dNBR as each
-  predictor is varied individually with all others held at current slider
-  values
-
-**SCF Snippet**
-
-Formats all tuned parameters into a ready-to-paste SCF parameter file
-snippet with units annotations.
-
----
-
-## 9. Tab 5 — Model Validation
-
-Compares SCF simulation outputs against observed fire data at two spatial
-scales: the large calibration boundary and the LANDIS landscape extent.
+1. Choose the perimeter source: **NIROPS** (recommended; needs GRIDMET FWI),
+   **FIRED**, or **GeoMAC**.
+2. Set cleaning thresholds, rasterization, sampling, fine fuels source, season
+   filters and predictors.
+3. Click **Run Spread Fitting**; review **Fit Coefficients** and **Diagnostics**.
+4. Check **Terrain**: EWS should exceed raw wind on upslope runs.
+5. Set B0 with **Parameter Tuning > B0 Sweep**.
+6. Optionally build a **Candidate Grid**, run LANDIS for each candidate, and
+   rank them in **Score Candidates**.
 
 ### Sub-tabs
 
 | Sub-tab | Content |
 |---------|---------|
-| **Ignitions** | Annual ignition counts: observed (FPA FOD) vs simulated (SCF) at calibration and landscape scales |
-| **Fire Size Distribution** | Empirical CDF of fire sizes: observed vs simulated |
-| **Annual Area Burned** | Two separate panels — calibration boundary scale and LANDIS landscape scale — with independent y-axes |
-| **Fire-Climate Relationship** | Fire size binned by FWI and EWS: observed (FPA FOD, ≥ 4 ha) vs simulated |
-| **Fire Count vs FWI** | Daily ignition counts vs FWI: observed and simulated |
+| **Method** | Walkthrough of the pipeline |
+| **Fit Coefficients** | Both models' coefficients; CSV |
+| **Maps** | Fine fuels; calibration fires |
+| **Diagnostics** | P(spread) vs FWI/wind, percolation check against runtime FWI, observed vs predicted daily area |
+| **Terrain** | EWS vs raw wind, slope, wind–upslope alignment |
+| **Perimeter Pairs** | Cleaned perimeter progression table; CSV |
+| **Candidate Grid** | Grid of spread B0 × B1. Exports one SCF snippet per candidate (.zip, each with its B0 and B1) |
+| **Threshold Search** | Cleaning/sampling thresholds scored by AUC × R² |
+| **Score Candidates** | Ranks candidate LANDIS runs (see below) |
+| **Fire Growth Animation** | Animated perimeter progression for one fire |
 
-Simulated data are loaded by entering the path to a
-`socialclimatefire-events-log.csv` output from a LANDIS run. FPA FOD and
-ERA FWI data from the Ignition Calibration tab are used automatically.
+### Score Candidates
 
----
+Put each LANDIS run in `<runs root>/candidate_0001/`, `candidate_0002/` and so
+on, matching the Candidate Grid IDs. The `socialclimatefire-events-log.csv` can
+be anywhere inside each folder. Each run gets two scores, both mean |log ratio|
+(0 = perfect, 0.69 = off by a factor of 2):
 
-## 10. SCF Parameter Mappings
+- **Fire size:** the 10th–90th percentiles of fires larger than one cell and no
+  larger than the landscape, against FPA FOD.
+- **Annual area:** the mean fraction of the landscape burned per year (the fire
+  rotation), against the observed fraction of the calibration boundary.
+  Simulation years are not matched to calendar years.
 
-### Ignition (SCF Eqs. 1–3)
-
-```
-AccidentalIgnitionB0    ← b0  (Accidental row in coefficient table)
-AccidentalIgnitionB1    ← b1
-AccidentalIgnitionBZ0   ← bz0  (ZIP only)
-AccidentalIgnitionBZ1   ← bz1  (ZIP only)
-
-LightningIgnitionB0     ← b0  (Lightning row)
-LightningIgnitionB1     ← b1
-LightningIgnitionBZ0    ← bz0  (ZIP only)
-LightningIgnitionBZ1    ← bz1  (ZIP only)
-```
-
-### Spread Probability (SCF CanSpread())
-
-```
-SpreadProbabilityB0     ← B0_Intercept
-SpreadProbabilityB1     ← B1_FWI
-SpreadProbabilityB2     ← B2_FineFuels    (0.0 if fine fuels = None)
-SpreadProbabilityB3     ← B3_EffectiveWind
-```
-
-### Maximum Daily Spread Area (SCF Spread())
-
-```
-MaximumSpreadAreaB0     ← B0_Intercept
-MaximumSpreadAreaB1     ← B1_FWI
-MaximumSpreadAreaB2     ← B2_EffectiveWind
-```
-
-> **Critical:** These coefficients are calibrated on **raw hectares** (no
-> log transform). They enter SCF directly without back-transformation.
-> B0 must be positive to prevent `MaxSpreadArea < 0` warnings in SCF at
-> low FWI values.
-
-### Bark Thickness (SCF Eq. 10)
-
-```
-Species_CSV_File  ← Fire_Spp_Table.csv   (SpeciesCode, AgeDBH, MaximumBarkThickness)
-```
-
-### Wind Units
-
-ERA5 wind (m/s) is converted to **km/h** before all calibration steps
-(multiply by 3.6). The SCF climate library expects DailyWindSpeed in km/h
-(SCF User Guide §2.43). Using m/s will produce spread and EWS coefficients
-that are wrong by a factor of 3.6.
+A run that burns nothing ranks last. Missing runs are reported in a status
+column.
 
 ---
 
-## 11. Output Files Reference
+## 8. Mortality Calibration
 
-| File | Tab | Format | Description |
-|------|-----|--------|-------------|
-| `ignition_coefficients.csv` | Ignition → Coefficients | CSV | b0, b1, bz0, bz1 per type |
-| `adjusted_coefficients.csv` | Ignition → Scale Adjustment | CSV | Landscape-scaled b0 |
-| `startup_values.csv` | Ignition → ERA Startup | CSV | FFMC/DMC/DC/FWI startup values |
-| `Lightning_Ignition_Map.tif` | Ignition → Landscape Maps | INT4S | Lightning ignition probability surface (0–100) |
-| `Accidental_Ignition_Map.tif` | Ignition → Landscape Maps | INT4S | Accidental ignition probability surface (0–100) |
-| `Rx_Ignition_Map.tif` | Ignition → Landscape Maps | INT4S | Prescribed fire ignition surface (0–100) |
-| `GroundSlope.tif` | Ignition → Landscape Maps | INT2S | Ground slope in degrees |
-| `UphillSlope.tif` | Ignition → Landscape Maps | INT2S | Uphill azimuth 0–359° from North |
-| `Suppression_Accidental_3Zones.tif` | Ignition → Landscape Maps | FLT4S | Blank suppression map (0.0) |
-| `Suppression_Lightning_3Zones.tif` | Ignition → Landscape Maps | FLT4S | Blank suppression map (0.0) |
-| `Suppression_Rx_3Zones.tif` | Ignition → Landscape Maps | FLT4S | Blank suppression map (0.0) |
-| `Fire_Spp_Table.csv` | Species Table | CSV | SpeciesCode, AgeDBH, MaximumBarkThickness |
-| `Fire_Spp_Table_annotated.csv` | Species Table | CSV | Full table with FIA SPCDs and estimation notes |
-| `spread_coefficients.csv` | Spread → Fit Coefficients | CSV | All spread model coefficients |
-| `geomac_clean_pairs.csv` | Spread → Perimeter Pairs | CSV | Cleaned perimeter pair dataset |
+Fits SCF's site severity (dNBR) and cohort mortality models. Signs and units
+matter here more than anywhere else; see
+[`docs/SCF_semantics.md` §6](docs/SCF_semantics.md#6-mortality).
+
+```
+Site:    eta = B0 + B1·Clay + B2·PET + B3·EWS + B4·CWD + B5·FineFuels + B6·LadderFuels
+         dNBR = max(eta, 0.0005)⁻¹                 (Gamma GLM, inverse link)
+Cohort:  P = exp(B0 + B1·BarkThickness + B2·SiteMortality);  p = P/(1+P)
+```
+
+- **Signs are inverted** in the site model: B0 > 0, and anything that raises
+  severity has a negative coefficient. The fit reports how many pixels reach
+  the 0.0005 floor (dNBR 2000); anything above 0% is a scale error.
+- **LadderFuels is raw biomass in g m⁻², not an index.** It is built from
+  LANDFIRE canopy bulk density × canopy depth below the ladder ceiling, and must
+  match `LadderFuelMaxAge` and `LadderFuelSpeciesList`.
+- **Cohort mortality** uses the Fire and Tree Mortality database, with
+  cluster-robust standard errors by fire. Expect B1 < 0 and B2 > 0.
+
+### Inputs
+
+| Input | Source |
+|-------|--------|
+| Clay | SOLUS100 + SoilGrids (fraction 0–1) |
+| dNBR | MTBS: download automatically or point to local per-fire TIFFs. Prefer continuous RdNBR over the 6-class thematic mosaic. |
+| PET and CWD | TerraClimate (remote) or local annual rasters, mm/yr |
+| EWS | Computed from the wind series and terrain (Nelson 2002); run Spread Calibration first for slope and aspect, otherwise raw wind is used |
+| Fine fuels | Reused from the Spread tab, otherwise LANDFIRE FBFM40 fetched at fit time |
+| Ladder fuels | LANDFIRE canopy biomass (remote), a local g m⁻² raster, or None (B6 = 0) |
+| Cohort data | Fire and Tree Mortality database directory |
+
+Sub-tabs: **Site Mortality Coefficients**, **Diagnostics**, **Data Summary**,
+**Parameter Snippet**, **Model Validation**.
 
 ---
 
-## 12. Troubleshooting
+## 9. Model Validation
+
+Compares a LANDIS run's `socialclimatefire-events-log.csv` (or the folder
+containing it) against observed data.
+
+| Sub-tab | Content |
+|---------|---------|
+| **Ignitions** | Annual ignition counts, observed vs simulated |
+| **Fire Size Distribution** | ECDF of fire sizes (fires ≥ one cell) |
+| **Annual Area Burned** | Calibration boundary and landscape scales |
+| **Fire-Climate Relationship** | Fire size by FWI and EWS bin |
+| **Annual Count vs FWI** | Ignitions vs FWI |
+| **Severity (dNBR)** | Simulated vs MTBS severity, and against EWS |
+| **Fire Duration** | Simulated vs observed fire durations |
+| **Fire Return Interval** | SCF fire maps vs LANDFIRE mean FRI |
+
+---
+
+## 10. Parameter Tuning
+
+Explore and test a full parameter set before running LANDIS.
+
+- **Parameters sidebar:** start by clicking **← Load from Calibration**; until
+  then it holds placeholder defaults. Every panel uses these values.
+- **`MaximumFineFuels` defaults to 900 g C m⁻²**, the load the calibration
+  scaled FineFuels = 1.0 to.
+
+| Sub-tab | Content |
+|---------|---------|
+| **Observed Targets** | FPA FOD size distribution and MTBS severity to aim for |
+| **Overview** | All equations at the current values |
+| **Ignitions** | Fits and diagnostics for the tuned ignition coefficients |
+| **Max Spread Area** / **Spread Probability** | Response surfaces against FWI and EWS |
+| **Fine Fuels** | `MaximumFineFuels` scaling and saturation check. If you raise it, it tells you the factor to multiply B2 and B5 by. |
+| **Site Mortality** / **Cohort Mortality** | Predicted dNBR and cohort mortality curves |
+| **Fire Simulation** | One fire on a 100×100 grid using SCF's spread rules |
+| **Fire Size Distribution** | Many fires, on **real daily weather** (default) or a constant FWI × EWS grid |
+| **B0 Sweep** | Sets `SpreadProbabilityB0` by simulation |
+
+### The fire simulator
+
+`simulate_fire_simple()` is a port of SCF's spread loop:
+
+- a FIFO queue in SCF's neighbour order
+- one trial per cell
+- the 0.71 diagonal weight
+- MaxSpreadArea pacing
+- the day-364 cutoff
+- optional daily weather
+
+It reproduces a literal per-cell translation of SCF's C# loop cell for cell.
+It does not model suppression, the escalation of EWS with intensity, varying
+fuels or terrain, or the landscape's irregular edge. Treat its sizes as a fast
+screen and LANDIS runs as the test.
+
+### Real-weather ensemble and B0 sweep
+
+- **Ignition days** are drawn from the weather record in proportion to SCF's
+  expected daily ignitions. Each fire then burns on that year's actual daily
+  FWI and wind until it goes out or reaches day 364.
+- **Weather source:**
+  - **Runtime**: FWI from your LANDIS climate file. This is what SCF uses.
+  - **Calibration**: ERA or GRIDMET FWI with GRIDMET wind.
+- **B0 Sweep** runs the ensemble at each B0, with the same ignition days and
+  random draws for every B0. It scores two things:
+  - **fire size** against FPA FOD
+  - **annual area burned**: SCF ignitions per year × mean area per ignition,
+    against the observed regional burn rate
+- **Sweep steps:** a coarse pass stops once results stop improving, then a fine
+  pass refines around the best value. **Use best B0** writes the result to the
+  Parameters sidebar.
+- **Weights:** set the area weight to 0 if your landscape's burn rate differs
+  from the region's. The status box warns when size and area favour very
+  different B0 values, which means B0 alone can't fit both; look at B1,
+  MaxSpreadArea or the ignition counts.
+
+### Export
+
+**Download SCF snippet** writes the tuned parameters in SCF syntax, in two
+labelled sections for where they go in the parameter file. Ignition b0 has the
+area offset applied; without the landscape areas loaded, the ignition section
+is written commented out.
+
+---
+
+## 11. Session — Save and Restore
+
+- **Download Settings (JSON):** every input, small enough to email.
+- **Save Computed Data (.RData):** all loaded and fitted data. It is large
+  (several GB with GRIDMET), so load it back by entering its path.
+
+Both are gitignored. A session saved before 2026-11-16 restores the old
+`MaximumFineFuels` of 18000; set it back to 900.
+
+---
+
+## 12. Putting Parameters into SCF
+
+Each export says where in the parameter file each section goes. SCF reads
+keywords in a fixed order, so paste each section where its header says.
+Section order and syntax are in
+[`docs/SCF_semantics.md` §1](docs/SCF_semantics.md#1-parameter-file-syntax-and-order).
+
+| Parameters | App source | Notes |
+|------------|------------|-------|
+| `LightningIgnitionsB0/B1`, `AccidentalIgnitionsB0/B1` | Ignition → Scale Adjustment, or the Tuning export | Keywords are **plural**. Use the **landscape** b0. |
+| `IgnitionDistribution ZeroInflatedPoisson` + `…IgnitionsBinomialB0/B1` | ZIP fit | The `IgnitionDistribution` line must come before the Binomial keywords. |
+| `MaximumFineFuels` | Tuning sidebar | ~900 g C m⁻² to match the fine-fuel scaling |
+| `MaximumSpreadAreaB0–B2` | Spread → Fit Coefficients (75th percentile) | Raw ha; B0 > 0 |
+| `SpreadProbabilityB0–B3` | B1, B3 from the Spread fit; **B0 from B0 Sweep** | |
+| `SiteMortalityB0–B6`, `CohortMortalityB0–B2` | Mortality → Parameter Snippet | Inverted signs; B6 in g m⁻² |
+| `TimeZeroPET`, `TimeZeroCWD` | Mortality → Parameter Snippet | Right after `Timestep` |
+| `LadderFuelMaxAge`, `LadderFuelSpeciesList` | Mortality inputs | Species on the line after the keyword |
+| `Species_CSV_File` | Species Table → `Fire_Spp_Table.csv` | Single-sided bark thickness |
+
+Also check:
+
+- **Suppression:** leave the suppression table at 0, or re-tune B0. The
+  historical perimeters were already suppressed.
+- **Wind:** wind in your LANDIS climate file must convert to km/h.
+
+---
+
+## 13. Output Files Reference
+
+| File | Tab | Description |
+|------|-----|-------------|
+| `ignition_coefficients.csv` | Ignition → Coefficients | b0, b1, bz0, bz1 per type (regional) |
+| `adjusted_coefficients.csv` | Ignition → Scale Adjustment | Landscape-scaled b0 |
+| `startup_values.csv` | Ignition → ERA Startup Codes | FFMC/DMC/DC/FWI startup values |
+| `Lightning_Ignition_Map.tif`, `Accidental_Ignition_Map.tif`, `Rx_Ignition_Map.tif` | Ignition → Landscape Maps | Ignition surfaces (INT4S 0–100) |
+| `GroundSlope.tif`, `UphillSlope.tif` | Ignition → Landscape Maps | Slope (degrees) and uphill azimuth |
+| `Suppression_*_3Zones.tif` | Ignition → Landscape Maps | Blank suppression maps (0) |
+| `Fire_Spp_Table.csv` (+ `_annotated`) | Species Table | SpeciesCode, AgeDBH, MaximumBarkThickness |
+| `spread_coefficients.csv` | Spread → Fit Coefficients | All spread model coefficients |
+| `geomac_clean_pairs.csv` | Spread → Perimeter Pairs | Cleaned perimeter pairs |
+| `candidate_grid.csv`, `scf_param_snippets.zip` | Spread → Candidate Grid | Candidate list and one SCF snippet per candidate |
+| `candidate_scores.csv` | Spread → Score Candidates | Scores, fire rotation and status per candidate |
+| `mortality_parameters.txt` | Mortality → Parameter Snippet | Site/cohort coefficients in 3 placement sections |
+| `scf_tuning_*.txt` | Parameter Tuning | Tuned parameter set in 2 placement sections |
+| `b0_sweep_*.csv` | Parameter Tuning → B0 Sweep | Scores and fire sizes for each B0 |
+
+---
+
+## 14. Troubleshooting
+
+### Score Candidates shows "no events log" or "no run folder"
+
+Each run must be in `<runs root>/candidate_NNNN/` with the 4-digit candidate
+ID. The events log must be named `socialclimatefire-events-log.csv` and can
+be at any depth inside that folder.
+
+### The B0 sweep or ensemble says no weather is loaded
+
+- **Runtime:** load your LANDIS climate CSV under **Runtime FWI check** in the
+  sidebar.
+- **Calibration:** load the sidebar FWI and fetch GRIDMET wind.
+
+### Fires in the Tuning simulator all die, or all hit the grid edge
+
+That is percolation: fire only spreads when P(spread) is above about 0.45–0.5.
+Fitted B0 values are usually far too low, which is expected; set B0 with the
+**B0 Sweep**. If most fires reach the grid edge, the grid (from the template's
+largest dimension) is limiting size; the status box reports this.
 
 ### FIA data fetch fails: "OneIndex" error or empty files
 
-Your `_TREE.csv` files may be 0-byte placeholders (common if the directory
-was created by a cloud sync service before files downloaded). The app detects
-empty files and re-downloads them via `rFIA::getFIA()` automatically. If the
-error persists, check that R has write access to the FIA directory and that
-you have an active internet connection.
-
-### ERA5 wind data not loading
-
-Ensure your NetCDF files contain `u10` and `v10` variable names at 12:00 UTC
-daily timesteps. The app computes wind speed as `sqrt(u10² + v10²) × 3.6`
-(m/s → km/h). Files from the Copernicus CDS single-level reanalysis product
-are compatible. Check the file dates match the calibration period set in the
-sidebar.
+Your `_TREE.csv` files may be 0-byte placeholders left by a cloud sync service.
+The app re-downloads empty files with `rFIA::getFIA()`. If the error persists,
+check write access to the FIA directory and your internet connection.
 
 ### Spread fitting is slow
 
-The spread probability stage rasterizes each perimeter pair and samples
-cells across the calibration boundary. Processing time scales with the number
-of fires, rasterization cell size, and the failure-to-success sampling ratio.
-Increasing the cell size, reducing the calibration period, or reducing max
-cells per pair will speed up fitting at some cost to precision. The
-**Threshold Search** tab tests threshold combinations efficiently by
-rasterizing once at the widest settings and filtering from cache.
+Time scales with the number of fires, the rasterization cell size and the
+failure-to-success sampling ratio. Increase the cell size, shorten the period,
+or lower the cells per pair. **Threshold Search** rasterizes once and filters
+from a cache.
 
-### Fire ensemble runs at wrong scale
+### SPCD mismatch warnings when loading the species lookup CSV
 
-If no LANDIS template raster is loaded, the ensemble uses the manual
-"Grid size" input (default 200 cells per side). When a template is loaded,
-the ensemble automatically uses `max(nrow, ncol)` of the template and the
-template cell area. Load the template in the sidebar before clicking
-**Run Ensemble** to ensure simulations match your landscape.
-
-### SPCD mismatch warnings when loading species lookup CSV
-
-The app compares your FIA SPCD values against an internal reference table.
-Incorrect SPCDs will cause the wrong species to be matched in FIA data.
-Verify against [REF_SPECIES.csv](https://apps.fs.usda.gov/fia/datamart/CSV/REF_SPECIES.csv).
+Incorrect SPCDs match the wrong species in FIA data. Verify against
+[REF_SPECIES.csv](https://apps.fs.usda.gov/fia/datamart/CSV/REF_SPECIES.csv).
 
 ### renv::restore() is slow or fails
 
-On first use, renv installs all packages from source or CRAN binaries
-(~5–15 minutes). If a GitHub-sourced package fails (`climateR`, `rFIA`),
-ensure you have a working internet connection. Run
-`renv::restore(prompt = FALSE)` to skip confirmation prompts.
+The first install takes 5–15 minutes. For GitHub 403 errors see
+[Windows and macOS](#windows-and-macos). `renv::restore(prompt = FALSE)` skips
+the confirmation prompts.
 
 ---
 
-## 13. Data Sources & Citations
+## 15. Data Sources & Citations
 
-**ERA-Interim FWI:**
-Vitolo, C., Di Giuseppe, F., Barnard, C., Coughlan, R., San-Miguel-Ayanz, J.,
-Libertá, G., & Krzeminski, B. (2019). ERA-interim based global fire weather
-index series. *Scientific Data*, 6(1), 190032.
+**ERA-Interim FWI:** Vitolo, C., et al. (2019). ERA-interim based global fire
+weather index series. *Scientific Data*, 6, 190032.
 <https://doi.org/10.5281/zenodo.1065400>
 
-**ERA5 Wind:**
-Hersbach, H., et al. (2020). The ERA5 global reanalysis. *Quarterly Journal
-of the Royal Meteorological Society*, 146(730), 1999–2049.
-<https://doi.org/10.1002/qj.3803>
+**GRIDMET:** Abatzoglou, J. T. (2013). Development of gridded surface
+meteorological data for ecological applications and modelling. *International
+Journal of Climatology*, 33, 121–131. <https://doi.org/10.1002/joc.3413>
 
-**FPA Fire Occurrence Database:**
-Short, K. C. (2022). Spatial wildfire occurrence data for the United States,
-1992–2020 (FPA FOD). Forest Service Research Data Archive.
-<https://doi.org/10.2737/RDS-2013-0009.6>
+**Canadian FWI System (`cffdrs`):** Wang, X., et al. (2017). cffdrs: an R
+package for the Canadian Forest Fire Danger Rating System. *Ecological
+Processes*, 6, 5. <https://doi.org/10.1186/s13717-017-0070-z>
 
-**GeoMAC Historic Perimeters:**
-National Interagency Fire Center (NIFC). Historic Geomac Perimeters 2000–2018.
+**FPA Fire Occurrence Database:** Short, K. C. (2022). Spatial wildfire
+occurrence data for the United States, 1992–2020 (FPA FOD). Forest Service
+Research Data Archive. <https://doi.org/10.2737/RDS-2013-0009.6>
+
+**GeoMAC Historic Perimeters:** National Interagency Fire Center.
 <https://www.nifc.gov/fire-information/maps-imagery-data-products/historical-fire-data>
 
-**LANDFIRE FBFM40:**
-LANDFIRE Program (2024). LF2024 Fire Behavior Fuel Model 40 (FBFM40), CONUS.
-U.S. Department of the Interior. <https://landfire.gov>
+**FIRED:** Balch, J. K., et al. (2020). FIRED (Fire Events Delineation): an
+open, flexible algorithm and database of US fire events derived from the MODIS
+burned area product. *Remote Sensing*, 12, 3498.
+<https://doi.org/10.3390/rs12213498>
 
-**FIA Tree Data:**
-U.S. Forest Service Forest Inventory and Analysis Program.
+**LANDFIRE:** LANDFIRE Program. FBFM40 and canopy fuel layers, CONUS. U.S.
+Department of the Interior. <https://landfire.gov>
+
+**MTBS:** Eidenshink, J., et al. (2007). A project for monitoring trends in
+burn severity. *Fire Ecology*, 3, 3–21. <https://www.mtbs.gov>
+
+**TerraClimate:** Abatzoglou, J. T., et al. (2018). TerraClimate, a
+high-resolution global dataset of monthly climate and climatic water balance
+from 1958–2015. *Scientific Data*, 5, 170191.
+<https://doi.org/10.1038/sdata.2017.191>
+
+**FIA Tree Data:** U.S. Forest Service Forest Inventory and Analysis Program.
 FIADB DataMart. <https://apps.fs.usda.gov/fia/datamart/>
 
-**Effective Wind Speed:**
-Nelson, R. M. Jr. (2002). An effective wind speed for models of fire spread.
-*International Journal of Wildland Fire*, 11(3), 153–161.
+**Effective Wind Speed:** Nelson, R. M. Jr. (2002). An effective wind speed for
+models of fire spread. *International Journal of Wildland Fire*, 11, 153–161.
 <https://doi.org/10.1071/WF01031>
 
-**Bark Thickness Coefficients:**
-Ryan, K. C., & Reinhardt, E. D. (1988). Predicting postfire mortality of
-seven western conifers. *Canadian Journal of Forest Research*, 18(10),
-1291–1297. <https://doi.org/10.1139/x88-199>
+**Bark thickness and tree mortality:** Ryan, K. C., & Reinhardt, E. D. (1988).
+Predicting postfire mortality of seven western conifers. *Canadian Journal of
+Forest Research*, 18, 1291–1297. <https://doi.org/10.1139/x88-199> —
+Cansler, C. A., et al. (2020). The Fire and Tree Mortality Database, for
+empirical modeling of individual tree mortality after fire. *Scientific Data*,
+7, 194. <https://doi.org/10.1038/s41597-020-0522-7>
 
-Cansler, C. A., Hood, S. M., Varner, J. M., et al. (2020). The Fire and
-Tree Mortality Database, for empirical modeling of individual tree mortality
-after fire. *Scientific Data*, 7(1), 194.
-<https://doi.org/10.1038/s41597-020-0522-7>
-
-**SCF Extension:**
-Shinneman, D. J., et al. Social-Climate-Fire (SCF) v4 LANDIS-II Extension.
+**SCF Extension:** LANDIS-II Social-Climate-Fire v4.
 <https://github.com/LANDIS-II-Foundation/Extension-Social-Climate-Fire>
