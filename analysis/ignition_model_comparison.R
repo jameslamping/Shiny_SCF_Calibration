@@ -25,6 +25,10 @@ suppressPackageStartupMessages({
 
 source("modules/ignition_helpers.R")
 source("modules/era_helpers.R")
+source("modules/user_paths.R")
+# Run from the app folder.  Paths come from user_paths.R (gitignored; copy
+# user_paths_template.R), the same file the app uses.
+UP <- load_user_paths(".")
 
 dir.create("analysis/plots", showWarnings = FALSE, recursive = TRUE)
 
@@ -33,11 +37,11 @@ dir.create("analysis/plots", showWarnings = FALSE, recursive = TRUE)
 # =============================================================================
 
 cat("--- Loading calibration boundary ---\n")
-shp_path <- "/Users/jlamping/Documents/Anthropic_Projects/scf_calibration_app/data_raw/landscape/S_USA.ECOSYS_ECOMAPPROVINCES_2025/ECOSYS_CoastalRange.shp"
+shp_path <- user_path(UP, "shp_path")
 cal_vect_raw <- vect(shp_path)
 
 cat("--- Loading LANDIS template raster ---\n")
-tif_path <- "/Users/jlamping/Documents/Anthropic_Projects/scf_calibration_app/data_raw/landscape/NOCA_ClimateRegions_09122025.tif"
+tif_path <- user_path(UP, "tif_path")
 template_r  <- rast(tif_path)
 working_crs <- crs(template_r)
 
@@ -46,7 +50,7 @@ cal_vect_proj <- project(cal_vect_raw, working_crs)
 cat("  Template CRS:", substr(working_crs, 1, 60), "\n")
 
 cat("--- Extracting ERA-Interim FWI time series ---\n")
-fwi_nc <- "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/Climate/ERA-Interim/data/fwi.nc"
+fwi_nc <- user_path(UP, "era_fwi_path")
 fwi_daily <- extract_era_timeseries(
   nc_path   = fwi_nc,
   park_vect = cal_vect_proj,
@@ -57,7 +61,7 @@ cat(sprintf("  FWI: %d daily values (%s to %s)\n",
             nrow(fwi_daily), min(fwi_daily$date), max(fwi_daily$date)))
 
 cat("--- Loading FPA FOD ignitions ---\n")
-fpa_gdb <- "/Users/jlamping/Documents/Anthropic_Projects/scf_calibration_app/data_raw/FPA_FOD/FPA_FOD_20221014.gdb"
+fpa_gdb <- user_path(UP, "fpa_gdb_path")
 ign_df <- load_fpa_fod(
   gdb_path    = fpa_gdb,
   cal_vect    = cal_vect_proj,

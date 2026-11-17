@@ -44,6 +44,22 @@ if (!requireNamespace("tigris", quietly = TRUE)) {
 options(tigris_use_cache = TRUE)   # cache downloaded shapefiles locally
 
 
+# ---- App folder and per-user paths ------------------------------------------
+# File paths come from user_paths.R in the app folder (gitignored; copy
+# user_paths_template.R).  Any path below can still be overridden by hand.
+if (requireNamespace("rstudioapi", quietly = TRUE) &&
+    rstudioapi::isAvailable() &&
+    nzchar(rstudioapi::getSourceEditorContext()$path)) {
+  APP_DIR <- dirname(rstudioapi::getSourceEditorContext()$path)
+} else {
+  APP_DIR <- getwd()   # run from the app folder, or set APP_DIR by hand
+}
+source(file.path(APP_DIR, "modules/user_paths.R"))
+UP <- load_user_paths(APP_DIR)
+if (length(UP) == 0)
+  message("No user_paths.R in ", APP_DIR, ": set the paths in Section 1 by hand.")
+
+
 # =============================================================================
 # SECTION 1 — *** EDIT THESE PATHS AND SETTINGS ***
 # =============================================================================
@@ -60,7 +76,7 @@ options(tigris_use_cache = TRUE)   # cache downloaded shapefiles locally
 #   Download the CONUS daily GeoPackage (.gpkg) file and set FIRED_GPKG below.
 PERIMETER_SOURCE <- "fired"    # "geomac" or "fired"
 
-GEOMAC_GDB   <- "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Code/calibration/scf_calibration/data_raw/GEOMAC/Historic_Geomac_Perimeters_All_Years_2000_2018.gdb"
+GEOMAC_GDB   <- user_path(UP, "geomac_gdb_path")
 
 # TWO separate FIRED files exist — make sure you have the right one:
 #
@@ -76,10 +92,10 @@ GEOMAC_GDB   <- "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamp
 # load_fired_perimeters() will detect this and stop with a helpful message.
 
 # Path to the FIRED CONUS DAILY GeoPackage (needs to be downloaded — see above)
-FIRED_GPKG        <- "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/FIRED_CONUS/daily/FIRED_CONUS_Daily_w_README/fired_conus_daily_nov2001-jan2019.gpkg"
+FIRED_GPKG        <- user_path(UP, "fired_gpkg_path")
 
 # Path to the FIRED CONUS EVENTS GeoPackage (already downloaded — for MaxSpreadArea)
-FIRED_EVENTS_GPKG <- "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/FIRED_CONUS/events/fired_events_conus_nov2001-jan2019.gpkg"
+FIRED_EVENTS_GPKG <- user_path(UP, "fired_events_gpkg_path")
 
 # FIRED layer name within the daily GeoPackage, or NULL to auto-detect
 FIRED_LAYER       <- NULL   # auto-detect (looks for layer name containing "daily")
@@ -93,7 +109,7 @@ FIRED_MIN_FIRE_HA <- 100
 # Set to 1 to run sequentially (e.g. for debugging).
 #parallel::detectCores()
 N_CORES <- 20
-TEMPLATE_TIF <- "/Users/jlamping/Desktop/LANDIS/MORA/CoolDry/Rep1/input_maps/MORA_ClimateRegions_09122025.tif"
+TEMPLATE_TIF <- user_path(UP, "tif_path")
 # Calibration boundary — TWO options (set exactly one):
 #
 # OPTION A: Load from a local shapefile / GeoPackage / GeoJSON.
@@ -106,13 +122,13 @@ TEMPLATE_TIF <- "/Users/jlamping/Desktop/LANDIS/MORA/CoolDry/Rep1/input_maps/MOR
 #   Example values: "Oregon", "Washington", "Idaho", "Montana", "California"
 #
 # Active option B — OR + WA:
-CAL_VECT_SHP    <- "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/S_USA.ECOSYS_ECOMAPPROVINCES_2025/ECOSYS_CoastalRange.shp" # set to a file path to use Option A
+CAL_VECT_SHP    <- user_path(UP, "shp_path", NULL) # set to a file path to use Option A
 CAL_VECT_STATES <- NULL #c("Oregon", "Washington")     # ignored when CAL_VECT_SHP is not NULL
 
 # ---- ERA-Interim FWI NetCDF -------------------------------------------------
 # Vitolo et al. 2019: https://doi.org/10.5281/zenodo.1065400
 # Download: fwi.nc  (daily FWI, 1980-2018, global, ERA-Interim grid)
-ERA_FWI_NC  <- "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/Climate/ERA-Interim/data/fwi.nc"
+ERA_FWI_NC  <- user_path(UP, "era_fwi_path")
 
 # ---- Wind source — choose ONE option ----------------------------------------
 
@@ -238,13 +254,7 @@ FWI_MIN <- 5         # NULL or 0 = no minimum
 # SECTION 2 — Load helper functions from app modules
 # =============================================================================
 
-# Detect app root automatically when running in RStudio; otherwise set manually.
-if (requireNamespace("rstudioapi", quietly = TRUE) &&
-    rstudioapi::isAvailable()) {
-  APP_DIR <- dirname(rstudioapi::getSourceEditorContext()$path)
-} else {
-  APP_DIR <- "/Users/jlamping/Documents/Anthropic_Projects/scf_calibration_app"
-}
+# APP_DIR is set at the top of the script (app folder).
 
 source(file.path(APP_DIR, "modules/era_helpers.R"))
 source(file.path(APP_DIR, "modules/ignition_helpers.R"))   # pick_first_col(), parse_any_date()

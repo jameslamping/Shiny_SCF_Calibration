@@ -48,6 +48,30 @@ source("modules/species_helpers.R", encoding = "UTF-8")
 source("modules/validation_helpers.R", encoding = "UTF-8")
 source("modules/mortality_helpers.R", encoding = "UTF-8")
 source("modules/tuning_helpers.R", encoding = "UTF-8")
+source("modules/user_paths.R", encoding = "UTF-8")
+
+# Every text box that holds a file or folder path.  Used to pre-fill them from
+# the per-user user_paths.R (gitignored; see user_paths_template.R) and to
+# normalise pasted Windows paths in the server.
+PATH_INPUT_IDS <- c(
+  "tif_path", "shp_path", "era_fwi_path", "era_ffmc_path", "era_dmc_path",
+  "era_dc_path", "gridmet_cache_dir", "landis_climate_path", "fpa_gdb_path",
+  "events_log_path", "geomac_gdb_path", "nirops_shp_path", "fired_gpkg_path",
+  "fired_events_gpkg_path", "fine_fuels_path", "ladder_fuels_path",
+  "scf_runs_root", "lookup_csv_path", "necn_csv_path", "fia_local_dir",
+  "ftm_dir", "mtbs_dnbr_dir", "mtbs_local_path", "mtbs_out_dir",
+  "sg_clay_dir", "solus_clay_dir", "et_local_path", "cwd_local_path",
+  "tc_cache_dir", "val_events_path", "fri_maps_dir", "fri_lf_tif_path",
+  "rdata_load_path"
+)
+USER_PATHS <- load_user_paths(".")
+if (length(USER_PATHS)) {
+  message(sprintf("user_paths.R: %d default path(s) loaded.", length(USER_PATHS)))
+  check_user_paths(USER_PATHS, PATH_INPUT_IDS)
+} else {
+  message("No user_paths.R: path boxes start empty. ",
+          "Copy user_paths_template.R to user_paths.R to set your own defaults.")
+}
 options(jsonlite.named_vectors_as_objects = FALSE)
 options(shiny.maxRequestSize = 50 * 1024^2)   # 50 MB — covers JSON settings; .RData loaded by path (no upload)
 
@@ -86,7 +110,7 @@ ui <- page_navbar(
         "perimeters (e.g. WA Cascades + Coast Range). The .dbf, .shx, and .prj ",
         "files must be in the same directory as the .shp."),
       textInput("shp_path", label = NULL,
-                value       = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/S_USA.ECOSYS_ECOMAPPROVINCES_2025/ECOSYS_CoastalRange.shp",
+                value = user_path(USER_PATHS, "shp_path"),
                 placeholder = "/path/to/calibration_region.shp"),
       actionButton("load_shp", "Load Shapefile", class = "btn-sm btn-secondary w-100")
     ),
@@ -127,7 +151,7 @@ ui <- page_navbar(
       "different CRS and extent than the calibration boundary — the app will ",
       "reproject everything to match this grid."),
     textInput("tif_path", label = NULL,
-              value       = "/Users/jlamping/Desktop/LANDIS/NOCA/CoolDry/Rep1/input_maps/NOCA_ClimateRegions_09122025.tif",
+              value = user_path(USER_PATHS, "tif_path"),
               placeholder = "/path/to/template.tif"),
     actionButton("load_tif", "Load Raster", class = "btn-sm btn-secondary w-100"),
     uiOutput("tif_status"),
@@ -156,7 +180,7 @@ ui <- page_navbar(
         "so re-runs and later sessions are fast. Fetch the years you need once, ",
         "then save the .RData cache."),
       textInput("gridmet_cache_dir", "GRIDMET cache directory",
-                value = "gridmet_cache",
+                value = user_path(USER_PATHS, "gridmet_cache_dir", "gridmet_cache"),
                 placeholder = "gridmet_cache"),
       p(class = "text-muted small",
         "Per-year raw meteorology is cached here as .rds so an interrupted ",
@@ -273,13 +297,13 @@ ui <- page_navbar(
              target = "_blank"),
       " — ffmc.nc, dmc.nc, dc.nc, fwi.nc"),
     textInput("era_fwi_path",  "fwi.nc",
-              value = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/Climate/ERA-Interim/data/fwi.nc"),
+              value = user_path(USER_PATHS, "era_fwi_path")),
     textInput("era_ffmc_path", "ffmc.nc",
-              value = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/Climate/ERA-Interim/data/ffmc.nc"),
+              value = user_path(USER_PATHS, "era_ffmc_path")),
     textInput("era_dmc_path",  "dmc.nc",
-              value = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/Climate/ERA-Interim/data/dmc.nc"),
+              value = user_path(USER_PATHS, "era_dmc_path")),
     textInput("era_dc_path",   "dc.nc",
-              value = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/Climate/ERA-Interim/data/dc.nc"),
+              value = user_path(USER_PATHS, "era_dc_path")),
     actionButton("load_era_fwi", "Load FWI Files", class = "btn-sm btn-secondary w-100"),
     uiOutput("era_fwi_status")
     ),
@@ -333,7 +357,7 @@ ui <- page_navbar(
                  href = "https://www.fs.usda.gov/rds/archive/Catalog/RDS-2013-0009.6",
                  target = "_blank")),
         textInput("fpa_gdb_path", label = NULL,
-                  value = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Code/calibration/scf_calibration/data_raw/Short2022/Data/FPA_FOD_20221014.gdb"),
+                  value = user_path(USER_PATHS, "fpa_gdb_path")),
 
         hr(),
         h6("Model Settings"),
@@ -847,7 +871,7 @@ ui <- page_navbar(
           "included in the table. Load it once; it persists for the session."),
         textInput("lookup_csv_path", label = NULL,
                   placeholder = "/path/to/LANDIS_FIA_species_lookup.csv",
-                  value = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/FIA/LANDIS_FIA_species_lookup.csv"),
+                  value = user_path(USER_PATHS, "lookup_csv_path")),
         actionButton("load_lookup_csv", "Load Lookup CSV",
                      class = "btn-sm btn-secondary w-100",
                      icon  = icon("table")),
@@ -873,7 +897,7 @@ ui <- page_navbar(
             "Useful when the lookup has more species than a specific project."),
           textInput("necn_csv_path", label = NULL,
                     placeholder = "/path/to/NECN_sp.csv",
-                    value = "/Users/jlamping/Desktop/LANDIS/OLYM/WarmWet/Rep2/extensions/NECN_sp_02032026.csv")
+                    value = user_path(USER_PATHS, "necn_csv_path"))
         ),
         conditionalPanel(
           "input.spp_filter_mode == 'manual'",
@@ -935,7 +959,7 @@ ui <- page_navbar(
           "temp folder (data lost on restart)."),
         textInput("fia_local_dir", label = NULL,
                   placeholder = "/path/to/FIA_RAW/",
-                  value = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/FIA/FIA_RAW"),
+                  value = user_path(USER_PATHS, "fia_local_dir")),
 
         actionButton("fetch_fia_bark", "Fetch FIA Bark Parameters",
                      class = "btn-success w-100",
@@ -2029,7 +2053,7 @@ ui <- page_navbar(
           tags$b("P(mort) = logistic(B0 + B1\u00d7BarkThickness + B2\u00d7dNBR).")),
         textInput("ftm_dir", "FTM data directory",
                   placeholder = "/path/to/RDS-2020-0001-2/Data",
-                  value = "/Users/jlamping/University of Oregon Dropbox/James Lamping/Lamping/NPS_postdoc/Spatial/FTM_Fire_mortality/RDS-2020-0001-2/Data"),
+                  value = user_path(USER_PATHS, "ftm_dir")),
         p(class = "text-muted small",
           "Directory must contain: ",
           tags$code("FTM_fires.csv"), " (fire locations), ",
@@ -2513,10 +2537,7 @@ ui <- page_navbar(
                       " → LF2016 → Fire Regime → FRI."),
                     textInput("fri_lf_tif_path",
                               "Path to LF2016_FRI_CONUS.tif",
-                              value = paste0("/Users/jlamping/University of Oregon Dropbox/",
-                                             "James Lamping/Lamping/NPS_postdoc/Spatial/",
-                                             "LANDFIRE/LF2016_FRI_CONUS/Tif/",
-                                             "LF2016_FRI_CONUS.tif"),
+                              value = user_path(USER_PATHS, "fri_lf_tif_path"),
                               placeholder = "/path/to/LF2016_FRI_CONUS.tif"),
                     actionButton("fetch_lf_mfri", "Load LANDFIRE FRI",
                                  class = "btn-sm btn-outline-primary w-100",
@@ -3217,17 +3238,12 @@ server <- function(input, output, session) {
     x <- sub("^[\"']+", "", sub("[\"']+$", "", x))
     gsub("\\\\", "/", x)
   }
-  path_input_ids <- c(
-    "tif_path", "shp_path", "era_fwi_path", "era_ffmc_path", "era_dmc_path",
-    "era_dc_path", "gridmet_cache_dir", "landis_climate_path", "fpa_gdb_path",
-    "events_log_path", "geomac_gdb_path", "nirops_shp_path", "fired_gpkg_path",
-    "fired_events_gpkg_path", "fine_fuels_path", "ladder_fuels_path",
-    "scf_runs_root", "lookup_csv_path", "necn_csv_path", "fia_local_dir",
-    "ftm_dir", "mtbs_dnbr_dir", "mtbs_local_path", "mtbs_out_dir",
-    "sg_clay_dir", "solus_clay_dir", "et_local_path", "cwd_local_path",
-    "tc_cache_dir", "val_events_path", "fri_maps_dir", "fri_lf_tif_path",
-    "rdata_load_path"
-  )
+  path_input_ids <- PATH_INPUT_IDS
+
+  # Pre-fill path boxes from user_paths.R.  Most boxes have no value in the UI
+  # definition, so set them here; the update is sent with the first flush.
+  for (id in intersect(names(USER_PATHS), PATH_INPUT_IDS))
+    updateTextInput(session, id, value = USER_PATHS[[id]])
   for (id in path_input_ids) local({
     pid <- id
     observeEvent(input[[pid]], {

@@ -64,9 +64,16 @@ install.packages("renv")          # if not already installed
 renv::restore()                   # installs all packages at exact locked versions
                                   # (~5–10 min on first run)
 
-# 3. Launch the app
+# 3. Set your default file paths (optional, recommended)
+#    Copy user_paths_template.R to user_paths.R and fill in your paths.
+#    user_paths.R is gitignored, so your paths stay on your machine.
+
+# 4. Launch the app
 shiny::runApp()
 ```
+
+On start-up the R console says how many default paths were loaded and lists
+any that don't exist on this machine.
 
 `renv::restore()` reads `renv.lock` and installs every package at the exact
 version used during development, including GitHub-sourced packages
@@ -94,8 +101,10 @@ on both because renv installs the right binaries for each OS.
 - **File paths:** paste paths in any form. `C:\data\fwi.nc`, `C:/data/fwi.nc`
   and a quoted path from Explorer's "Copy as path" are all normalised to
   forward slashes when entered.
-- **Default paths:** several path boxes come pre-filled with the original
-  developer's macOS paths. Replace them with your own before loading data.
+- **Default paths:** every path box starts empty unless you set it in your own
+  `user_paths.R` (see Quick Start). Write paths there with forward slashes,
+  e.g. `"C:/data/fwi.nc"`: a single backslash in an R string is an escape
+  character.
 - **Sharing the lockfile:** if you install a new package on either OS, run
   `renv::snapshot()` and commit `renv.lock`. Don't commit `renv/library/`;
   it is OS-specific and already gitignored.
@@ -137,6 +146,7 @@ scf_calibration_app/
 ├── app.R                        # UI + server (all tabs)
 ├── renv.lock                    # Pinned package versions
 ├── .Rprofile                    # Auto-activates renv on project open
+├── user_paths_template.R        # Copy to user_paths.R (gitignored) for your default paths
 ├── docs/
 │   └── SCF_semantics.md         # What SCF does with each parameter — read first
 ├── modules/
@@ -150,7 +160,8 @@ scf_calibration_app/
 │   ├── species_helpers.R        # FIA DBH/age, FOFEM bark coefficients, species table
 │   ├── tuning_helpers.R         # SCF-faithful fire simulator, real-weather ensemble,
 │   │                            #   B0 sweep, tuning plots, tuning export
-│   └── validation_helpers.R     # SCF events-log reader, validation plots, FRI
+│   ├── validation_helpers.R     # SCF events-log reader, validation plots, FRI
+│   └── user_paths.R             # Reads the per-user user_paths.R
 ├── analysis/                    # Stand-alone analysis scripts
 └── spread_probability_diagnostic.R  # Step-through script for the spread pipeline
 ```

@@ -25,7 +25,7 @@ Findings are ranked by how badly they could produce wrong SCF parameters.
 **Docs (later the same day):** #13 and #14 done (README rewrite,
 `docs/SCF_semantics.md`).
 
-**Still open:** #4, #8, B3 in #9, #10 in the Validation tab, #12,
+**Still open:** #8, B3 in #9, #10 in the Validation tab, #12,
 #15, #16, and the MORA findings below.
 
 ### MORA findings from this session (data, not code)
@@ -100,7 +100,9 @@ labmate running `renv::restore()` won't get them.
 - Fix: `renv::install(c("cffdrs","quantreg","nnls","patchwork","tigris"))`, then
   `renv::snapshot()`.
 
-### 4. Hardcoded personal paths as input defaults
+### 4. Hardcoded personal paths as input defaults — FIXED 2026-11-16
+> Paths now come from a per-user, gitignored `user_paths.R` (template tracked),
+> read by the app and both scripts; boxes start empty without it.
 About 13 `textInput` defaults in `app.R` point at `/Users/jlamping/...`
 (lines 89, 130, 276–282, 336, 850, 876, 938, 2016, 2500). The same goes for
 `spread_probability_diagnostic.R:63–246` and `analysis/*.R`.
@@ -219,11 +221,9 @@ the whole calibration region with fires simulated on the landscape.
 ---
 
 ## Suggested order (remaining)
-1. **#4 default paths:** a gitignored per-user config instead of
-   `/Users/jlamping/...` defaults.
-2. **MORA data fixes:** refit B6 (or set 0), positive MSA B0.
-3. **#15 tests:** turn this session's scratch checks into a `testthat` suite:
+1. **MORA data fixes:** refit B6 (or set 0), positive MSA B0.
+2. **#15 tests:** turn this session's scratch checks into a `testthat` suite:
    - simulator vs SCF reference loop
    - scoring known-answer
    - snippet parser emulation
-4. #8, #10 (Validation tab), #12, #16
+3. #8, #10 (Validation tab), #12, #16

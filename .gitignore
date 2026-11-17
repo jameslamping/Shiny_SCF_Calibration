@@ -63,3 +63,6 @@ gridmet_cache/
 # Generated diagnostic / analysis outputs
 spread_diag_report_*.txt
 analysis/plots/
+
+# Per-user default paths (copy user_paths_template.R)
+/user_paths.R
