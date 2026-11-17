@@ -25,7 +25,7 @@ Findings are ranked by how badly they could produce wrong SCF parameters.
 **Docs (later the same day):** #13 and #14 done (README rewrite,
 `docs/SCF_semantics.md`).
 
-**Still open:** #4, #8, the B1/B3 part of #9, #10 in the Validation tab, #12,
+**Still open:** #4, #8, B3 in #9, #10 in the Validation tab, #12,
 #15, #16, and the MORA findings below.
 
 ### MORA findings from this session (data, not code)
@@ -154,10 +154,15 @@ step has been done.
   (`app.R:5750`). This doesn't matter in the PNW because cffdrs uses latitude
   bands, but it would elsewhere.
 
-### 9. The spread-probability response is a daily rate, but SCF draws once per fire — B0 PART DONE 2026-11-16
-> B0 now comes from the B0 Sweep tab. B1/B3 are still taken from the GLM; a
-> joint sweep (B0 × B1) is the natural next step: for MORA no single B0 matches
-> both the median and the P90 fire size.
+### 9. The spread-probability response is a daily rate, but SCF draws once per fire — B0 AND B1 DONE 2026-11-16
+> The B0 Sweep tab sets B0, or B0 and B1 jointly. It recovers a known pair
+> (−1.80, 0.08) from simulated fires. B3 (wind) still comes from the GLM.
+>
+> MORA (B2 = 0, size only, runtime weather): best B0 −3.16, B1 0.10, against
+> fitted B1 0.016.
+> - Size score 0.33 vs 0.77 for B0 alone (1,000-fire check).
+> - P90 872 ha vs observed 290.
+> - P99 3,263 vs observed 9,222: the extreme tail is still short.
 - The perimeter-pair frontier ring counts a cell as a failure if it is unburned
   at t+1, even if it burns at t+2. SCF never gives that cell a second chance.
 - This affects more than the intercept: it also distorts the B1 and B3 slopes,
@@ -216,11 +221,9 @@ the whole calibration region with fires simulated on the landscape.
 ## Suggested order (remaining)
 1. **#4 default paths:** a gitignored per-user config instead of
    `/Users/jlamping/...` defaults.
-2. **#9 joint B0 × B1 sweep:** fixes the shape of the size distribution, not just
-   its level.
-3. **MORA data fixes:** refit B6 (or set 0), positive MSA B0.
-4. **#15 tests:** turn this session's scratch checks into a `testthat` suite:
+2. **MORA data fixes:** refit B6 (or set 0), positive MSA B0.
+3. **#15 tests:** turn this session's scratch checks into a `testthat` suite:
    - simulator vs SCF reference loop
    - scoring known-answer
    - snippet parser emulation
-5. #8, #10 (Validation tab), #12, #16
+4. #8, #10 (Validation tab), #12, #16

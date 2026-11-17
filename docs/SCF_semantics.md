@@ -138,6 +138,12 @@ P = P * suppressEffect from the suppression table
   the intercept, and the perimeter pairs measure a daily spread rate, not
   SCF's one-shot trial. **Set B0 by simulation**, using Parameter Tuning >
   **B0 Sweep**, then confirm with LANDIS runs on the Score Candidates tab.
+- **The slopes are affected too.** A daily rate and a one-shot probability
+  are not proportional, so the regression's B1 (FWI) is also not SCF's.
+  - If no single B0 matches both typical and large fires, use the sweep's
+    joint B0 × B1 mode.
+  - B0 moves the whole size distribution; B1 sets how much more fire spreads
+    on hot days than mild ones, i.e. the width of the distribution.
 
 ### Maximum daily spread area (FireEvent.cs `Spread`)
 

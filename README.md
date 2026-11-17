@@ -417,7 +417,7 @@ Explore and test a full parameter set before running LANDIS.
 | **Site Mortality** / **Cohort Mortality** | Predicted dNBR and cohort mortality curves |
 | **Fire Simulation** | One fire on a 100×100 grid using SCF's spread rules |
 | **Fire Size Distribution** | Many fires, on **real daily weather** (default) or a constant FWI × EWS grid |
-| **B0 Sweep** | Sets `SpreadProbabilityB0` by simulation |
+| **B0 Sweep** | Sets `SpreadProbabilityB0` (or B0 and B1 jointly) by simulation |
 
 ### The fire simulator
 
@@ -453,8 +453,19 @@ screen and LANDIS runs as the test.
   Parameters sidebar.
 - **Weights:** set the area weight to 0 if your landscape's burn rate differs
   from the region's. The status box warns when size and area favour very
-  different B0 values, which means B0 alone can't fit both; look at B1,
-  MaxSpreadArea or the ignition counts.
+  different B0 values, which means B0 alone can't fit both.
+- **Joint B0 × B1 mode:** use it when no single B0 matches both the median
+  and the tail of the size distribution. B0 moves the whole distribution; B1
+  (the FWI slope) changes its spread, because a steeper B1 grows fires more on
+  hot days and less on mild ones.
+  - For each B1 the B0 sweep is rerun with its window shifted by
+    −(ΔB1 × the ignition-weighted mean FWI), so it stays near the point where
+    fires take off.
+  - A blue × marks any B1 whose best B0 lies on the window edge: widen the B0
+    range and rerun.
+  - **Use best values** writes both B0 and B1.
+  - Treat a B1 chosen this way as a calibration result, not a regression
+    estimate. Report it as such.
 
 ### Export
 
@@ -489,7 +500,7 @@ Section order and syntax are in
 | `IgnitionDistribution ZeroInflatedPoisson` + `…IgnitionsBinomialB0/B1` | ZIP fit | The `IgnitionDistribution` line must come before the Binomial keywords. |
 | `MaximumFineFuels` | Tuning sidebar | ~900 g C m⁻² to match the fine-fuel scaling |
 | `MaximumSpreadAreaB0–B2` | Spread → Fit Coefficients (75th percentile) | Raw ha; B0 > 0 |
-| `SpreadProbabilityB0–B3` | B1, B3 from the Spread fit; **B0 from B0 Sweep** | |
+| `SpreadProbabilityB0–B3` | B3 (and B1) from the Spread fit; **B0 from B0 Sweep**, or B0 and B1 from its joint mode | |
 | `SiteMortalityB0–B6`, `CohortMortalityB0–B2` | Mortality → Parameter Snippet | Inverted signs; B6 in g m⁻² |
 | `TimeZeroPET`, `TimeZeroCWD` | Mortality → Parameter Snippet | Right after `Timestep` |
 | `LadderFuelMaxAge`, `LadderFuelSpeciesList` | Mortality inputs | Species on the line after the keyword |
@@ -520,7 +531,7 @@ Also check:
 | `candidate_scores.csv` | Spread → Score Candidates | Scores, fire rotation and status per candidate |
 | `mortality_parameters.txt` | Mortality → Parameter Snippet | Site/cohort coefficients in 3 placement sections |
 | `scf_tuning_*.txt` | Parameter Tuning | Tuned parameter set in 2 placement sections |
-| `b0_sweep_*.csv` | Parameter Tuning → B0 Sweep | Scores and fire sizes for each B0 |
+| `b0_sweep_*.csv`, `b0_b1_sweep_*.csv` | Parameter Tuning → B0 Sweep | Scores and fire sizes for each B0 (and B1) |
 
 ---
 

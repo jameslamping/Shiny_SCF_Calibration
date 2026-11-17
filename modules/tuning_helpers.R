@@ -21,6 +21,8 @@
 #   plot_fire_ensemble_weather() Size CDF vs FPA FOD + size vs ignition FWI
 #   sweep_b0_weather()       SpreadProbabilityB0 by simulation (size + annual area)
 #   plot_b0_sweep()          Scores and fire sizes across the B0 sweep
+#   sweep_b0_b1_weather()    Joint SpreadProbabilityB0 x B1 sweep
+#   plot_b0_b1_sweep()       Score surface and best-B0 fire sizes per B1
 #   ign_tune_coef_df()       Hand-typed ignition coefficients -> coef tibble
 #   build_scf_tuning_snippet() SCF parameter file text from tuning inputs
 # =============================================================================
@@ -1389,8 +1391,15 @@ sweep_b0_weather <- function(b0_values, weather,
   rownames(tab) <- NULL
   best <- if (any(is.finite(tab$score_total))) tab$B0[which.min(tab$score_total)] else NA_real_
 
+  # Best B0 on the edge of the coarse window -> the optimum may lie outside it.
+  coarse_b0 <- tab$B0[grepl("^Coarse", tab$pass)]
+  best_edge <- if (!is.finite(best) || length(coarse_b0) == 0) NA_character_
+    else if (abs(best - min(coarse_b0)) < 1e-9) "low"
+    else if (abs(best - max(coarse_b0)) < 1e-9 && !is.finite(stopped_at)) "high"
+    else NA_character_
+
   list(table = tab, ensembles = ens_list, best_b0 = best,
-       info = list(ign_per_yr = ign_per_yr, obs_rate = obs_rate,
+       info = list(ign_per_yr = ign_per_yr, obs_rate = obs_rate, best_edge = best_edge,
                    obs_median_ha = if (length(obs_sz)) stats::median(obs_sz) else NA_real_,
                    obs_p90_ha = if (length(obs_sz)) stats::quantile(obs_sz, 0.9, names = FALSE) else NA_real_,
                    n_obs = length(obs_sz), grid_ha = grid_ha, n_fires = n_fires,
@@ -1399,6 +1408,173 @@ sweep_b0_weather <- function(b0_values, weather,
                      tab$B0[which.min(tab$score_size)] else NA_real_,
                    best_b0_aab  = if (any(is.finite(tab$score_aab)))
                      tab$B0[which.min(tab$score_aab)] else NA_real_))
+}
+
+
+# -----------------------------------------------------------------------------
+# sweep_b0_b1_weather
+#
+# Joint SpreadProbabilityB0 x B1 sweep.  B0 alone shifts the whole fire-size
+# distribution up or down; B1 (the FWI slope) changes its SHAPE: a steeper B1
+# makes hot days carry fire much further and mild days much less, widening the
+# distribution.  When B0 alone can match the median or the tail but not both,
+# this is the next lever.
+#
+# For each B1 the B0 sweep (sweep_b0_weather, coarse pass with early stop) is
+# run with the same seed, so every (B0, B1) sees the same ignition days and
+# random draws.  The B0 window moves with B1: the take-off point sits where
+# B0 + B1 * FWI is roughly constant, so for each B1 the window given for b1_ref
+# is shifted by -(B1 - b1_ref) * fwi_ref, where fwi_ref is the mean ignition-
+# day FWI weighted by expected SCF ignitions.  A fine pass (step/4) then runs at
+# the best B1 around the best B0.
+#
+# Returns list(table (B1, B0, ... scores), ensembles (keyed "B1|B0"),
+#              best_b0, best_b1, info).
+# -----------------------------------------------------------------------------
+
+sweep_b0_b1_weather <- function(b1_values, b0_values, b1_ref, weather,
+                                obs_sizes, obs_rate = NULL,
+                                ign_coef = NULL, area_ratio = NULL,
+                                tmpl_area_ha = NULL,
+                                n_fires = 150L, grid_dim = 200L, ff_val = 0.5,
+                                msa_b0, msa_b1, msa_b2, sp_b2, sp_b3,
+                                cell_area_ha = 0.09,
+                                w_size = 0.5, w_aab = 0.5,
+                                patience = 3L, refine = TRUE, seed = 1L,
+                                progress_fn = NULL) {
+
+  b1_values <- sort(unique(b1_values))
+  b0_values <- sort(unique(b0_values))
+
+  # Ignition-weighted mean FWI on candidate ignition days (same rule as
+  # run_fire_ensemble_weather)
+  doy  <- as.integer(format(as.Date(weather$date), "%j"))
+  cand <- which(is.finite(weather$FWI) & doy < 364L)
+  w    <- ignition_day_weights(weather$FWI[cand], ign_coef)
+  fwi_ref <- if (sum(w) > 0) sum(w * weather$FWI[cand]) / sum(w) else mean(weather$FWI[cand])
+
+  common <- list(weather = weather, obs_sizes = obs_sizes, obs_rate = obs_rate,
+                 ign_coef = ign_coef, area_ratio = area_ratio,
+                 tmpl_area_ha = tmpl_area_ha, n_fires = n_fires,
+                 grid_dim = grid_dim, ff_val = ff_val,
+                 msa_b0 = msa_b0, msa_b1 = msa_b1, msa_b2 = msa_b2,
+                 sp_b2 = sp_b2, sp_b3 = sp_b3, cell_area_ha = cell_area_ha,
+                 w_size = w_size, w_aab = w_aab, patience = patience, seed = seed)
+
+  tabs <- list(); ens <- list(); per_b1 <- list(); info0 <- NULL
+  for (i in seq_along(b1_values)) {
+    b1    <- b1_values[i]
+    shift <- -(b1 - b1_ref) * fwi_ref
+    prog  <- if (is.null(progress_fn)) NULL else
+      function(frac, detail) progress_fn((i - 1 + frac) / length(b1_values),
+                                         sprintf("B1 = %.4f (%d of %d) | %s", b1, i,
+                                                 length(b1_values), detail))
+    sw <- do.call(sweep_b0_weather, c(common, list(
+      b0_values = b0_values + shift, sp_b1 = b1, refine = FALSE, progress_fn = prog)))
+    tabs[[i]] <- cbind(B1 = b1, sw$table)
+    for (k in names(sw$ensembles)) ens[[paste0(sprintf("%.6f", b1), "|", k)]] <- sw$ensembles[[k]]
+    per_b1[[i]] <- data.frame(B1 = b1, B0_shift = shift, best_b0 = sw$best_b0,
+                              stopped_at = sw$info$stopped_at,
+                              best_edge = sw$info$best_edge)
+    if (is.null(info0)) info0 <- sw$info
+  }
+  tab <- do.call(rbind, tabs)
+  best_i <- which.min(tab$score_total)
+
+  # Fine pass at the best B1
+  if (refine && length(best_i) == 1 && length(b0_values) >= 3) {
+    step <- stats::median(diff(b0_values))
+    bb0  <- tab$B0[best_i]; bb1 <- tab$B1[best_i]
+    fine <- seq(bb0 - step, bb0 + step, by = step / 4)
+    done <- tab$B0[abs(tab$B1 - bb1) < 1e-12]
+    fine <- fine[!sapply(fine, function(x) any(abs(x - done) < 1e-9))]
+    if (length(fine)) {
+      prog <- if (is.null(progress_fn)) NULL else
+        function(frac, detail) progress_fn(frac, paste("Fine pass |", detail))
+      fine_args <- common; fine_args$patience <- 1e6L     # run every fine value
+      sw <- do.call(sweep_b0_weather, c(fine_args, list(
+        b0_values = fine, sp_b1 = bb1, refine = FALSE, progress_fn = prog)))
+      sw$table$pass <- sub("^Coarse", "Fine", sw$table$pass)
+      tab <- rbind(tab, cbind(B1 = bb1, sw$table))
+      for (k in names(sw$ensembles)) ens[[paste0(sprintf("%.6f", bb1), "|", k)]] <- sw$ensembles[[k]]
+    }
+  }
+  tab <- tab[order(tab$B1, tab$B0), ]; rownames(tab) <- NULL
+  best_i <- which.min(tab$score_total)
+
+  info <- info0
+  info$fwi_ref  <- fwi_ref
+  info$b1_ref   <- b1_ref
+  info$per_b1   <- do.call(rbind, per_b1)
+  info$mode     <- "joint"
+  list(table = tab, ensembles = ens,
+       best_b0 = if (length(best_i)) tab$B0[best_i] else NA_real_,
+       best_b1 = if (length(best_i)) tab$B1[best_i] else NA_real_,
+       info = info)
+}
+
+# Ensemble for one (B1, B0) of a joint sweep
+joint_sweep_ensemble <- function(sweep, b1, b0) {
+  sweep$ensembles[[paste0(sprintf("%.6f", b1), "|", sprintf("%.4f", b0))]]
+}
+
+
+# -----------------------------------------------------------------------------
+# plot_b0_b1_sweep
+#
+# A: total score over (B0, B1) as tiles, best pair circled.
+# B: for each B1, the median and P90 fire size at that B1's best B0, against
+#    the observed values: shows whether any B1 matches both.
+# -----------------------------------------------------------------------------
+
+plot_b0_b1_sweep <- function(sweep) {
+  tab  <- sweep$table[is.finite(sweep$table$score_total), ]
+  info <- sweep$info
+  b1s  <- sort(unique(tab$B1))
+  h    <- if (length(b1s) > 1) min(diff(b1s)) else 0.01
+  coarse <- tab[grepl("^Coarse", tab$pass), ]
+  fine   <- tab[grepl("^Fine", tab$pass), ]
+  coarse$w <- stats::ave(coarse$B0, coarse$B1, FUN = function(x)
+    if (length(x) > 1) stats::median(diff(sort(x))) else 0.25)
+  edge <- info$per_b1[!is.na(info$per_b1$best_edge), , drop = FALSE]
+
+  pA <- ggplot(coarse, aes(B0, B1)) +
+    geom_tile(aes(fill = pmin(score_total, 3), width = w), height = h * 0.9) +
+    { if (nrow(fine)) geom_point(data = fine, aes(fill = pmin(score_total, 3)),
+                                 shape = 21, size = 2.6, colour = "grey20") } +
+    { if (nrow(edge)) geom_point(data = edge, aes(best_b0, B1), shape = 4, size = 3,
+                                 stroke = 1.2, colour = "#2166ac", inherit.aes = FALSE) } +
+    geom_point(data = tab[which.min(tab$score_total), ], shape = 21, size = 5,
+               stroke = 1.4, colour = "white", fill = NA) +
+    scale_fill_viridis_c(option = "magma", direction = -1, name = "Score\n(capped 3)") +
+    labs(title = sprintf("Joint sweep: best B0 = %.3f, B1 = %.4f", sweep$best_b0, sweep$best_b1),
+         subtitle = paste0(sprintf("B0 window shifted by -(B1 - %.4f) x %.1f (ignition-weighted FWI)",
+                                   info$b1_ref, info$fwi_ref),
+                           if (nrow(edge)) "\nBlue x: best B0 on the window edge (widen the B0 range)" else ""),
+         x = "SpreadProbabilityB0", y = "SpreadProbabilityB1 (FWI)") +
+    theme_bw(base_size = 12)
+
+  best_per <- do.call(rbind, lapply(split(tab, tab$B1), function(d) d[which.min(d$score_total), ]))
+  sz <- rbind(data.frame(B1 = best_per$B1, ha = best_per$median_ha, what = "Median"),
+              data.frame(B1 = best_per$B1, ha = best_per$p90_ha,    what = "P90"))
+  sz <- sz[is.finite(sz$ha) & sz$ha > 0, ]
+  ref <- data.frame(what = c("Median", "P90"), ha = c(info$obs_median_ha, info$obs_p90_ha))
+  pB <- ggplot(sz, aes(B1, ha, colour = what)) +
+    geom_line(linewidth = 0.9) + geom_point(size = 2) +
+    geom_hline(data = ref[is.finite(ref$ha), ], aes(yintercept = ha, colour = what),
+               linetype = "dashed") +
+    geom_text(data = best_per, aes(B1, Inf, label = sprintf("%.2f", score_total)),
+              inherit.aes = FALSE, vjust = 1.4, size = 2.8, colour = "grey30") +
+    scale_y_log10(labels = scales::comma) +
+    scale_colour_manual(values = c(Median = "#d94801", P90 = "#7f2704")) +
+    labs(title = "Fire size at each B1's best B0",
+         subtitle = "Dashed = observed.  Top labels: total score",
+         x = "SpreadProbabilityB1 (FWI)", y = "Fire size, fires > 1 cell (ha, log)",
+         colour = NULL) +
+    theme_bw(base_size = 12) + theme(legend.position = "bottom")
+
+  if (requireNamespace("patchwork", quietly = TRUE)) patchwork::wrap_plots(pA, pB, ncol = 2)
+  else pA
 }
 
 

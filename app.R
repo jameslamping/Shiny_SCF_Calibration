@@ -3066,6 +3066,19 @@ ui <- page_navbar(
               " first."),
             fluidRow(
               column(3,
+                radioButtons("sweep_mode", "Sweep",
+                             choices = c("B0 only" = "b0",
+                                         "B0 and B1 (FWI slope) jointly" = "joint"),
+                             selected = "b0"),
+                conditionalPanel("input.sweep_mode == 'joint'",
+                  numericInput("sweep_b1_min",  "B1 from", value = 0.01, step = 0.01),
+                  numericInput("sweep_b1_max",  "B1 to",   value = 0.16, step = 0.01),
+                  numericInput("sweep_b1_step", "B1 step", value = 0.03, min = 0.005, step = 0.005),
+                  p(class = "text-muted small",
+                    "The current B1 is always included. The B0 range below applies ",
+                    "at the current B1; for other B1 values it is shifted so it ",
+                    "stays around the point where fires take off.")
+                ),
                 numericInput("sweep_b0_min",  "B0 from",  value = -3,   step = 0.25),
                 numericInput("sweep_b0_max",  "B0 to",    value = 1.5,  step = 0.25),
                 numericInput("sweep_b0_step", "B0 step",  value = 0.25, min = 0.05, step = 0.05),
@@ -3083,7 +3096,7 @@ ui <- page_navbar(
                              icon = icon("play")),
                 br(), br(),
                 uiOutput("sweep_status_ui"),
-                actionButton("sweep_use_best", "Use best B0 in Parameters",
+                actionButton("sweep_use_best", "Use best values in Parameters",
                              class = "btn-outline-primary btn-sm w-100", icon = icon("check")),
                 br(), br(),
                 downloadButton("dl_b0_sweep", "Download sweep table (.csv)",
@@ -7742,47 +7755,72 @@ server <- function(input, output, session) {
       .obs_fire_targets(rv$ign_df, yrs[1], yrs[2], la$cal_area_ha, cell_area_ha,
                         la$tmpl_area_ha)$rate else NULL
 
+    joint <- identical(input$sweep_mode, "joint")
+    b1_vals <- NULL
+    if (joint) {
+      b1_vals <- tryCatch(seq(input$sweep_b1_min, input$sweep_b1_max, by = input$sweep_b1_step),
+                          error = function(e) NULL)
+      b1_vals <- sort(unique(round(c(b1_vals, p$sp_b1), 6)))
+      if (length(b1_vals) < 2 || length(b1_vals) > 30) {
+        showNotification("Set a B1 range with 2 to 30 values (min < max, step > 0).",
+                         type = "error", duration = 10)
+        return()
+      }
+    }
+    common <- list(
+      weather      = wx$df,
+      obs_sizes    = obs_df$FIRE_SIZE_HA,
+      obs_rate     = obs_rate,
+      ign_coef     = ig$coef,
+      area_ratio   = if (!is.null(la)) la$ratio else NULL,
+      tmpl_area_ha = if (!is.null(la)) la$tmpl_area_ha else NULL,
+      n_fires      = max(30L, min(1000L, as.integer(input$sweep_nfires %||% 150L))),
+      grid_dim     = grid_dim,
+      ff_val       = input$tune_ens_ff %||% 0.5,
+      msa_b0 = p$msa_b0, msa_b1 = p$msa_b1, msa_b2 = p$msa_b2,
+      sp_b2  = p$sp_b2,  sp_b3  = p$sp_b3,
+      cell_area_ha = cell_area_ha,
+      w_size = input$sweep_w_size %||% 0.5,
+      w_aab  = input$sweep_w_aab  %||% 0.5)
+
     sw <- tryCatch(
-      withProgress(message = "B0 sweep", value = 0, {
-        sweep_b0_weather(
-          b0_values    = b0_vals,
-          weather      = wx$df,
-          obs_sizes    = obs_df$FIRE_SIZE_HA,
-          obs_rate     = obs_rate,
-          ign_coef     = ig$coef,
-          area_ratio   = if (!is.null(la)) la$ratio else NULL,
-          tmpl_area_ha = if (!is.null(la)) la$tmpl_area_ha else NULL,
-          n_fires      = max(30L, min(1000L, as.integer(input$sweep_nfires %||% 150L))),
-          grid_dim     = grid_dim,
-          ff_val       = input$tune_ens_ff %||% 0.5,
-          msa_b0 = p$msa_b0, msa_b1 = p$msa_b1, msa_b2 = p$msa_b2,
-          sp_b1  = p$sp_b1,  sp_b2  = p$sp_b2,  sp_b3  = p$sp_b3,
-          cell_area_ha = cell_area_ha,
-          w_size = input$sweep_w_size %||% 0.5,
-          w_aab  = input$sweep_w_aab  %||% 0.5,
-          progress_fn = function(frac, detail) setProgress(frac, detail = detail))
+      withProgress(message = if (joint) "B0 \u00d7 B1 sweep" else "B0 sweep", value = 0, {
+        prog <- function(frac, detail) setProgress(frac, detail = detail)
+        if (joint)
+          do.call(sweep_b0_b1_weather, c(common, list(
+            b1_values = b1_vals, b0_values = b0_vals, b1_ref = p$sp_b1, progress_fn = prog)))
+        else
+          do.call(sweep_b0_weather, c(common, list(
+            b0_values = b0_vals, sp_b1 = p$sp_b1, progress_fn = prog)))
       }),
       error = function(e) {
-        showNotification(paste("B0 sweep failed:", conditionMessage(e)),
+        showNotification(paste("Sweep failed:", conditionMessage(e)),
                          type = "error", duration = 12)
         NULL
       })
     if (is.null(sw)) return()
+    if (!joint) { sw$best_b1 <- p$sp_b1; sw$info$mode <- "b0" }
     sw$info$wx_label <- wx$label
     sw$info$wx_note  <- wx$note
     sw$info$ign_src  <- ig$src
     sw$info$has_area <- !is.null(la)
+    sw$info$b1_at_run <- p$sp_b1
+    sw$info$b0_at_run <- p$sp_b0
     sweep_rv(sw)
   })
 
+  sweep_is_joint <- function(sw) identical(sw$info$mode, "joint")
+
   output$sweep_plot <- renderPlot({
     sw <- sweep_rv(); req(sw)
-    plot_b0_sweep(sw)
+    if (sweep_is_joint(sw)) plot_b0_b1_sweep(sw) else plot_b0_sweep(sw)
   })
 
   output$sweep_best_plot <- renderPlot({
     sw <- sweep_rv(); req(sw, is.finite(sw$best_b0))
-    ens <- sw$ensembles[[sprintf("%.4f", sw$best_b0)]]
+    ens <- if (sweep_is_joint(sw)) joint_sweep_ensemble(sw, sw$best_b1, sw$best_b0)
+           else sw$ensembles[[sprintf("%.4f", sw$best_b0)]]
+    req(ens)
     yrs <- input$cal_years
     obs <- rv$ign_df$FIRE_SIZE_HA[rv$ign_df$FIRE_YEAR >= yrs[1] & rv$ign_df$FIRE_YEAR <= yrs[2]]
     plot_fire_ensemble_weather(ens, obs_sizes = obs)
@@ -7790,30 +7828,50 @@ server <- function(input, output, session) {
 
   output$sweep_table <- renderDT({
     sw <- sweep_rv(); req(sw)
-    sw$table %>%
+    tab <- sw$table
+    if (!"B1" %in% names(tab)) tab <- cbind(B1 = sw$best_b1, tab)
+    tab %>%
       mutate(across(where(is.numeric), ~ signif(.x, 4))) %>%
-      datatable(options = list(pageLength = 10, scrollX = TRUE, order = list(list(0, "asc"))),
+      datatable(options = list(pageLength = 10, scrollX = TRUE,
+                               order = list(list(which(names(tab) == "score_total") - 1, "asc"))),
                 rownames = FALSE, class = "table-sm table-striped")
   })
 
   output$sweep_status_ui <- renderUI({
     sw <- sweep_rv()
     if (is.null(sw)) return(tags$p(class = "text-muted small", "Not run yet."))
-    info <- sw$info
-    best <- sw$table[which.min(sw$table$score_total), ]
-    tags$div(class = "alert alert-info p-2", style = "font-size:0.82rem;",
-      tags$b(sprintf("Best B0 = %.3f", sw$best_b0)),
-      sprintf("  (current %.3f)", isolate(input$tune_sp_b0) %||% NA_real_), tags$br(),
+    info  <- sw$info
+    joint <- sweep_is_joint(sw)
+    best  <- sw$table[which.min(sw$table$score_total), ]
+    edges <- if (joint) info$per_b1[!is.na(info$per_b1$best_edge), , drop = FALSE] else NULL
+    edge_msg <- if (joint && nrow(edges))
+      sprintf("For B1 = %s the best B0 is on the edge of its window: widen the B0 range and rerun.",
+              paste(signif(edges$B1, 3), collapse = ", "))
+      else if (!joint && !is.na(info$best_edge %||% NA))
+      sprintf("The best B0 is at the %s end of the range: widen it and rerun.",
+              if (info$best_edge == "low") "low" else "high")
+      else NULL
+    tags$div(class = paste("alert p-2", if (is.null(edge_msg)) "alert-info" else "alert-warning"),
+      style = "font-size:0.82rem;",
+      tags$b(if (joint) sprintf("Best B0 = %.3f, B1 = %.4f", sw$best_b0, sw$best_b1)
+             else sprintf("Best B0 = %.3f", sw$best_b0)),
+      sprintf("  (before: B0 %.3f, B1 %.4f)", info$b0_at_run %||% NA_real_,
+              info$b1_at_run %||% NA_real_), tags$br(),
       sprintf("Score %.2f: size %.2f, area %s", best$score_total, best$score_size,
               if (is.finite(best$score_aab)) sprintf("%.2f", best$score_aab) else "n/a"), tags$br(),
-      sprintf("Size alone favours %.2f; area alone %s.", info$best_b0_size,
-              if (is.finite(info$best_b0_aab)) sprintf("%.2f", info$best_b0_aab) else "n/a"),
-      if (is.finite(info$best_b0_size) && is.finite(info$best_b0_aab) &&
-          abs(info$best_b0_size - info$best_b0_aab) > 0.5)
-        tagList(tags$br(), tags$b("They disagree by more than 0.5:"),
-                " fire sizes and burn rate cannot both be matched by B0 alone ",
-                "(check ignition counts, B1, MaxSpreadArea or fuels)."),
-      tags$br(),
+      if (!joint) tagList(
+        sprintf("Size alone favours %.2f; area alone %s.", info$best_b0_size,
+                if (is.finite(info$best_b0_aab)) sprintf("%.2f", info$best_b0_aab) else "n/a"),
+        if (is.finite(info$best_b0_size) && is.finite(info$best_b0_aab) &&
+            abs(info$best_b0_size - info$best_b0_aab) > 0.5)
+          tagList(tags$br(), tags$b("They disagree by more than 0.5:"),
+                  " fire sizes and burn rate cannot both be matched by B0 alone ",
+                  "(try the joint B0 \u00d7 B1 sweep, or check ignition counts and MaxSpreadArea)."),
+        tags$br()),
+      if (joint) tagList(sprintf(
+        "Best at the current B1 (%.4f) scores %.2f.", info$b1_at_run,
+        suppressWarnings(min(sw$table$score_total[abs(sw$table$B1 - info$b1_at_run) < 1e-6], na.rm = TRUE))),
+        tags$br()),
       sprintf("At best: %.0f%% never spread; median %s ha, P90 %s ha (observed %s / %s).",
               best$pct_no_spread, scales::comma(round(best$median_ha, 1)),
               scales::comma(round(best$p90_ha, 1)),
@@ -7823,8 +7881,9 @@ server <- function(input, output, session) {
                                    best$sim_annual_pct, 100 * info$obs_rate, info$ign_per_yr)),
       if (!isTRUE(info$has_area))
         tagList(tags$br(), "No landscape areas loaded: scored on fire size only."),
+      if (!is.null(edge_msg)) tagList(tags$br(), tags$b(edge_msg)),
       tags$br(),
-      tags$span(class = "text-muted", sprintf("%s; ignitions from %s; %d fires per B0.",
+      tags$span(class = "text-muted", sprintf("%s; ignitions from %s; %d fires per run.",
                                               info$wx_label, info$ign_src, info$n_fires)),
       if (!is.null(info$wx_note)) tagList(tags$br(), tags$span(class = "text-muted", info$wx_note))
     )
@@ -7833,18 +7892,28 @@ server <- function(input, output, session) {
   observeEvent(input$sweep_use_best, {
     sw <- sweep_rv()
     if (is.null(sw) || !is.finite(sw$best_b0)) {
-      showNotification("Run the B0 sweep first.", type = "warning"); return()
+      showNotification("Run the sweep first.", type = "warning"); return()
     }
     updateNumericInput(session, "tune_sp_b0", value = round(sw$best_b0, 4))
-    showNotification(sprintf("SpreadProbabilityB0 set to %.4f in Parameters.", sw$best_b0),
-                     type = "message")
+    if (sweep_is_joint(sw)) {
+      updateNumericInput(session, "tune_sp_b1", value = round(sw$best_b1, 6))
+      showNotification(sprintf("SpreadProbabilityB0 = %.4f and B1 = %.4f set in Parameters.",
+                               sw$best_b0, sw$best_b1), type = "message")
+    } else {
+      showNotification(sprintf("SpreadProbabilityB0 set to %.4f in Parameters.", sw$best_b0),
+                       type = "message")
+    }
   })
 
   output$dl_b0_sweep <- downloadHandler(
-    filename = function() sprintf("b0_sweep_%s.csv", format(Sys.time(), "%Y%m%d_%H%M%S")),
+    filename = function() sprintf("%s_sweep_%s.csv",
+                                  if (sweep_is_joint(sweep_rv())) "b0_b1" else "b0",
+                                  format(Sys.time(), "%Y%m%d_%H%M%S")),
     content  = function(f) {
       sw <- sweep_rv(); req(sw)
-      write_csv(dplyr::mutate(sw$table, best_b0 = sw$best_b0), f)
+      tab <- sw$table
+      if (!"B1" %in% names(tab)) tab <- cbind(B1 = sw$best_b1, tab)
+      write_csv(dplyr::mutate(tab, best_b0 = sw$best_b0, best_b1 = sw$best_b1), f)
     })
 
   # Daily weather for the real-weather ensemble.  Returns list(df, label, note);
